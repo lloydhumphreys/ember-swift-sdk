@@ -1,0 +1,7 @@
+.DS_Store
+.build/
+.swiftpm/
+xcuserdata/
+DerivedData/
+# Local development only: the password the stand-in server and the live tests sign in with.
+.dev/
