@@ -69,7 +69,9 @@ extension RoomSession {
     /// waiting to be retried, a thread with a reply unsettled, or a message not yet confirmed. A
     /// failed file the room has since confirmed (its pending gone) isn't waiting for anything.
     var isBusy: Bool {
-        running != nil || !outgoing.isEmpty || !threads.isEmpty || failedUploads.values.contains(where: isUnconfirmed)
+        // Closures here and below, not the methods by name: Swift 6.0 takes a main-actor method
+        // passed by name to a rethrowing call for one that can throw.
+        running != nil || !outgoing.isEmpty || !threads.isEmpty || failedUploads.values.contains { isUnconfirmed($0) }
             || hasUnsentMessages
     }
 
@@ -77,7 +79,7 @@ extension RoomSession {
         // A job would hold the session, and `keep` would tie the thread to it again, after sign-out.
         // No ids: one per file would pair the app's thumbnails with messages that never show.
         guard !isShutDown else {
-            files.forEach(removeIfTemporary)
+            files.forEach { removeIfTemporary($0) }
             return []
         }
         var ids: [String] = []
