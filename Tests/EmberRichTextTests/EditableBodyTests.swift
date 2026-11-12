@@ -14,6 +14,13 @@ private func text(_ body: String) -> String {
     EditableBody(body: body, mentionNames: names).text
 }
 
+private let samId = "1abcdefghijklmno"
+private let samMention = "<action-text-attachment content-type=\"application/vnd.campfire.mention\" sgid=\"\(samId)\"></action-text-attachment>"
+
+private func edit(_ body: String, _ newText: String, mentions: [String: String]) -> String {
+    EditableBody(body: body, mentionNames: names).body(editedTo: newText, mentions: mentions)
+}
+
 /// Bodies in the shapes Lexxy, Trix, the server and the composer write, plus a few odd ones.
 private let corpus: [String] = [
     "<p>Hello world</p>",
@@ -241,6 +248,114 @@ struct EditableBodyTests {
             let editable = EditableBody(body: input)
             _ = editable.body(editedTo: editable.text + "x")
             _ = editable.body(editedTo: "")
+            _ = editable.body(editedTo: editable.text + " @Sam", mentions: [samId: "Sam"])
+            _ = editable.body(editedTo: "@Sam", mentions: [samId: "Sam"])
+        }
+    }
+
+    // MARK: Adding mentions
+
+    @Test func typedNameOfSomeoneChosenBecomesAMention() {
+        #expect(edit("<p>Thanks all</p>", "Thanks @Sam all", mentions: [samId: "Sam"]) == "<p>Thanks \(samMention) all</p>")
+        #expect(edit("<p>Over to</p>", "Over to @Sam ", mentions: [samId: "Sam"]) == "<p>Over to \(samMention) </p>")
+        #expect(edit("<p>hi</p>", "@Sam hi", mentions: [samId: "Sam"]) == "<p>\(samMention) hi</p>")
+    }
+
+    @Test func mentionTypedInsideBoldStaysInBold() {
+        #expect(edit("<p><strong>hi there</strong></p>", "hi @Sam there", mentions: [samId: "Sam"]) == "<p><strong>hi \(samMention) there</strong></p>")
+    }
+
+    @Test func mentionsAlreadyThereStayByteForByte() {
+        let body = "<p>Hi \(mention), welcome</p><ul><li><b>one</b></li></ul>"
+        #expect(edit(body, "Hi @Maya, welcome @Sam\none", mentions: [samId: "Sam"]) == "<p>Hi \(mention), welcome \(samMention)</p><ul><li><b>one</b></li></ul>")
+    }
+
+    @Test func choosingSomeoneAlreadyMentionedLeavesTheBodyAlone() {
+        let body = "<p>Hi \(mention)</p>"
+        #expect(edit(body, "Hi @Maya", mentions: [userId: "Maya"]) == body)
+    }
+
+    @Test func anotherPersonWithTheSameNameGetsTheirOwnMention() {
+        #expect(edit("<p>Hi \(mention)</p>", "Hi @Maya and @Maya", mentions: [samId: "Maya"]) == "<p>Hi \(mention) and \(samMention)</p>")
+    }
+
+    @Test func nameAlreadyThereAsPlainTextBecomesAMention() {
+        // As the composer does: every "@Name" of someone chosen is a mention of them.
+        #expect(edit("<p>ask @Sam about it</p>", "ask @Sam about it", mentions: [samId: "Sam"]) == "<p>ask \(samMention) about it</p>")
+        #expect(edit("<p>ask <em>@Sam</em></p>", "ask @Sam", mentions: [samId: "Sam"]) == "<p>ask <em>\(samMention)</em></p>")
+    }
+
+    @Test func nameSplitAcrossFormattingBecomesOneMention() {
+        let result = edit("<p>@<b>Sam</b> hi</p>", "@Sam hi", mentions: [samId: "Sam"])
+        #expect(result == "<p>\(samMention) hi</p>")
+    }
+
+    @Test func nameInsideALinkOrCodeStaysText() {
+        let body = "<p><a href=\"https://x.test\">@Sam</a> and <code>@Sam</code></p><pre>@Sam</pre>"
+        #expect(edit(body, "@Sam and @Sam\n@Sam", mentions: [samId: "Sam"]) == body)
+        #expect(edit(body, "@Sam and @Sam!\n@Sam", mentions: [samId: "Sam"]) == "<p><a href=\"https://x.test\">@Sam</a> and <code>@Sam!</code></p><pre>@Sam</pre>")
+    }
+
+    @Test func onlyAWholeNameBecomesAMention() {
+        #expect(edit("<p>hi</p>", "hi @Samuel and x@Sam", mentions: [samId: "Sam"]) == "<p>hi @Samuel and x@Sam</p>")
+    }
+
+    @Test func nameThatRunsIntoAMentionStaysText() {
+        // "@Maya" is a mention; a chosen "Maya Lin" can't take it over.
+        let body = "<p>\(mention) Lin</p>"
+        #expect(edit(body, "@Maya Lin", mentions: [samId: "Maya Lin"]) == body)
+    }
+
+    @Test func chosenNameOtherThanTheShownOneStillMentions() {
+        // Someone the body mentions as "Maya" chosen again as "Maya Lin": the new mention reads as
+        // the old one does.
+        #expect(edit("<p>Hi \(mention)</p>", "Hi @Maya and @Maya Lin", mentions: [userId: "Maya Lin"]) == "<p>Hi \(mention) and \(mention)</p>")
+    }
+
+    @Test func idTheServerWouldRefuseChangesNothing() {
+        #expect(edit("<p>Hi</p>", "Hi @Sam", mentions: ["not-a-user": "Sam"]) == "<p>Hi @Sam</p>")
+        #expect(edit("<p>Hi @Sam</p>", "Hi @Sam", mentions: ["not-a-user": "Sam"]) == "<p>Hi @Sam</p>")
+    }
+
+    @Test func noMentionsIsBodyEditedTo() {
+        for body in corpus {
+            let editable = EditableBody(body: body, mentionNames: names)
+            for newText in [editable.text, editable.text + " @Sam", "x" + editable.text] {
+                #expect(editable.body(editedTo: newText, mentions: [:]) == editable.body(editedTo: newText))
+            }
+        }
+    }
+
+    @Test func unmappableBodyFallsBackToTheComposersBody() {
+        let editable = EditableBody(body: "<p>broken <b>markup</p>")
+        #expect(editable.body(editedTo: "broken markup @Sam", mentions: [samId: "Sam"]) == "<p>broken markup \(samMention)</p>")
+        #expect(editable.body(editedTo: "broken markup", mentions: [samId: "Sam"]) == "<p>broken <b>markup</p>")
+    }
+
+    @Test func randomMentionsRoundTripAndKeepUntouchedLines() {
+        var generator = SeededGenerator(seed: 0xA7)
+        let people = [samId: "Sam", userId: "Maya"]
+        var known = names
+        known[samId] = "Sam"
+        for body in corpus {
+            let original = EditableBody(body: body, mentionNames: names)
+            let characters = Array(original.text)
+            let plainish = !body.contains("<a ") && !body.contains("<code") && !body.contains("<pre")
+            for _ in 0..<40 {
+                let lower = Int.random(in: 0...characters.count, using: &generator)
+                let upper = Int.random(in: lower...min(characters.count, lower + 4), using: &generator)
+                let newText = String(characters[..<lower]) + " @Sam " + String(characters[upper...])
+                let result = original.body(editedTo: newText, mentions: people)
+                #expect(EditableBody(body: result, mentionNames: known).text == newText, "\(body) -> \(newText.debugDescription)")
+                #expect((try? HTMLTreeBuilder.parse(result)) != nil)
+                if plainish { #expect(result.contains(samMention), "\(body) -> \(newText.debugDescription): \(result)") }
+                // A mention never costs formatting the same edit without one keeps.
+                guard let layout = original.layout, original.splice(editedTo: newText) != nil else { continue }
+                #expect(original.splice(editedTo: newText, mentions: people) != nil, "lost formatting: \(body) -> \(newText.debugDescription)")
+                if original.splice(editedTo: newText, mentions: people) != nil {
+                    expectUntouchedLinesKept(layout, original.text, newText, result)
+                }
+            }
         }
     }
 }

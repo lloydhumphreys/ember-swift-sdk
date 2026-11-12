@@ -18,6 +18,9 @@ import Observation
     public internal(set) var timeline = Timeline()
     /// `.stopped(.notFound)` when the room is gone or you're no longer in it.
     public private(set) var status: ReconnectingSocket.Status = .idle
+    /// Where the room's connection is, as a screen shows it: `status`, and whether the room has let
+    /// the socket in.
+    public private(set) var phase: Phase = .idle
     /// The latest thing the room refused that isn't a pending message's failure (an edit, a boost…).
     /// The view shows it and sets it back to nil.
     public var notice: String?
@@ -44,6 +47,11 @@ import Observation
     @ObservationIgnored private var jumpTarget: String?
     /// How many `history.around` requests the open connection has sent and not had answered.
     @ObservationIgnored private var aroundsAsked = 0
+    /// The first message shown when an older page was asked for while the room hadn't let the socket
+    /// in, so the page goes once it has, should that message still be first.
+    @ObservationIgnored private var olderWanted: String?
+    /// The same for a newer page, by the last message shown.
+    @ObservationIgnored private var newerWanted: String?
 
     /// How many leases are open, `start()`'s included.
     @ObservationIgnored private(set) var leases = 0
@@ -66,15 +74,61 @@ import Observation
     /// Files that failed, kept so `retry` can send them again.
     @ObservationIgnored var failedUploads: [String: UploadJob] = [:]
 
+    /// Where unsent text messages are kept across launches.
+    @ObservationIgnored public let unsentStore: any UnsentMessageStore
+    /// Whose they are, once `Workspace` or the room's first welcome has said.
+    @ObservationIgnored private var unsentKey: UnsentMessageKey?
+    /// What `unsentStore` was last given, so an unchanged list isn't written again.
+    @ObservationIgnored private var savedUnsent: [UnsentMessage] = []
+    /// Failed replies in threads no screen holds, kept until their thread is asked for again.
+    @ObservationIgnored var parkedReplies: [UnsentMessage] = []
+    /// How long a message may go unconfirmed before it shows as failed (`notSent`), counted from
+    /// when it was sent or retried, whatever the connection does meanwhile. One that fails before
+    /// it was written to a socket isn't sent when the connection returns.
+    @ObservationIgnored public var sendTimeout: Duration = .seconds(30)
+    /// How long a page of older or newer messages may go unanswered before it fails, as one the room
+    /// refused does (`timeline.olderPageFailure`, `timeline.newerPageFailure`).
+    public static let pageTimeout: Duration = .seconds(15)
+    /// Counts connections, so a timer started on one does nothing on the next.
+    @ObservationIgnored private var connection = 0
+    /// The timers of messages sent or retried and not yet confirmed or failed.
+    @ObservationIgnored private var sendTimers: [String: Task<Void, Never>] = [:]
+    /// The timers of the older and newer pages on their way.
+    @ObservationIgnored private var olderTimer: Task<Void, Never>?
+    @ObservationIgnored private var newerTimer: Task<Void, Never>?
+    /// The messages and replies created on this connection, since their last retry. The room answers
+    /// a socket's frames in order, so a check's `missing` for one of them comes from a check sent
+    /// before the create, and sending it again would store it twice.
+    @ObservationIgnored private var created: Set<String> = []
+    /// Whether the socket was kept open after the last lease closed, for unsent messages.
+    @ObservationIgnored private var lingering = false
+    /// Changes sent with the `async` forms of edit, delete and boost, waiting to be shown made.
+    @ObservationIgnored var changes: [ChangeWaiter] = []
+    /// How far each file got before it failed, so a retry goes on from there.
+    @ObservationIgnored var uploadCheckpoints: [String: UploadCheckpoint] = [:]
+    /// What keeps a file going up when the app leaves the foreground: `.system` when the client is
+    /// on the network, `.none` for any other transport.
+    @ObservationIgnored public var backgroundTime: BackgroundTime
+
     @ObservationIgnored private var typingSent = false
     @ObservationIgnored private var typingThrottled = false
     @ObservationIgnored private var throttle: Task<Void, Never>?
     @ObservationIgnored private var pause: Task<Void, Never>?
 
     /// A session for a room on `client`. With `messageID`, it opens on the page around that message.
-    public init(client: EmberClient, roomID: RoomID, around messageID: String? = nil) {
+    /// Unsent messages are kept in a `FileUnsentMessageStore` when the client is on the network,
+    /// and in memory for any other transport.
+    public convenience init(client: EmberClient, roomID: RoomID, around messageID: String? = nil) {
+        let store: any UnsentMessageStore = client.transport is URLSessionHTTPTransport ? FileUnsentMessageStore() : MemoryUnsentMessageStore()
+        self.init(client: client, roomID: roomID, around: messageID, unsentStore: store)
+    }
+
+    /// A session for a room on `client` that keeps its unsent messages in `unsentStore`.
+    public init(client: EmberClient, roomID: RoomID, around messageID: String? = nil, unsentStore: any UnsentMessageStore) {
         self.client = client
         self.roomID = roomID
+        self.unsentStore = unsentStore
+        backgroundTime = client.transport is URLSessionHTTPTransport ? .system : .none
         aroundOnConnect = messageID.map(Opening.message) ?? .catchUp
         jumpTarget = messageID
         isJumping = messageID != nil
@@ -92,6 +146,9 @@ import Observation
         }
         throttle?.cancel()
         pause?.cancel()
+        for timer in sendTimers.values { timer.cancel() }
+        olderTimer?.cancel()
+        newerTimer?.cancel()
     }
 
     // MARK: Connecting
@@ -118,10 +175,31 @@ import Observation
         ownLease = nil
     }
 
-    /// A lease has closed.
+    /// A lease has closed. With the last, the socket closes, unless a message is still unsent: then
+    /// it stays open until none is (`releaseIfIdle()`).
     func leaseClosed() {
         leases = max(0, leases - 1)
-        if leases == 0 { socket?.stop() }
+        if leases == 0 {
+            if hasUnsentMessages {
+                lingering = true
+            } else {
+                socket?.stop()
+            }
+        }
+        onLeasesChanged?()
+    }
+
+    /// Whether a text message is on its way, the room's or a thread's: pending and not failed.
+    var hasUnsentMessages: Bool {
+        timeline.pending.contains { $0.upload == nil && $0.failure == nil } || threads.contains(where: \.hasUnsettled)
+    }
+
+    /// Closes a socket kept open for unsent messages once none is left, and tells `Workspace`, whose
+    /// cache may let go of the session now.
+    func releaseIfIdle() {
+        guard lingering, leases == 0, !hasUnsentMessages else { return }
+        lingering = false
+        socket?.stop()
         onLeasesChanged?()
     }
 
@@ -146,6 +224,7 @@ import Observation
     /// session that's taken back needs its threads to go on hearing its frames.
     func detach() {
         onSignedOut = nil
+        lingering = false
         socket?.stop()
         dropUploads()
     }
@@ -188,8 +267,17 @@ import Observation
     }
 
     private func connect() {
-        guard leases > 0, !isHeldBack else { return }
+        guard leases > 0 || lingering, !isHeldBack else { return }
         socket?.start()
+    }
+
+    /// Connects again after the server stopped the connection (`phase` is `.stopped`), as a Retry
+    /// button asks, while a lease holds the room. Does nothing while the room is connected or
+    /// connecting, when nothing holds it, while `Workspace` holds it back, and after a stop for
+    /// signing out, which only signing in again mends.
+    public func reconnect() {
+        guard case let .stopped(reason) = status, reason != .signedOut else { return }
+        connect()
     }
 
     /// Tells the room whether the app is in front (`presence.visible`).
@@ -207,22 +295,34 @@ import Observation
     public func send(body: String, plainText: String) -> String {
         let clientMessageId = UUID().uuidString.lowercased()
         let frame = timeline.send(body: body, plainText: plainText, clientMessageId: clientMessageId)
-        // While the room hasn't let the socket in, the message waits: the welcome's `message.check`
-        // finds it missing, and the room's answer sends it.
-        if admitted { transmitMessage(frame) }
+        // While the room hasn't let the socket in, the message waits, timed from now: the welcome's
+        // `message.check` finds it missing, and the room's answer sends it.
+        if admitted { transmitMessage(frame) } else { watchSend(clientMessageId) }
+        saveUnsent()
         return clientMessageId
     }
 
-    /// Sends a refused message again, under the same id. A file that failed goes up again from the
-    /// start, after any still waiting.
+    /// Sends a failed message again, under the same id. The room is asked first whether it has the
+    /// message, as one that failed for want of an answer may have been stored, and it's created only
+    /// if the room says it's missing. A file that failed goes on from the part after the last the
+    /// server took (from the start if the server forgot the upload), after any still waiting.
     public func retry(_ clientMessageId: String) {
         if timeline.pending.first(where: { $0.clientMessageId == clientMessageId })?.upload != nil {
             _ = timeline.retry(clientMessageId)
             retryUpload(clientMessageId)
             return
         }
-        guard let frame = timeline.retry(clientMessageId) else { return }
-        if admitted { transmitMessage(frame) }
+        guard timeline.retry(clientMessageId) != nil else { return }
+        if admitted { checkAgain(clientMessageId) } else { watchSend(clientMessageId, again: true) }
+        saveUnsent()
+    }
+
+    /// Asks the room whether it has `id`, a message or reply sent again, and times it from now. The
+    /// answer creates it if the room says it's missing.
+    func checkAgain(_ id: String) {
+        created.remove(id)
+        transmit(.checkMessages(clientMessageIds: [id]))
+        watchSend(id, again: true)
     }
 
     /// A message goes at the end of the newest page, which a timeline reading older history (or on its
@@ -234,12 +334,112 @@ import Observation
             askAround(nil)
         }
         transmit(frame)
+        if case let .createMessage(id, _, _, _) = frame {
+            created.insert(id)
+            watchSend(id)
+        }
+    }
+
+    /// Sends a thread's reply on this connection, remembered as created, as `transmitMessage(_:)`
+    /// remembers a room message: a check sent before it that finds it missing mustn't create it again.
+    func transmitReply(_ frame: ClientFrame) {
+        transmit(frame)
+        if case let .createMessage(id, _, _, _) = frame { created.insert(id) }
     }
 
     /// Forgets a pending message. A file on its way up stops.
     public func discard(_ clientMessageId: String) {
         discardUpload(clientMessageId)
         timeline.discard(clientMessageId)
+        saveUnsent()
+        releaseIfIdle()
+    }
+
+    /// The `failure` of a message the room hasn't confirmed within `sendTimeout`.
+    public static let notSent = "Not sent. Try again, or discard it."
+
+    /// Fails `id`, a room message or a thread's reply, should it still be unconfirmed `sendTimeout`
+    /// after it was asked for. A timer already running for it goes on, unless `again`, as a retry
+    /// is timed from the retry.
+    func watchSend(_ id: String, again: Bool = false) {
+        if !again, sendTimers[id] != nil { return }
+        sendTimers[id]?.cancel()
+        let timing = client.timing
+        let timeout = sendTimeout
+        sendTimers[id] = Task { [weak self] in
+            do { try await timing.sleep(for: timeout) } catch { return }
+            self?.sendTimedOut(id)
+        }
+    }
+
+    private func sendTimedOut(_ id: String) {
+        sendTimers[id] = nil
+        let isUnsent: (PendingMessage) -> Bool = { $0.clientMessageId == id && $0.upload == nil && $0.failure == nil }
+        if timeline.pending.contains(where: isUnsent) {
+            _ = timeline.fail(id, reason: Self.notSent)
+        } else if let thread = threads.first(where: { $0.timeline.pending.contains(where: isUnsent) }) {
+            _ = thread.fail(id, reason: Self.notSent)
+            settle(thread)
+        } else {
+            return
+        }
+        saveUnsent()
+        releaseIfIdle()
+    }
+
+    /// Gives `unsentStore` the room's unsent and failed texts and thread replies, when they've
+    /// changed. Nothing until the session knows who you are.
+    func saveUnsent() {
+        guard let unsentKey else { return }
+        let messages = timeline.pending.filter { $0.upload == nil && $0.parentId == nil }
+        let replies = threads.flatMap { $0.timeline.pending.filter { $0.upload == nil } }
+        let unsent = (messages + replies).map(UnsentMessage.init) + parkedReplies
+        guard unsent != savedUnsent else { return }
+        savedUnsent = unsent
+        unsentStore.save(unsent, for: unsentKey)
+    }
+
+    /// Says who's signed in before the room's first welcome does, so what's unsent is read and kept
+    /// from the start. `Workspace` calls it as it makes the session.
+    func signedIn(as userID: UserID) {
+        restoreUnsent(for: userID)
+    }
+
+    /// Once the session knows who you are: what `unsentStore` kept for you here comes back as
+    /// pending, under the same ids, so the welcome's check (a thread's, for a reply) asks about them
+    /// and the room's answer sends the missing. A thread with a reply still on its way is kept to
+    /// send it; one whose replies all failed waits until it's asked for. What was sent before now is
+    /// saved now.
+    private func restoreUnsent(for userID: UserID) {
+        guard unsentKey == nil else { return }
+        let key = UnsentMessageKey(server: client.origin, userID: userID, roomID: roomID)
+        unsentKey = key
+        let saved = unsentStore.messages(for: key)
+        savedUnsent = saved
+        let known = Set((timeline.pending + threads.flatMap(\.timeline.pending)).map(\.clientMessageId))
+        let unknown = saved.filter { !known.contains($0.clientMessageId) }
+        for message in unknown where message.parentId == nil {
+            _ = timeline.send(body: message.body, plainText: message.plainText, clientMessageId: message.clientMessageId, now: message.createdAt)
+            if let failure = message.failure { _ = timeline.fail(message.clientMessageId, reason: failure) }
+        }
+        var replies: [String: [UnsentMessage]] = [:]
+        var parents: [String] = []
+        for message in unknown {
+            guard let parent = message.parentId else { continue }
+            if replies[parent] == nil { parents.append(parent) }
+            replies[parent, default: []].append(message)
+        }
+        for parent in parents {
+            let group = replies[parent] ?? []
+            if group.contains(where: { $0.failure == nil }) {
+                let thread = thread(parent)
+                thread.restore(group)
+                keep(thread)
+            } else {
+                parkedReplies += group
+            }
+        }
+        saveUnsent()
     }
 
     /// What `notice` says when an edit, deletion or boost can't go because the room hasn't let the
@@ -320,21 +520,85 @@ import Observation
     // MARK: Paging
 
     /// Asks for the page before the oldest message, when `timeline.hasMore` and none is on its way.
-    /// Nothing while `isJumping`, since the page it's from is about to be replaced.
+    /// Nothing while `isJumping`, since the page it's from is about to be replaced. Asked for while
+    /// reconnecting, it goes once the room lets the socket in, unless what it was for has been replaced.
     public func loadOlder() {
-        guard admitted, !isJumping, let frame = timeline.olderPage() else { return }
+        guard !isJumping else { return }
+        guard admitted else {
+            olderWanted = timeline.messages.first?.id
+            return
+        }
+        olderWanted = nil
+        guard let frame = timeline.olderPage() else { return }
         transmit(frame)
+        watchOlder()
     }
 
     /// Asks for the page after the newest message, when `timeline.hasNewer` and none is on its way.
-    /// Nothing while `isJumping`.
+    /// Nothing while `isJumping`. Asked for while reconnecting, it waits as `loadOlder()` does.
     public func loadNewer() {
-        guard admitted, !isJumping, let frame = timeline.newerPage() else { return }
+        guard !isJumping else { return }
+        guard admitted else {
+            newerWanted = timeline.messages.last?.id
+            return
+        }
+        newerWanted = nil
+        guard let frame = timeline.newerPage() else { return }
         transmit(frame)
+        watchNewer()
+    }
+
+    /// Asks again for the older page after `timeline.olderPageFailure`.
+    public func retryOlder() {
+        guard admitted, !isJumping, let frame = timeline.retryOlderPage() else { return }
+        transmit(frame)
+        watchOlder()
+    }
+
+    /// Asks again for the newer page after `timeline.newerPageFailure`.
+    public func retryNewer() {
+        guard admitted, !isJumping, let frame = timeline.retryNewerPage() else { return }
+        transmit(frame)
+        watchNewer()
+    }
+
+    /// Fails the older page asked for on this connection, should it still be on its way
+    /// `pageTimeout` from now. A late answer still shows.
+    private func watchOlder() {
+        olderTimer?.cancel()
+        let timing = client.timing
+        let connection = connection
+        olderTimer = Task { [weak self] in
+            do { try await timing.sleep(for: Self.pageTimeout) } catch { return }
+            guard let self, connection == self.connection else { return }
+            olderTimer = nil
+            timeline.olderPageFailed()
+        }
+    }
+
+    /// Fails the newer page asked for on this connection, should it still be on its way
+    /// `pageTimeout` from now.
+    private func watchNewer() {
+        newerTimer?.cancel()
+        let timing = client.timing
+        let connection = connection
+        newerTimer = Task { [weak self] in
+            do { try await timing.sleep(for: Self.pageTimeout) } catch { return }
+            guard let self, connection == self.connection else { return }
+            newerTimer = nil
+            timeline.newerPageFailed()
+        }
+    }
+
+    /// Whether the reader has scrolled away from the newest message, so a reconnect that can't
+    /// catch up keeps their place instead of showing the newest page.
+    public func setAwayFromLatest(_ away: Bool) {
+        timeline.setAwayFromLatest(away)
     }
 
     /// Shows the page around a message (`history.around`); `timeline.anchor` says where to scroll.
     public func jump(to messageID: String) {
+        forgetWantedPages()
         jumpTarget = messageID
         isJumping = true
         if admitted {
@@ -346,7 +610,9 @@ import Observation
 
     /// Shows the newest page again, after a jump, or instead of one on its way.
     public func jumpToLatest() {
+        forgetWantedPages()
         endJump()
+        timeline.setAwayFromLatest(false)
         if admitted {
             askAround(nil)
         } else {
@@ -374,6 +640,21 @@ import Observation
     private func endJump() {
         jumpTarget = nil
         if isJumping { isJumping = false }
+    }
+
+    private func forgetWantedPages() {
+        olderWanted = nil
+        newerWanted = nil
+    }
+
+    /// Sends the pages asked for while reconnecting, for the messages still at the ends they were for.
+    private func sendWantedPages() {
+        let older = olderWanted
+        let newer = newerWanted
+        forgetWantedPages()
+        guard !isJumping else { return }
+        if let older, older == timeline.messages.first?.id { loadOlder() }
+        if let newer, newer == timeline.messages.last?.id { loadNewer() }
     }
 
     // MARK: Frames
@@ -415,9 +696,24 @@ import Observation
 
     private func socketChanged(_ status: ReconnectingSocket.Status) {
         self.status = status
+        let phase: Phase = switch status {
+        case .idle: .idle
+        case .connecting, .open: self.phase == .admitted || self.phase == .reconnecting ? .reconnecting : .connecting
+        case let .stopped(reason): .stopped(reason)
+        }
+        if phase != self.phase { self.phase = phase }
         guard status != .open else { return }
         timeline.disconnected()
         admitted = false
+        // What was sent on the connection that dropped waits for the next one's check, still timed
+        // from when it was asked for. A page on its way failed with the connection.
+        connection += 1
+        olderTimer?.cancel()
+        newerTimer?.cancel()
+        olderTimer = nil
+        newerTimer = nil
+        created = []
+        changesDisconnected(status)
         // Whatever page was on its way won't come on this connection: the next one opens around it.
         aroundsAsked = 0
         if let jumpTarget { aroundOnConnect = .message(jumpTarget) }
@@ -426,20 +722,31 @@ import Observation
         typingSent = false
         pause?.cancel()
         pause = nil
-        if case .stopped(.signedOut) = status { onSignedOut?() }
+        if case .stopped(.signedOut) = status {
+            client.sessionEnded()
+            onSignedOut?()
+        }
     }
 
     /// Handles one frame from the room's socket.
     func handle(_ frame: ServerFrame) {
         switch frame {
-        case .welcome, .resumed:
+        case let .welcome(you, _, _, _):
+            restoreUnsent(for: you.id)
             admitted = true
+            if phase != .admitted { phase = .admitted }
+        case .resumed:
+            admitted = true
+            if phase != .admitted { phase = .admitted }
         case let .error(message, clientMessageId, clientMessageIds, failed):
             let ids = Set(clientMessageIds ?? clientMessageId.map { [$0] } ?? [])
             // A reply's refusal is its thread's to show, as a message's is the timeline's.
             let isPending = timeline.pending.contains { ids.contains($0.clientMessageId) }
                 || threads.contains { $0.timeline.pending.contains { ids.contains($0.clientMessageId) } }
-            if !isPending, !message.isEmpty, failed != "thread.open", failed != "thread.before" {
+            // A change sent with an `async` form hears its refusal as a throw instead.
+            let isChange = ids.isEmpty && changeRefused(message, failed: failed)
+            if !isPending, !isChange, !message.isEmpty, failed != "thread.open", failed != "thread.before",
+               failed != "history.before", failed != "history.after" {
                 notice = message
             }
             if failed == "history.around" { aroundAnswered() }
@@ -449,9 +756,10 @@ import Observation
             break
         }
         let answers = timeline.apply(frame)
+        changeShown(frame)
         for answer in answers {
             if case let .createMessage(id, _, _, _) = answer {
-                if !isHeldText(id) { transmitMessage(answer) }
+                if !isHeldText(id), !created.contains(id) { transmitMessage(answer) }
             } else {
                 transmit(answer)
             }
@@ -461,7 +769,11 @@ import Observation
         // goes as it is: a reply never waits on the room's newest page.
         for thread in threads {
             for answer in thread.apply(frame) {
-                if case let .createMessage(id, _, _, _) = answer, isHeldText(id) { continue }
+                if case let .createMessage(id, _, _, _) = answer {
+                    if isHeldText(id) || created.contains(id) { continue }
+                    created.insert(id)
+                    watchSend(id)
+                }
                 transmit(answer)
             }
         }
@@ -487,19 +799,54 @@ import Observation
             reopenThreads()
         }
         for thread in threads where !thread.isHeld { settle(thread) }
+        saveUnsent()
+        releaseIfIdle()
+        // A change still missing after several later ones was lost: connecting again catches up from it.
+        if admitted, timeline.needsCatchUp { socket?.stop(); connect() }
     }
 
-    /// The room has let the socket in.
+    /// The room has let the socket in. What's unsent and not held behind files, and not timed since
+    /// it was asked for (one kept from an earlier launch), is timed from here: the check the welcome
+    /// sent finds it, and the room's answer sends it or says it's stored. Changes asked for while
+    /// it was connecting go now.
     private func opened() {
         aroundOnConnect = .catchUp
         askedAround = .catchUp
         if isVisible != askedVisible { transmit(.visible(isVisible)) }
+        for message in timeline.pending + threads.flatMap(\.timeline.pending)
+        where message.upload == nil && message.failure == nil && !isHeldText(message.clientMessageId) {
+            watchSend(message.clientMessageId)
+        }
+        sendWaitingChanges()
+        sendWantedPages()
     }
 
     /// Whether the room has let the open socket in, so frames sent now arrive.
     var isAdmitted: Bool { admitted }
 
+    /// Sends `frame` on the socket; false when it couldn't go.
+    @discardableResult
+    func transmit(sending frame: ClientFrame) -> Bool {
+        socket?.send(frame.text) == true
+    }
+
     func transmit(_ frame: ClientFrame) {
         socket?.send(frame.text)
+    }
+}
+
+extension RoomSession {
+    /// Where a room's connection is.
+    public enum Phase: Equatable, Sendable {
+        /// Not connected, and not trying: nothing holds the room, or the app is in the background.
+        case idle
+        /// Connecting, or connected and waiting for the room to let the socket in.
+        case connecting
+        /// The room has let the socket in: what's sent now arrives.
+        case admitted
+        /// The connection dropped after the room had let it in, and is being made again.
+        case reconnecting
+        /// The server said not to come back.
+        case stopped(ReconnectingSocket.StopReason)
     }
 }

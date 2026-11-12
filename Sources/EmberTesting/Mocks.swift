@@ -3,15 +3,17 @@ import EmberSDK
 
 extension EmberClient {
     /// A client on stand-in transports, with cookies of its own, so nothing touches the network or
-    /// the app's real session. Pass `timing` on a `ManualClock` to control every wait.
+    /// the app's real session. Pass `timing` on a `ManualClock` to control every wait, and `network`
+    /// to take the network away.
     public static func mock(
         origin: URL = URL(string: "https://ember.test")!,
         transport: MockHTTPTransport = MockHTTPTransport(),
         connector: MockSocketConnector = MockSocketConnector(),
         cookies: HTTPCookieStorage = EphemeralCookieStorage(),
-        timing: EmberTiming = EmberTiming()
+        timing: EmberTiming = EmberTiming(),
+        network: MockNetworkPath = MockNetworkPath()
     ) -> EmberClient {
-        EmberClient(origin: origin, transport: transport, connector: connector, cookies: cookies, timing: timing)
+        EmberClient(origin: origin, transport: transport, connector: connector, cookies: cookies, timing: timing, network: network)
     }
 }
 

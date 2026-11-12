@@ -86,11 +86,14 @@ private func mine(_ id: String, _ clientMessageId: String) -> Message {
             Issue.record("\(checks)"); return
         }
         #expect(firstIds.count == Limits.checkedMessages)
-        #expect(secondIds == ["c51"])
+        #expect(secondIds == ["c51", "c52"])
 
         let resent = timeline.apply(.messageChecked(stored: (1 ... 49).map { "c\($0)" }, missing: ["c50", "c52"]))
         #expect(resent == [.createMessage(clientMessageId: "c50", body: "50")])
         #expect(timeline.pending.map(\.id) == ["c50", "c51", "c52"])
+        #expect(timeline.pending.last?.failure == "No")
+        _ = timeline.apply(.messageChecked(stored: ["c52"], missing: []))
+        #expect(timeline.pending.map(\.id) == ["c50", "c51"])
     }
 
     @Test func aWelcomeKeepsWhatItDoesntConfirm() {
@@ -313,8 +316,9 @@ private func mine(_ id: String, _ clientMessageId: String) -> Message {
         // A repeat or an older change leaves it be too.
         _ = timeline.apply(.messageDeleted(messageId: "m001", seq: 1))
         #expect(timeline.seq == 1)
+        // The missing change, arriving late, fills the gap and moves seq past what came after it.
         _ = timeline.apply(.messageDeleted(messageId: "m003", seq: 2))
-        #expect(timeline.seq == 2)
+        #expect(timeline.seq == 4)
     }
 
     @Test func resumedSetsTheBaseline() {

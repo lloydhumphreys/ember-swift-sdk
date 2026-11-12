@@ -21,6 +21,8 @@ struct RunningUpload {
     let job: UploadJob
     let attempt: UUID
     let task: Task<Void, Never>
+    /// Stops asking for background time for it.
+    let endBackground: @Sendable () -> Void
 }
 
 extension RoomSession {
@@ -53,14 +55,22 @@ extension RoomSession {
             if let replyID { thread.go(to: replyID) }
             return thread
         }
-        return ThreadSession(room: self, parentID: parentID, at: replyID)
+        let thread = ThreadSession(room: self, parentID: parentID, at: replyID)
+        let parked = parkedReplies.filter { $0.parentId == parentID }
+        if !parked.isEmpty, !isShutDown {
+            parkedReplies.removeAll { $0.parentId == parentID }
+            thread.restore(parked)
+            keep(thread)
+        }
+        return thread
     }
 
     /// Whether anything is still going that the session has to be kept for: a file, a failed file
-    /// waiting to be retried, or a thread with a reply unsettled. A failed file the room has since
-    /// confirmed (its pending gone) isn't waiting for anything.
+    /// waiting to be retried, a thread with a reply unsettled, or a message not yet confirmed. A
+    /// failed file the room has since confirmed (its pending gone) isn't waiting for anything.
     var isBusy: Bool {
         running != nil || !outgoing.isEmpty || !threads.isEmpty || failedUploads.values.contains(where: isUnconfirmed)
+            || hasUnsentMessages
     }
 
     func enqueue(files: [UploadSource], body: String?, plainText: String?, thread: ThreadSession?, alsoSend: Bool) -> [String] {
@@ -109,6 +119,7 @@ extension RoomSession {
         }
         if let thread { keep(thread) }
         pump()
+        saveUnsent()
         return ids
     }
 
@@ -124,6 +135,8 @@ extension RoomSession {
                     thread.release(frame, clientMessageId: id)
                 } else if admittedPending(id) {
                     transmitMessage(frame)
+                } else if timeline.pending.contains(where: { $0.clientMessageId == id && $0.failure == nil }) {
+                    watchSend(id)
                 }
             case let .file(job):
                 begin(job)
@@ -133,7 +146,8 @@ extension RoomSession {
     }
 
     /// Whether a held room message is still pending (not discarded meanwhile) and can go now. One
-    /// that can't waits for the check that follows the next welcome, as any message does.
+    /// that can't waits for the check that follows the next welcome, as any message does, timed
+    /// from its turn.
     private func admittedPending(_ id: String) -> Bool {
         isAdmitted && timeline.pending.contains { $0.clientMessageId == id && $0.failure == nil }
     }
@@ -143,21 +157,30 @@ extension RoomSession {
         let client = client
         let roomID = roomID
         let id = job.clientMessageId
+        let resuming = uploadCheckpoints[id]
+        let endBackground = backgroundTime.begin("Sending \(job.source.name)")
         // The task holds the session, so a file finishes even when nothing else does.
         let task = Task { @MainActor in
             do {
                 let message = try await client.upload(
                     job.source, in: roomID, clientMessageId: id,
-                    parentId: job.thread?.parentID, alsoSend: job.alsoSend
-                ) { [weak self] sent in
-                    Task { @MainActor in self?.progressed(id, attempt: attempt, sent: sent) }
-                }
+                    parentId: job.thread?.parentID, alsoSend: job.alsoSend, resuming: resuming,
+                    checkpoint: { [weak self] checkpoint in await self?.checkpointed(id, attempt: attempt, checkpoint) },
+                    progress: { [weak self] sent in
+                        Task { @MainActor in self?.progressed(id, attempt: attempt, sent: sent) }
+                    }
+                )
                 self.finished(job, attempt: attempt, with: .success(message))
             } catch {
                 self.finished(job, attempt: attempt, with: .failure(error))
             }
         }
-        running = RunningUpload(job: job, attempt: attempt, task: task)
+        running = RunningUpload(job: job, attempt: attempt, task: task, endBackground: endBackground)
+    }
+
+    private func checkpointed(_ id: String, attempt: UUID, _ checkpoint: UploadCheckpoint) {
+        guard running?.attempt == attempt else { return }
+        uploadCheckpoints[id] = checkpoint
     }
 
     private func progressed(_ id: String, attempt: UUID, sent: Int) {
@@ -176,9 +199,11 @@ extension RoomSession {
     }
 
     private func finished(_ job: UploadJob, attempt: UUID, with result: Result<Message, any Error>) {
-        guard running?.attempt == attempt else { return }
+        guard let current = running, current.attempt == attempt else { return }
+        current.endBackground()
         running = nil
         let id = job.clientMessageId
+        if case .success = result { uploadCheckpoints[id] = nil }
         switch result {
         case let .success(message):
             timeline.posted(message)
@@ -189,6 +214,7 @@ extension RoomSession {
             // The room confirmed it (`message.created` landed before the last part's answer, which
             // was then lost): it's posted, whatever the HTTP said, so it's done, not failed.
             guard isUnconfirmed(job) else {
+                uploadCheckpoints[id] = nil
                 removeIfTemporary(job.source)
                 break
             }
@@ -202,11 +228,12 @@ extension RoomSession {
         pump()
     }
 
-    /// Queues a failed file to go again from the start.
+    /// Queues a failed file to go again, from the part after the last the server took.
     func retryUpload(_ id: String) {
         guard let job = failedUploads.removeValue(forKey: id) else { return }
         // Confirmed since it failed: sending it again would only post it twice.
         guard isUnconfirmed(job) else {
+            uploadCheckpoints[id] = nil
             removeIfTemporary(job.source)
             return
         }
@@ -218,8 +245,10 @@ extension RoomSession {
     /// Stops a file wherever it is (going, waiting or failed) and deletes it if it was temporary.
     func discardUpload(_ id: String) {
         var job: UploadJob?
+        uploadCheckpoints[id] = nil
         if let running, running.job.clientMessageId == id {
             running.task.cancel()
+            running.endBackground()
             self.running = nil
             job = running.job
         } else if let index = outgoing.firstIndex(where: { if case let .file(job) = $0 { job.clientMessageId == id } else { false } }) {
@@ -235,6 +264,8 @@ extension RoomSession {
     /// Stops every file, as the session is shut down.
     func cancelUploads() {
         running?.task.cancel()
+        running?.endBackground()
+        uploadCheckpoints = [:]
         // A cancelled job never finishes, so its temporary file goes here, as a discarded one's does.
         var dropped = running.map { [$0.job] } ?? []
         running = nil
@@ -272,6 +303,7 @@ extension RoomSession {
     func dropConfirmedFailures() {
         for (id, job) in failedUploads where !isUnconfirmed(job) {
             failedUploads[id] = nil
+            uploadCheckpoints[id] = nil
             removeIfTemporary(job.source)
         }
     }
@@ -322,10 +354,16 @@ extension RoomSession {
     /// Lets go of a thread no screen holds once nothing of it is left to settle.
     func settle(_ thread: ThreadSession) {
         guard !thread.isHeld, !thread.hasUnsettled, !hasUploads(for: thread) else { return }
+        guard threads.contains(where: { $0 === thread }) else { return }
         threads.removeAll { $0 === thread }
+        // Its failed replies wait for the thread to be asked for again, kept across launches meanwhile.
+        if !isShutDown {
+            parkedReplies += thread.timeline.pending.filter { $0.upload == nil }.map(UnsentMessage.init)
+        }
         // Its failed files can't be retried once no screen has it, so they go too.
         for (id, job) in failedUploads where job.thread === thread {
             failedUploads[id] = nil
+            uploadCheckpoints[id] = nil
             removeIfTemporary(job.source)
         }
     }

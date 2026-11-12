@@ -39,11 +39,12 @@ public struct PendingMessage: Hashable, Identifiable, Sendable {
         .createMessage(clientMessageId: clientMessageId, body: body, parentId: parentId, alsoSend: parentId == nil ? nil : alsoSend)
     }
 
-    /// Whether a reconnect asks the room about it: a message on its way, or a file that failed,
-    /// which may have been posted anyway. Not a message the room refused, nor a file still going up,
-    /// as the web's `checkUnconfirmed` leaves them out.
+    /// Whether a reconnect asks the room about it: any text, on its way or failed, and a file that
+    /// failed, since a failed one may have been stored anyway (one sent whose answer was lost). The
+    /// room's answer drops one it has; a failed one it doesn't have stays failed. Not a file still
+    /// going up.
     var isChecked: Bool {
-        upload == nil ? failure == nil : failure != nil
+        upload == nil || failure != nil
     }
 }
 
@@ -79,6 +80,9 @@ extension Limits {
     public static let timelineLeeway = 20
     /// How much of a parent's text a reply quotes (`PARENT_TEXT_LENGTH`), in Unicode scalars.
     public static let parentText = 150
+    /// How many of the room's later changes may arrive before a missing one counts as lost
+    /// (`Timeline.needsCatchUp`) rather than late.
+    public static let seqReorder = 3
 }
 
 /// A room's timeline as a client holds it: what the socket's frames add up to.
@@ -108,11 +112,29 @@ public struct Timeline: Equatable, Sendable {
     public private(set) var typing: [User] = []
     /// How many messages came in while `hasNewer` held them back, for a "new messages" button.
     public private(set) var arrivals = 0
+    /// Why the page before the oldest message didn't load, or nil. Until `retryOlderPage()`, a page
+    /// that loads, or the next connection, `olderPage()` asks for nothing, so a page that fails isn't
+    /// asked for again and again.
+    public private(set) var olderPageFailure: String?
+    /// Why the page after the newest message didn't load, or nil, as `olderPageFailure` for
+    /// `newerPage()` and `retryNewerPage()`.
+    public private(set) var newerPageFailure: String?
+    /// Whether a change the room numbered has gone missing, as the `seq` of the changes after it
+    /// shows: connecting again with `since` (`seq`, which stays at the change before it) brings it.
+    /// Set once `Limits.seqReorder` later changes have come without it, since changes the room makes
+    /// at once can arrive a little out of order. A welcome or resumed clears it.
+    public private(set) var needsCatchUp = false
+    /// Whether the reader has scrolled away from the newest messages, as the view says with
+    /// `setAwayFromLatest`. A reconnect that can't catch up then keeps the messages they're reading
+    /// and treats the newer ones as not loaded yet (`hasNewer`), rather than showing the newest page.
+    public private(set) var isAwayFromLatest = false
 
     // The page bounds the room's history requests go from. They stay put when the messages at the
     // ends are deleted, since the room pages from ids, not from what's shown.
     private var oldestId: String?
     private var newestId: String?
+    /// The numbered changes heard after a gap in `seq`, which move `seq` on once the gap fills.
+    private var ahead: Set<Int> = []
 
     public init() {}
 
@@ -122,7 +144,11 @@ public struct Timeline: Equatable, Sendable {
         switch frame {
         case let .welcome(you, present, seq, page):
             me = you
-            show(page)
+            if isLoaded, page.around == nil {
+                reconnect(to: page)
+            } else {
+                show(page)
+            }
             self.present = present
             self.seq = seq
             settle()
@@ -156,7 +182,7 @@ public struct Timeline: Equatable, Sendable {
             return checks()
 
         case let .messageCreated(message, seq):
-            see(seq)
+            guard see(seq) else { return [] }
             let isMine = !message.clientMessageId.isEmpty && pending.contains { $0.clientMessageId == message.clientMessageId }
             dropConfirmed(by: [message])
             typing.removeAll { $0.id == message.creator.id }
@@ -166,33 +192,39 @@ public struct Timeline: Equatable, Sendable {
             } else if hasNewer {
                 // Your own message confirmed isn't news to you.
                 if !isMine { arrivals += 1 }
-            } else {
-                messages.append(message)
-                newestId = message.id
+            } else if isAwayFromLatest, messages.count >= Limits.timelineMessages + Limits.timelineLeeway,
+                      newestId.map({ jsLess($0, message.id) }) ?? false {
+                // A full window someone's reading back through isn't cut from its start for something
+                // newer: it stops short of the latest instead, as after a jump.
+                hasNewer = true
+                if !isMine { arrivals += 1 }
+            } else if inRange(message.id) {
+                insert(message)
+                if newestId.map({ jsLess($0, message.id) }) ?? true { newestId = message.id }
                 if oldestId == nil { oldestId = message.id }
             }
             cutFromStart()
 
         case let .messageUpdated(message, seq):
-            see(seq)
+            guard see(seq) else { return [] }
             if let index = messages.firstIndex(where: { $0.id == message.id }) {
                 messages[index] = message
             }
             retell(message)
 
         case let .messageDeleted(messageId, seq):
-            see(seq)
+            guard see(seq) else { return [] }
             messages.removeAll { $0.id == messageId }
 
         case let .boostCreated(boost, seq):
-            see(seq)
+            guard see(seq) else { return [] }
             if let index = messages.firstIndex(where: { $0.id == boost.messageId }),
                !messages[index].boosts.contains(where: { $0.id == boost.id }) {
                 messages[index].boosts.append(boost)
             }
 
         case let .boostDeleted(boostId, messageId, seq):
-            see(seq)
+            guard see(seq) else { return [] }
             if let index = messages.firstIndex(where: { $0.id == messageId }) {
                 messages[index].boosts.removeAll { $0.id == boostId }
             }
@@ -221,7 +253,9 @@ public struct Timeline: Equatable, Sendable {
             messages.insert(contentsOf: older, at: 0)
             dropConfirmed(by: page)
             self.hasMore = hasMore
-            if let first = older.first { oldestId = first.id }
+            if let first = page.first, oldestId.map({ jsLess(first.id, $0) }) ?? true { oldestId = first.id }
+            // A page that moves the bound on nothing would be asked for again, the same, at once.
+            olderPageFailure = hasMore && oldestId == before ? Self.emptyPage : nil
             cutFromEnd()
 
         case let .historyAfter(after, page, hasNewer):
@@ -232,7 +266,8 @@ public struct Timeline: Equatable, Sendable {
             messages.append(contentsOf: newer)
             dropConfirmed(by: page)
             self.hasNewer = hasNewer
-            if let last = newer.last { newestId = last.id }
+            if let last = page.last, newestId.map({ jsLess($0, last.id) }) ?? true { newestId = last.id }
+            newerPageFailure = hasNewer && newestId == after ? Self.emptyPage : nil
             if !hasNewer { arrivals = 0 }
             cutFromStart()
 
@@ -245,9 +280,9 @@ public struct Timeline: Equatable, Sendable {
         case let .messageChecked(stored, missing):
             let storedIds = Set(stored)
             pending.removeAll { storedIds.contains($0.clientMessageId) }
-            // The room never got these, so they go again under the same ids, which the room
-            // de-duplicates should one turn up after all.
-            // A file has no body to send again: it stays as it is.
+            // The room never got these, so those still on their way go again under the same ids.
+            // The room doesn't de-duplicate a create, so one that failed stays failed until a retry
+            // asks again. A file has no body to send again: it stays as it is.
             return missing.compactMap { id in
                 guard let message = pending.first(where: { $0.clientMessageId == id && $0.failure == nil && $0.upload == nil }) else { return nil }
                 return message.createFrame
@@ -258,8 +293,12 @@ public struct Timeline: Equatable, Sendable {
 
         case let .error(text, clientMessageId, clientMessageIds, failed):
             switch failed {
-            case "history.before": isLoadingOlder = false
-            case "history.after": isLoadingNewer = false
+            case "history.before":
+                isLoadingOlder = false
+                olderPageFailure = text
+            case "history.after":
+                isLoadingNewer = false
+                newerPageFailure = text
             case "history.around": isLoadingPage = false
             case "thread.open", "thread.before": return []
             default: break
@@ -281,8 +320,10 @@ public struct Timeline: Equatable, Sendable {
         return .createMessage(clientMessageId: clientMessageId, body: body)
     }
 
-    /// Sends a refused message again, under the same id. nil when it isn't pending, and for a file,
-    /// which starts again from its first byte: the session uploads it again.
+    /// Puts a failed message on its way again, under the same id, and answers the frame that creates
+    /// it. nil when it isn't pending, and for a file, which the session uploads again. The room
+    /// doesn't de-duplicate a create, so `RoomSession` asks it with `message.check` first and sends
+    /// this only for a message the room says is missing.
     public mutating func retry(_ clientMessageId: String) -> ClientFrame? {
         guard let index = pending.firstIndex(where: { $0.clientMessageId == clientMessageId }) else { return nil }
         pending[index].failure = nil
@@ -326,18 +367,33 @@ public struct Timeline: Equatable, Sendable {
         pending.removeAll { $0.clientMessageId == clientMessageId }
     }
 
-    /// `history.before` the oldest message, when there's more and none is on its way.
+    /// `history.before` the oldest message, when there's more, none is on its way, and the last one
+    /// didn't fail (`olderPageFailure`).
     public mutating func olderPage() -> ClientFrame? {
-        guard isLoaded, hasMore, !isLoadingOlder, let oldestId else { return nil }
+        guard isLoaded, hasMore, !isLoadingOlder, olderPageFailure == nil, let oldestId else { return nil }
         isLoadingOlder = true
         return .historyBefore(messageId: oldestId)
     }
 
-    /// `history.after` the newest message, when there's newer and none is on its way.
+    /// `history.after` the newest message, when there's newer, none is on its way, and the last one
+    /// didn't fail (`newerPageFailure`).
     public mutating func newerPage() -> ClientFrame? {
-        guard isLoaded, hasNewer, !isLoadingNewer, let newestId else { return nil }
+        guard isLoaded, hasNewer, !isLoadingNewer, newerPageFailure == nil, let newestId else { return nil }
         isLoadingNewer = true
         return .historyAfter(messageId: newestId)
+    }
+
+    /// Asks again for the page before the oldest message after it failed: `olderPageFailure` is
+    /// forgotten and `olderPage()` answers.
+    public mutating func retryOlderPage() -> ClientFrame? {
+        olderPageFailure = nil
+        return olderPage()
+    }
+
+    /// Asks again for the page after the newest message after it failed, as `retryOlderPage()`.
+    public mutating func retryNewerPage() -> ClientFrame? {
+        newerPageFailure = nil
+        return newerPage()
     }
 
     /// `history.around` a message, to jump to it, or the newest page for nil, to jump back.
@@ -346,17 +402,43 @@ public struct Timeline: Equatable, Sendable {
         return .historyAround(messageId: messageID)
     }
 
+    /// The reader has scrolled away from the newest messages, or back to them (`isAwayFromLatest`).
+    public mutating func setAwayFromLatest(_ away: Bool) {
+        isAwayFromLatest = away
+    }
+
     /// The view has scrolled to `anchor`: forget it, so it isn't scrolled to again.
     public mutating func clearAnchor() {
         anchor = nil
     }
 
-    /// The socket dropped: nobody's typing as far as we know, and no page is on its way.
+    /// The socket dropped: nobody's typing as far as we know, and no page is on its way. An older
+    /// or newer page that was on its way fails (`pageNotLoaded`), as a refused one does, so it's
+    /// asked for again with a retry.
     public mutating func disconnected() {
         typing = []
-        isLoadingOlder = false
-        isLoadingNewer = false
+        olderPageFailed()
+        newerPageFailed()
         isLoadingPage = false
+    }
+
+    /// What `olderPageFailure` or `newerPageFailure` says of a page the room didn't answer in time,
+    /// or that the connection dropped before it came.
+    public static let pageNotLoaded = "The page didn’t load."
+
+    /// The page before the oldest message didn't come: it fails with `reason`, as one the room
+    /// refused does, and `retryOlderPage()` asks again. Nothing when none is on its way.
+    public mutating func olderPageFailed(_ reason: String = Self.pageNotLoaded) {
+        guard isLoadingOlder else { return }
+        isLoadingOlder = false
+        olderPageFailure = reason
+    }
+
+    /// The page after the newest message didn't come, as `olderPageFailed(_:)`.
+    public mutating func newerPageFailed(_ reason: String = Self.pageNotLoaded) {
+        guard isLoadingNewer else { return }
+        isLoadingNewer = false
+        newerPageFailure = reason
     }
 
     public func message(_ id: String) -> Message? {
@@ -379,6 +461,36 @@ public struct Timeline: Equatable, Sendable {
         newestId = page.messages.last?.id
         anchor = page.around
         arrivals = 0
+        olderPageFailure = nil
+        newerPageFailure = nil
+    }
+
+    /// The newest page, on a reconnect the room couldn't catch up with `since`. Where it overlaps
+    /// what's shown it takes over from its first message, and the older messages stay. Where it
+    /// doesn't, a reader away from the latest keeps what they're reading, with the newer messages
+    /// to load (`hasNewer`) as after a jump; anyone else gets the page.
+    private mutating func reconnect(to page: TimelinePage) {
+        guard let first = page.messages.first, let oldestId, let newestId, !messages.isEmpty else { return show(page) }
+        if !jsLess(first.id, oldestId), !jsLess(newestId, first.id) {
+            messages.removeAll { !jsLess($0.id, first.id) }
+            messages += page.messages.filter(\.isInRoom)
+            dropConfirmed(by: page.messages)
+            hasNewer = page.hasNewer
+            self.newestId = page.messages.last?.id
+            anchor = nil
+            arrivals = 0
+            olderPageFailure = nil
+            newerPageFailure = nil
+            cutFromStart()
+        } else if isAwayFromLatest, jsLess(newestId, first.id) {
+            dropConfirmed(by: page.messages)
+            if !hasNewer { arrivals += 1 }
+            hasNewer = true
+            olderPageFailure = nil
+            newerPageFailure = nil
+        } else {
+            show(page)
+        }
     }
 
     private mutating func settle() {
@@ -387,14 +499,38 @@ public struct Timeline: Equatable, Sendable {
         isLoadingNewer = false
         isLoadingPage = false
         typing = []
+        ahead = []
+        needsCatchUp = false
     }
 
-    /// The room numbers its changes one after another, so a gap is one it never told us of: `seq`
-    /// stays at the change before it, and connecting again with `since` brings what was missed. A room
-    /// that doesn't number its changes (no `seq` on its welcome) stays without one.
-    private mutating func see(_ seq: Int) {
-        if let current = self.seq, seq == current + 1 { self.seq = seq }
+    /// Whether a numbered change is news: false for one already heard, which changes nothing again.
+    ///
+    /// The room numbers its changes one after another, so a gap is one not heard of yet. `seq` stays
+    /// at the change before it, so connecting again with `since` brings what was missed; the changes
+    /// after it are kept in `ahead` and move `seq` on should it arrive late. A room that doesn't number
+    /// its changes (no `seq` on its welcome) stays without one.
+    private mutating func see(_ seq: Int) -> Bool {
+        guard let current = self.seq else { return true }
+        guard seq > current, !ahead.contains(seq) else { return false }
+        if seq == current + 1 {
+            var latest = seq
+            while ahead.remove(latest + 1) != nil { latest += 1 }
+            self.seq = latest
+        } else {
+            ahead.insert(seq)
+        }
+        needsCatchUp = ahead.count >= Limits.seqReorder
+        return true
     }
+
+    /// Puts a message among the others by id, which orders them as the room does, wherever it arrives.
+    private mutating func insert(_ message: Message) {
+        let index = messages.lastIndex { jsLess($0.id, message.id) }.map { $0 + 1 } ?? 0
+        messages.insert(message, at: index)
+    }
+
+    /// What `olderPageFailure` or `newerPageFailure` says of a page that brought nothing to move on from.
+    static let emptyPage = "The room sent an empty page."
 
     /// Whether a message changed while we were away belongs between the page's bounds.
     private func inRange(_ id: String) -> Bool {

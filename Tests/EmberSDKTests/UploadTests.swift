@@ -190,21 +190,36 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         await #expect { try await client.upload(try file.source(), in: Fixtures.general.id, clientMessageId: "c1") } throws: {
             ($0 as? EmberError)?.message == Uploads.failed
         }
-        // Within the same budget as a dropped part: three tries in all.
-        #expect(transport.requests("PUT", partPath(1)).count == 3)
+        // Within the same budget as a dropped part.
+        #expect(transport.requests("PUT", partPath(1)).count == EmberClient.partRetries + 1)
         #expect(clock.sleeperCount == 0)
     }
 
-    @Test func aPartIsTriedThreeTimesAtMost() async throws {
+    @Test func aPartIsTriedSevenTimesAtMost() async throws {
         transport.stub("PUT", partPath(1)) { _ in throw URLError(.notConnectedToInternet) }
         let client = client
         let task = Task { try await client.uploadPart(in: Fixtures.general.id, upload: "upload_1", part: 1, data: Data([1])) }
-        for attempt in 0 ..< 2 {
+        #expect(EmberClient.partRetries == 6)
+        for attempt in 0 ..< EmberClient.partRetries {
             #expect(await eventually { clock.sleeperCount == 1 })
             clock.advance(by: timing.backoff(attempt: attempt))
         }
         await #expect { try await task.value } throws: { ($0 as? EmberError)?.isUnreachable == true }
-        #expect(transport.requests("PUT", partPath(1)).count == 3)
+        #expect(transport.requests("PUT", partPath(1)).count == 7)
+    }
+
+    @Test(arguments: [408, 429, 500, 503])
+    func aPartTheServerCouldntTakeJustThenIsSentAgain(_ status: Int) async throws {
+        let failures = Mutex(1)
+        transport.stub("PUT", partPath(1)) { _ in
+            failures.withLock { count in defer { count -= 1 }; return count > 0 } ? (status, Fixtures.errorJSON("Busy")) : (204, "")
+        }
+        let client = client
+        let task = Task { try await client.uploadPart(in: Fixtures.general.id, upload: "upload_1", part: 1, data: Data([1])) }
+        #expect(await eventually { clock.sleeperCount == 1 })
+        clock.advance(by: timing.backoff(attempt: 0))
+        #expect(try await task.value == nil)
+        #expect(transport.requests("PUT", partPath(1)).count == 2)
     }
 
     @Test func aRefusedPartIsntSentAgain() async throws {
@@ -238,7 +253,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(partSize: 4, parts: 3), message: Fixtures.fileMessage("m100", clientMessageId: "c1"))
         transport.stub("POST", uploads, status: 201, json: Fixtures.uploadTicketJSON(ticket))
         await #expect { try await client.upload(try file.source(), in: Fixtures.general.id, clientMessageId: "c1") } throws: {
-            ($0 as? EmberError) == EmberError(status: 201, message: "The server’s answer couldn’t be read.")
+            ($0 as? EmberError) == EmberError(kind: .undecodable, status: 201, message: "The server’s answer couldn’t be read.")
         }
         #expect(transport.requests.map { $0.httpMethod ?? "" } == ["POST"])
     }
@@ -272,6 +287,41 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
     @Test func aFileThatCantBeReadIsntASource() {
         let missing = FileManager.default.temporaryDirectory.appendingPathComponent("ember-missing-\(UUID().uuidString)")
         #expect(throws: EmberError.self) { try UploadSource(fileURL: missing, contentType: "text/plain") }
+    }
+
+    @Test func aFileThatCantBeReadIsntTheNetworksFault() throws {
+        let missing = FileManager.default.temporaryDirectory.appendingPathComponent("ember-missing-\(UUID().uuidString)")
+        let error = try #require(#expect(throws: EmberError.self) { try UploadSource(fileURL: missing, contentType: "text/plain") })
+        #expect(error.kind == .unreadableFile)
+        #expect(!error.isUnreachable)
+    }
+
+    @Test func aFileGoneBeforeItsSentIsntTheNetworksFault() async throws {
+        let file = try TestFile([1])
+        let source = try file.source()
+        file.remove()
+        let error = await #expect(throws: EmberError.self) { try await client.upload(source, in: Fixtures.general.id, clientMessageId: "c1") }
+        #expect(error?.kind == .unreadableFile)
+        #expect(error?.isUnreachable == false)
+        #expect(transport.requests.isEmpty)
+    }
+
+    @Test func aSuccessThatCantBeReadIsntAnHTTPFailure() async throws {
+        transport.stub("PUT", partPath(1), status: 201, json: "{\"not\": \"a message\"}")
+        let error = await #expect(throws: EmberError.self) {
+            try await client.uploadPart(in: Fixtures.general.id, upload: "upload_1", part: 1, data: Data([1]))
+        }
+        #expect(error?.kind == .undecodable)
+        #expect(error?.status == 201)
+        #expect(error?.isUnreachable == false)
+    }
+
+    @Test func aRefusalIsAnHTTPFailureAndNoAnswerIsUnreachable() {
+        #expect(EmberError(status: 422, message: "No.").kind == .http)
+        #expect(EmberError(status: 0, message: "Gone.").kind == .unreachable)
+        #expect(EmberError(status: 0, message: "Gone.").isUnreachable)
+        #expect(!EmberError(kind: .refused, message: "No.").isUnreachable)
+        #expect(EmberError(status: 401, message: "Who?").isSignedOut)
     }
 
     @Test func aNameOrTypeTheServerWouldRefuseIsntASource() throws {
@@ -374,8 +424,8 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let id = try #require(session.send(files: [try file.source(isTemporary: true)]).first)
         let posted = Fixtures.fileMessage("m100", clientMessageId: id)
         transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: posted)
-        // The part's answer never makes it back, though the room posted the file.
-        transport.stub("PUT", partPath(1), status: 502, json: Fixtures.errorJSON("Bad gateway"))
+        // The part's answer is a failure that isn't tried again, though the room posted the file.
+        transport.stub("PUT", partPath(1), status: 400, json: Fixtures.errorJSON("Bad request"))
 
         await gate.waitForRequest()
         socket.serverSends(Fixtures.RoomFrames.messageCreated(posted, seq: 11))
@@ -399,7 +449,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let id = try #require(thread.send(files: [try file.source(isTemporary: true)]).first)
         let posted = Fixtures.fileMessage("r100", parentID: "m001", clientMessageId: id)
         transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: posted)
-        transport.stub("PUT", partPath(1), status: 502, json: Fixtures.errorJSON("Bad gateway"))
+        transport.stub("PUT", partPath(1), status: 400, json: Fixtures.errorJSON("Bad request"))
 
         await gate.waitForRequest()
         socket.serverSends(Fixtures.RoomFrames.messageCreated(posted, seq: 11))
@@ -566,6 +616,75 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         #expect(object(transport.requests("POST", uploads).last?.httpBody)?["clientMessageId"] as? String == id)
         // A temporary file goes once it's posted, not before.
         #expect(!file.exists)
+    }
+
+    /// A three-part file whose second part is refused once (413), then answered by `later` in turn.
+    func stubResumable(later: [Int]) {
+        let ticket = Fixtures.uploadTicket(partSize: 4, parts: 3)
+        transport.stub("POST", uploads, status: 201, json: Fixtures.uploadTicketJSON(ticket))
+        transport.stub("PUT", partPath(1), status: 204, json: "")
+        let answers = Mutex([413] + later)
+        transport.stub("PUT", partPath(2)) { _ in
+            let status = answers.withLock { $0.isEmpty ? 204 : $0.removeFirst() }
+            return (status, status == 204 ? "" : Fixtures.errorJSON("No"))
+        }
+    }
+
+    @Test func aRetriedFileGoesOnFromThePartsTheServerTook() async throws {
+        let (session, _) = try await opened()
+        let file = try TestFile(Array(0 ..< 10))
+        defer { file.remove() }
+        stubResumable(later: [])
+        let sent = try #require(session.send(files: [try file.source()]).first)
+        #expect(await eventually { session.timeline.pending.first?.failure != nil })
+        #expect(transport.requests("PUT", partPath(1)).count == 1)
+        transport.stub("PUT", partPath(3), status: 201, json: Fixtures.messageJSON(Fixtures.fileMessage("m100", clientMessageId: sent)))
+
+        session.retry(sent)
+        #expect(await eventually { session.timeline.pending.isEmpty })
+        #expect(transport.requests("POST", uploads).count == 1)
+        #expect(transport.requests("PUT", partPath(1)).count == 1)
+        #expect(transport.requests("PUT", partPath(2)).count == 2)
+        #expect(transport.requests("PUT", partPath(3)).count == 1)
+    }
+
+    @Test func aRetriedFileTheServerForgotStartsAgain() async throws {
+        let (session, _) = try await opened()
+        let file = try TestFile(Array(0 ..< 10))
+        defer { file.remove() }
+        stubResumable(later: [404])
+        let sent = try #require(session.send(files: [try file.source()]).first)
+        #expect(await eventually { session.timeline.pending.first?.failure != nil })
+        transport.stub("PUT", partPath(3), status: 201, json: Fixtures.messageJSON(Fixtures.fileMessage("m100", clientMessageId: sent)))
+
+        session.retry(sent)
+        #expect(await eventually { session.timeline.pending.isEmpty })
+        #expect(transport.requests("PUT", partPath(3)).count == 1)
+        #expect(transport.requests("POST", uploads).count == 2)
+        #expect(transport.requests("PUT", partPath(1)).count == 2)
+        #expect(transport.requests("PUT", partPath(2)).count == 3)
+    }
+
+    @Test func aFileGoingUpAsksForBackgroundTimeUntilItsDone() async throws {
+        let (session, _) = try await opened()
+        let asked = Mutex<[String]>([])
+        let ended = Mutex(0)
+        session.backgroundTime = BackgroundTime { reason in
+            asked.withLock { $0.append(reason) }
+            return { ended.withLock { $0 += 1 } }
+        }
+        let file = try TestFile([1], name: "photo.jpg")
+        defer { file.remove() }
+        let gate = transport.hold("POST", uploads)
+        let id = try #require(session.send(files: [try file.source(contentType: "image/jpeg")]).first)
+        await gate.waitForRequest()
+        #expect(asked.withLock { $0 } == ["Sending photo.jpg"])
+        #expect(ended.withLock { $0 } == 0)
+
+        transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: Fixtures.fileMessage("m100", clientMessageId: id))
+        gate.release()
+        #expect(await eventually { session.timeline.pending.isEmpty })
+        #expect(ended.withLock { $0 } == 1)
     }
 
     @Test func discardingAFileStopsItAndDeletesATemporaryOne() async throws {

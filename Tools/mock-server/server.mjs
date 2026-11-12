@@ -9,6 +9,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_PREVIEW_BYTES, PART_SIZE, files } from "./files.mjs";
+import { createBotApi } from "./bots.mjs";
 import { cardPicture, keptCards } from "./cards.mjs";
 import { PEOPLE, deployCards, seed } from "./seed.mjs";
 import { HISTORY_PAGE_SIZE, MAX_BOOST_LENGTH, Store, randomBase36, sortableId } from "./store.mjs";
@@ -207,9 +208,18 @@ function etagged(req, res, body) {
 }
 
 const signedOut = (res) => fail(res, 401, "Not signed in");
+for (const bot of Object.values(seededBots)) rooms.engineering.members.set(bot.id, { unread: false, involvement: "mentions" });
+const bots = createBotApi({ store, files, avatarToken, readRaw });
 
 const routes = [];
 const route = (method, pattern, handler) => routes.push({ method, pattern: new RegExp(`^${pattern}$`), handler });
+
+route("GET", "/api/account/bots", (req, res) => {
+  const user = userOf(req);
+  if (!user) return signedOut(res);
+  if (user.role !== "administrator") return fail(res, 403, "Only administrators can do that");
+  reply(res, 200, { bots: bots.listed() });
+});
 
 route("GET", "/api/bootstrap", (req, res) => {
   const user = userOf(req);
@@ -527,6 +537,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "image/png", "Content-Length": png.length, "Cache-Control": "public, max-age=3600" });
       return res.end(method === "HEAD" ? undefined : png);
     }
+    if (await bots.handle(req, res, url)) return;
     const file = /^\/(files|previews)\/([^/]+)\/([^/]+)\/./.exec(url.pathname);
     if (file) return files.serve(req, res, file[1], file[2], file[3], url);
     for (const { method: wanted, pattern, handler } of routes) {
@@ -638,7 +649,7 @@ function roomSocket(conn, user, token, room, params) {
         if (outdated) return send(conn, { type: "error", message: OUTDATED, clientMessageId: frame.clientMessageId, failed: "message.create" });
         const result = store.createMessage(room, user.id, frame);
         if (refused(result)) return;
-        if (!result.duplicate && REPLIER && !result.message.parentId) {
+        if (REPLIER && !result.message.parentId) {
           cardBots(room, result.message);
           scriptedReply(room, result.message);
         }

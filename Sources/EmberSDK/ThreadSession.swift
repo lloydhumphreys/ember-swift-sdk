@@ -25,6 +25,8 @@ import Observation
     @ObservationIgnored private let started = Date()
     /// Drops typing that's gone quiet, while anyone is typing.
     @ObservationIgnored private var typingTicker: Task<Void, Never>?
+    /// Fails the older page on its way after `RoomSession.pageTimeout`.
+    @ObservationIgnored private var pageTimer: Task<Void, Never>?
 
     init(room: RoomSession, parentID: String, at replyID: String?) {
         self.room = room
@@ -62,6 +64,8 @@ import Observation
     func end() {
         typingTicker?.cancel()
         typingTicker = nil
+        pageTimer?.cancel()
+        pageTimer = nil
         roomLease?.close()
         roomLease = nil
     }
@@ -82,9 +86,12 @@ import Observation
     public func reply(body: String, plainText: String, alsoSend: Bool = false) -> String {
         let id = UUID().uuidString.lowercased()
         let frame = timeline.reply(body: body, plainText: plainText, alsoSend: alsoSend, clientMessageId: id, now: now())
-        if !room.isShutDown { room.keep(self) }
+        guard !room.isShutDown else { return id }
+        room.keep(self)
         // A reply never waits on the room's newest page, as a room message does.
-        if room.isAdmitted { room.transmit(frame) }
+        if room.isAdmitted { room.transmitReply(frame) }
+        room.watchSend(id)
+        room.saveUnsent()
         return id
     }
 
@@ -95,17 +102,26 @@ import Observation
         room.enqueue(files: files, body: body, plainText: plainText, thread: self, alsoSend: alsoSend)
     }
 
-    /// Sends a refused reply again, under the same id. A file that failed goes up again from the
-    /// start, after any still waiting.
+    /// Sends a failed reply again, under the same id, as `RoomSession.retry(_:)` does: the room is
+    /// asked first whether it has the reply, and it's created only if the room says it's missing. A
+    /// file that failed goes on from the part after the last the server took, after any still waiting.
     public func retry(_ clientMessageId: String) {
         if timeline.pending.first(where: { $0.clientMessageId == clientMessageId })?.upload != nil {
             _ = timeline.retry(clientMessageId)
             room.retryUpload(clientMessageId)
             return
         }
-        guard let frame = timeline.retry(clientMessageId) else { return }
-        if !room.isShutDown { room.keep(self) }
-        if room.isAdmitted { room.transmit(frame) }
+        guard timeline.retry(clientMessageId) != nil else { return }
+        guard !room.isShutDown else { return }
+        room.keep(self)
+        if room.isAdmitted { room.checkAgain(clientMessageId) } else { room.watchSend(clientMessageId, again: true) }
+        room.saveUnsent()
+    }
+
+    /// Connects the thread's room again after the server stopped it, as `RoomSession.reconnect()`
+    /// does. The thread opens again once the room lets the socket in.
+    public func reconnect() {
+        room.reconnect()
     }
 
     /// Forgets a pending reply. A file on its way up stops.
@@ -113,17 +129,58 @@ import Observation
         room.discardUpload(clientMessageId)
         timeline.discard(clientMessageId)
         room.settle(self)
+        room.saveUnsent()
+        room.releaseIfIdle()
+    }
+
+    /// Replies kept from an earlier launch, or from when the thread was last let go of, shown as
+    /// pending again under the same ids: a failed one as failed, the rest for the next check to send.
+    func restore(_ replies: [UnsentMessage]) {
+        for reply in replies where !timeline.pending.contains(where: { $0.clientMessageId == reply.clientMessageId }) {
+            _ = timeline.reply(body: reply.body, plainText: reply.plainText, alsoSend: reply.alsoSend, clientMessageId: reply.clientMessageId, now: reply.createdAt)
+            if let failure = reply.failure { _ = timeline.fail(reply.clientMessageId, reason: failure) }
+        }
     }
 
     /// Asks for the replies before the oldest loaded, when `timeline.hasMore` and none is on its way.
     public func loadOlder() {
         guard room.isAdmitted, let frame = timeline.olderPage() else { return }
         room.transmit(frame)
+        watchPage([frame])
     }
 
     /// Brings `replyID` into focus, as a second link into the thread asks.
     func go(to replyID: String) {
-        for frame in timeline.go(to: replyID, isOpen: room.isAdmitted) { room.transmit(frame) }
+        let frames = timeline.go(to: replyID, isOpen: room.isAdmitted)
+        for frame in frames { room.transmit(frame) }
+        watchPage(frames)
+    }
+
+    /// Times the older page from now when `sent` asks for one, as the room's are; forgets the timer
+    /// once none is on its way.
+    private func watchPage(_ sent: [ClientFrame]) {
+        guard timeline.isLoadingOlder else {
+            pageTimer?.cancel()
+            pageTimer = nil
+            return
+        }
+        guard sent.contains(where: { if case .threadBefore = $0 { true } else { false } }) else { return }
+        pageTimer?.cancel()
+        let timing = room.client.timing
+        pageTimer = Task { [weak self] in
+            do { try await timing.sleep(for: RoomSession.pageTimeout) } catch { return }
+            guard let self else { return }
+            pageTimer = nil
+            timeline.olderPageFailed()
+            takeNotice()
+        }
+    }
+
+    private func takeNotice() {
+        if let text = timeline.notice {
+            notice = text
+            timeline.notice = nil
+        }
     }
 
     /// The screen has scrolled to `timeline.focus`.
@@ -136,10 +193,8 @@ import Observation
     /// Applies a frame from the room's socket; answers what to send back.
     func apply(_ frame: ServerFrame) -> [ClientFrame] {
         let answers = timeline.apply(frame, now: now())
-        if let text = timeline.notice {
-            notice = text
-            timeline.notice = nil
-        }
+        takeNotice()
+        watchPage(answers)
         watchTyping()
         return answers
     }
@@ -152,6 +207,7 @@ import Observation
     /// The socket dropped.
     func disconnected() {
         timeline.disconnected()
+        watchPage([])
         watchTyping()
     }
 
@@ -163,8 +219,9 @@ import Observation
     /// A held reply's turn has come. One discarded meanwhile doesn't go, and one that can't go yet
     /// waits for the check that follows the thread opening again.
     func release(_ frame: ClientFrame, clientMessageId: String) {
-        guard room.isAdmitted, timeline.pending.contains(where: { $0.clientMessageId == clientMessageId && $0.failure == nil }) else { return }
-        room.transmit(frame)
+        guard timeline.pending.contains(where: { $0.clientMessageId == clientMessageId && $0.failure == nil }) else { return }
+        if room.isAdmitted { room.transmitReply(frame) }
+        room.watchSend(clientMessageId)
     }
 
     func attach(_ upload: PendingUpload, alsoSend: Bool, clientMessageId: String) {

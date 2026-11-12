@@ -7,12 +7,13 @@ import Testing
     let connector = MockSocketConnector()
     let timing: EmberTiming
     let clock: ManualClock
+    let network = MockNetworkPath()
     let socket: ReconnectingSocket
     let heard = Heard()
 
     init() {
         (timing, clock) = manualTiming()
-        socket = ReconnectingSocket(connector: connector, timing: timing) {
+        socket = ReconnectingSocket(connector: connector, timing: timing, network: network) {
             URLRequest(url: URL(string: "wss://ember.test/api/socket")!)
         }
         socket.onText = { [heard] in heard.texts.append($0) }
@@ -20,10 +21,15 @@ import Testing
     }
 
     /// Waits for the socket to be waiting to try again after `connections` tries.
+    /// A moment's settling tells the wait from a connect timeout that's about to be cancelled.
     func waitingToRetry(after connections: Int) async -> Bool {
-        await eventually {
-            connector.connections.count == connections && socket.status == .connecting && clock.sleeperCount == 1
-        }
+        guard await eventually({ isWaiting(after: connections) }) else { return false }
+        await settle()
+        return await eventually { isWaiting(after: connections) }
+    }
+
+    func isWaiting(after connections: Int) -> Bool {
+        connector.connections.count == connections && socket.status == .connecting && clock.sleeperCount == 1
     }
 
     @Test func opens() async {
@@ -131,13 +137,26 @@ import Testing
         clock.advance(by: .milliseconds(1))
         #expect(await eventually { connector.connections.count == 3 && socket.status == .open })
 
-        // Hearing from the server starts the backoff over.
+        // Hearing from the server isn't enough to start the backoff over: a server that welcomes a
+        // socket and drops it keeps being backed off from.
         connector.latest?.serverSends(#"{"type":"welcome"}"#)
         #expect(await eventually { heard.texts.count == 1 })
         connector.latest?.serverCloses(code: 1006)
         #expect(await waitingToRetry(after: 3))
+        clock.advance(by: .milliseconds(1999))
+        await settle()
+        #expect(connector.connections.count == 3)
+        clock.advance(by: .milliseconds(1))
+        #expect(await eventually { connector.connections.count == 4 && socket.status == .open })
+
+        // Staying up for the stable period is.
+        #expect(await eventually { clock.sleeperCount == 1 })
+        clock.advance(by: timing.stablePeriod)
+        await settle()
+        connector.latest?.serverCloses(code: 1006)
+        #expect(await waitingToRetry(after: 4))
         clock.advance(by: .milliseconds(500))
-        #expect(await eventually { connector.connections.count == 4 })
+        #expect(await eventually { connector.connections.count == 5 })
     }
 
     @Test func backoffDoublesUpToTheMaximumAndSpreads() {
@@ -157,17 +176,53 @@ import Testing
         #expect(await waitingToRetry(after: 1))
     }
 
-    @Test func reconnectsAtOnceWhenAskedTo() async {
+    @Test func reconnectsSoonWhenAskedTo() async {
         socket.start()
         #expect(await eventually { socket.status == .open })
+        connector.latest?.serverSends(#"{"type":"welcome"}"#)
+        #expect(await eventually { heard.texts.count == 1 })
         connector.latest?.serverCloses(code: SocketClose.reconnect)
+        // Not in the same instant: a whole room's clients would all come back at once.
+        #expect(await waitingToRetry(after: 1))
+        #expect(timing.reconnectDelay() == .milliseconds(250))
+        clock.advance(by: .milliseconds(249))
+        await settle()
+        #expect(connector.connections.count == 1)
+        clock.advance(by: .milliseconds(1))
         #expect(await eventually { connector.connections.count == 2 && socket.status == .open })
+    }
+
+    @Test func theReconnectWaitIsSpread() {
+        #expect(EmberTiming(random: { 0 }).reconnectDelay() == .milliseconds(125))
+        #expect(EmberTiming(random: { 0.999 }).reconnectDelay() < .milliseconds(375))
+    }
+
+    @Test func aServerThatKeepsAskingToReconnectIsBackedOffFrom() async {
+        connector.onConnect { connection in connection.serverCloses(code: SocketClose.reconnect) }
+        socket.start()
+        #expect(await waitingToRetry(after: 1))
+        clock.advance(by: .milliseconds(250))
+        // Asked again with nothing heard between: an ordinary failure, backed off from.
+        #expect(await waitingToRetry(after: 2))
+        clock.advance(by: .milliseconds(499))
+        await settle()
+        #expect(connector.connections.count == 2)
+        clock.advance(by: .milliseconds(1))
+        #expect(await waitingToRetry(after: 3))
+        clock.advance(by: .milliseconds(999))
+        await settle()
+        #expect(connector.connections.count == 3)
+        clock.advance(by: .milliseconds(1))
+        #expect(await waitingToRetry(after: 4))
     }
 
     @Test(arguments: [
         (SocketClosed(closeCode: 4003), ReconnectingSocket.StopReason.signedOut),
         (SocketClosed(closeCode: 4004), .notFound),
         (SocketClosed(httpStatus: 401), .signedOut),
+        (SocketClosed(httpStatus: 403), .refused(status: 403)),
+        (SocketClosed(httpStatus: 404), .refused(status: 404)),
+        (SocketClosed(httpStatus: 400), .refused(status: 400)),
     ])
     func stopsWhenTheServerSaysNotToComeBack(closed: SocketClosed, reason: ReconnectingSocket.StopReason) async {
         connector.autoOpen = closed.httpStatus == nil
@@ -186,12 +241,58 @@ import Testing
         #expect(await eventually { connector.connections.count == 2 && socket.status == .open })
     }
 
-    @Test func anUpgradeRefusedOtherwiseIsTriedAgain() async {
+    @Test(arguments: [503, 500, 408, 429])
+    func anUpgradeRefusedForNowIsTriedAgain(status: Int) async {
         connector.autoOpen = false
         socket.start()
         #expect(await eventually { connector.connections.count == 1 })
-        connector.latest?.serverCloses(httpStatus: 503)
+        connector.latest?.serverCloses(httpStatus: status)
         #expect(await waitingToRetry(after: 1))
+    }
+
+    // MARK: The network
+
+    @Test func triesAgainAsSoonAsTheNetworkIsBack() async {
+        socket.start()
+        #expect(await eventually { socket.status == .open && network.listenerCount == 1 })
+        network.set(available: false)
+        #expect(await eventually { !socket.isNetworkAvailable })
+        connector.latest?.serverCloses(code: 1006)
+        #expect(await waitingToRetry(after: 1))
+        clock.advance(by: .seconds(1))
+        await settle()
+        #expect(connector.connections.count == 1)
+        network.set(available: true)
+        #expect(await eventually { connector.connections.count == 2 && socket.status == .open })
+        #expect(socket.isNetworkAvailable)
+    }
+
+    @Test func doesntSpendTheBackoffWhileOffline() async {
+        socket.start()
+        #expect(await eventually { network.listenerCount == 1 })
+        network.set(available: false)
+        #expect(await eventually { !socket.isNetworkAvailable })
+        for tries in 1...3 {
+            #expect(await eventually { connector.connections.count == tries && socket.status == .open })
+            connector.latest?.serverCloses(code: 1006)
+            #expect(await waitingToRetry(after: tries))
+            clock.advance(by: timing.backoffMax)
+        }
+        // Back online, the next failure waits the first backoff, not the fourth.
+        #expect(await eventually { connector.connections.count == 4 && socket.status == .open })
+        network.set(available: true)
+        #expect(await eventually { socket.isNetworkAvailable })
+        connector.latest?.serverCloses(code: 1006)
+        #expect(await waitingToRetry(after: 4))
+        clock.advance(by: .milliseconds(500))
+        #expect(await eventually { connector.connections.count == 5 })
+    }
+
+    @Test func stopsListeningToTheNetworkWhenStopped() async {
+        socket.start()
+        #expect(await eventually { network.listenerCount == 1 })
+        socket.stop()
+        #expect(await eventually { network.listenerCount == 0 })
     }
 
     @Test func stoppingMidBackoffReallyStops() async {
@@ -228,6 +329,8 @@ import Testing
         socket.start()
         #expect(await eventually { socket.status == .open })
         connector.latest?.serverCloses(code: SocketClose.reconnect)
+        #expect(await eventually { socket.status == .connecting && clock.sleeperCount == 1 })
+        clock.advance(by: timing.reconnectFloor)
         #expect(await eventually { connector.connections.count == 2 })
         #expect(connector.connections.map { $0.request.query } == ["try=1", "try=2"])
         socket.stop()

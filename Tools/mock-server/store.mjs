@@ -165,7 +165,7 @@ export class Store {
   searches = new Map();
   sharedOrder = [];
   invitations = new Map();
-  account = { name: "Fernwood", tagline: "Calm software, made together" };
+  account = { name: process.env.EMBER_WORKSPACE_NAME || "Fernwood", tagline: "Calm software, made together" };
   joinCode = "";
   /// Replaced by server.mjs: who hears what, and who is where.
   hub = { room() {}, workspace() {}, viewers: () => new Set(), present: () => [], typing: () => {} };
@@ -424,7 +424,8 @@ export class Store {
   }
 
   /// Adds a message for `userId`, tells everyone, and answers it, or `{ error }` with the frame to send back.
-  /// A file's message has no body: its plain text is the file's name, and it isn't de-duplicated by `clientMessageId`, as on the real server.
+  /// A file's message has no body: its plain text is the file's name. Nothing is de-duplicated by `clientMessageId`, as on the real server:
+  /// a create sent twice is stored twice, and only `message.check` tells a client what's already stored.
   /// `bot` is for the server's own scripted bots, never a client's frame: `{ cards, cardsText }`, cards as `keptCards` answers them.
   /// A message with cards may have no text; its plain text is the text's, then the cards'.
   createMessage(room, userId, { clientMessageId, body, parentId, alsoSend, attachment }, at = Date.now(), bot = {}) {
@@ -442,8 +443,6 @@ export class Store {
       prepared.plainText = [prepared.plainText, bot.cardsText ?? ""].filter((line) => line !== "").join("\n");
       if (prepared.plainText.length > MAX_MESSAGE_LENGTH) return fail(`Messages can be up to ${MAX_MESSAGE_LENGTH.toLocaleString("en-US")} characters.`);
     } else {
-      const existing = room.messages.find((message) => message.clientMessageId === clientMessageId && message.creatorId === userId);
-      if (existing) return { message: existing, duplicate: true };
       prepared = this.prepareBody(body);
       if (prepared.error) return fail(prepared.error);
     }
@@ -650,10 +649,18 @@ export class Store {
     const hits = [];
     for (const room of this.roomsOf(userId)) {
       if (search.in && room.id !== search.in) continue;
+      // Each room is read once for which messages have replies, and which threads are yours, so a
+      // search stays linear in the room's length.
+      const parents = new Set();
+      const yourThreads = new Set();
+      for (const message of room.messages) {
+        if (message.parentId && !message.deleted) parents.add(message.parentId);
+        if (message.creatorId === userId) yourThreads.add(message.parentId ?? message.id);
+      }
       for (const message of room.messages) {
         if (message.deleted) continue;
         if (search.from && message.creatorId !== search.from) continue;
-        const threadId = message.parentId ?? (this.repliesOf(room, message.id).length > 0 ? message.id : null);
+        const threadId = message.parentId ?? (parents.has(message.id) ? message.id : null);
         if (search.inThread && threadId === null) continue;
         if (search.hasFile && !message.attachment) continue;
         if (search.hasLink && (message.attachment || !(hasLinkable(message.plainText) || /<a\s[^>]*\bhref=/i.test(message.body) || (message.cards !== undefined && (/<a\s[^>]*\bhref=/i.test(JSON.stringify(message.cards)) || hasLinkable(JSON.stringify(message.cards))))))) continue;
@@ -661,7 +668,7 @@ export class Store {
           const mine =
             message.mentionIds.includes(userId) ||
             room.kind === "direct" ||
-            (threadId !== null && room.messages.some((other) => other.creatorId === userId && (other.id === threadId || other.parentId === threadId)));
+            (threadId !== null && yourThreads.has(threadId));
           if (!mine) continue;
         }
         let matched = [];

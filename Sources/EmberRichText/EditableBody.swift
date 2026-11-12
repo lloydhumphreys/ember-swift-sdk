@@ -17,6 +17,9 @@ import Foundation
 /// - An edit that cuts into a mention keeps what is left of "@Name" as plain text.
 /// - Typed line breaks are written as `<br>`, as `RichText.body(fromPlainText:)` writes them.
 ///
+/// `body(editedTo:mentions:)` does the same and then makes a mention of each "@Name" of someone
+/// chosen while editing, as the composer does.
+///
 /// A body this can't map (badly nested markup) reads as plain text, and any change to it is sent
 /// as `RichText.body(fromPlainText:)`. Never traps.
 public struct EditableBody: Sendable {
@@ -41,18 +44,63 @@ public struct EditableBody: Sendable {
 
     /// The body to save for `newText`, keeping the formatting of everything the edit didn't touch.
     public func body(editedTo newText: String) -> String {
-        if newText == text { return body }
-        return splice(editedTo: newText) ?? RichText.body(fromPlainText: newText)
+        body(editedTo: newText, mentions: [:])
+    }
+
+    /// The body to save for `newText`, as `body(editedTo:)` writes it, with each "@" and name of
+    /// someone in `mentions` that is still plain text made a mention of them, wherever it is, as
+    /// `RichText.segments(_:mentions:)` finds them when composing.
+    ///
+    /// `mentions` maps a user id to the name written after the "@": the people chosen while
+    /// editing. Mentions already in the body stay as they are, whoever they're of. A name inside a
+    /// link or code, or one that runs into a mention, stays text. An id the server wouldn't accept
+    /// as a mention changes nothing.
+    ///
+    /// A body this can't map is sent as `RichText.body(from: RichText.segments(newText, mentions:))`.
+    public func body(editedTo newText: String, mentions: [String: String]) -> String {
+        let people = mentions.filter { Composer.isValidUserId($0.key) && !$0.value.isEmpty }
+        if newText == text, people.isEmpty || Composer.matches(newText, mentions: people).isEmpty { return body }
+        if let result = splice(editedTo: newText, mentions: people) { return result }
+        return people.isEmpty ? RichText.body(fromPlainText: newText) : RichText.body(from: RichText.segments(newText, mentions: people))
     }
 
     /// The edited body, or nil when the edit can't be mapped onto this body and loses its formatting.
-    func splice(editedTo newText: String) -> String? {
+    func splice(editedTo newText: String, mentions: [String: String] = [:]) -> String? {
         guard let layout else { return nil }
-        guard let result = layout.splice(oldText: text, newText: newText) else { return nil }
-        // Belt and braces: an edit that wouldn't read back as what was typed is not worth keeping
-        // formatting for.
-        let check = EditableBody(body: result, mentionNames: mentionNames)
-        guard check.layout != nil, check.text == Self.normalisedLineBreaks(newText) else { return nil }
+        var result = body
+        if newText != text {
+            guard let spliced = layout.splice(oldText: text, newText: newText) else { return nil }
+            // Belt and braces: an edit that wouldn't read back as what was typed is not worth
+            // keeping formatting for.
+            let check = EditableBody(body: spliced, mentionNames: mentionNames)
+            guard check.layout != nil, check.text == Self.normalisedLineBreaks(newText) else { return nil }
+            result = spliced
+        }
+        return mentions.isEmpty ? result : Self.mentioning(mentions, in: result, names: mentionNames)
+    }
+
+    /// `body` with each "@" and name of someone in `mentions` that reads as plain text made a
+    /// mention of them, or nil when the result wouldn't read back as it should.
+    private static func mentioning(_ mentions: [String: String], in body: String, names known: [String: String]) -> String? {
+        // A mention of someone the body already mentions reads with the name it already has.
+        let names = known.merging(mentions) { existing, _ in existing }
+        let reading = EditableBody(body: body, mentionNames: names)
+        guard var layout = reading.layout else { return nil }
+        let scalars = reading.text.unicodeScalars
+        var expected = Array(scalars)
+        var result = body
+        // From the end, so the offsets of those still to do stay put.
+        for match in Composer.matches(reading.text, mentions: mentions).reversed() {
+            let start = scalars.distance(from: scalars.startIndex, to: match.range.lowerBound)
+            let end = scalars.distance(from: scalars.startIndex, to: match.range.upperBound)
+            guard let mentioned = layout.mentioning(start..<end, userId: match.userId) else { continue }
+            guard let next = try? Layout(mentioned, mentionNames: names) else { return nil }
+            expected.replaceSubrange(start..<end, with: ("@" + (names[match.userId] ?? match.name)).unicodeScalars)
+            result = mentioned
+            layout = next
+        }
+        let check = EditableBody(body: result, mentionNames: names)
+        guard check.layout != nil, check.text.unicodeScalars.elementsEqual(expected) else { return nil }
         return result
     }
 
@@ -538,7 +586,28 @@ struct Layout: Sendable {
                 insertion = "<br>"
             }
         }
+        return replacing(first: first, last: last, with: insertion)
+    }
 
+    /// The body with the plain text at `range` (offsets into the text's scalars) replaced by a
+    /// mention of `userId`, or nil where that text isn't plain: not whole units, holding a mention
+    /// or a line break, or inside a link or code.
+    func mentioning(_ range: Range<Int>, userId: String) -> String? {
+        guard !range.isEmpty,
+              let first = units.firstIndex(where: { $0.textStart == range.lowerBound }),
+              let end = units[first...].firstIndex(where: { $0.textEnd == range.upperBound }) else { return nil }
+        let plain: Set<Unit.Kind> = [.character, .special, .formatting]
+        let kept: Set<String> = ["a", "code", "pre"]
+        for unit in units[first...end] {
+            guard plain.contains(unit.kind),
+                  !openElements(at: unit.source.lowerBound).contains(where: { kept.contains(elements[$0].name) }) else { return nil }
+        }
+        return replacing(first: first, last: end + 1, with: Composer.mention(userId))
+    }
+
+    /// The body with units [first, last) replaced by `insertion`, closing and opening the elements
+    /// around them so the markup stays balanced.
+    private func replacing(first: Int, last: Int, with insertion: String) -> String? {
         let p: Int
         if !insertion.isEmpty {
             p = units[first].source.lowerBound

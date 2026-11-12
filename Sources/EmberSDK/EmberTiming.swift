@@ -13,6 +13,15 @@ public struct EmberTiming: Sendable {
     public var backoffBase: Duration
     /// The longest wait before reconnecting.
     public var backoffMax: Duration
+    /// About how long a socket waits before reconnecting when the server asks it to (4001), give or
+    /// take half, so a whole room's clients don't all come back in the same instant.
+    public var reconnectFloor: Duration
+    /// How long a connection has to stay open before its end backs off from the start again.
+    public var stablePeriod: Duration
+    /// The sidebar is read again on a reconnect at most this often.
+    public var sidebarRefresh: Duration
+    /// The directory is read again on a reconnect at most this often.
+    public var directoryRefresh: Duration
     /// A typing start goes to the room at most this often.
     public var typingThrottle: Duration
     /// A composer left alone this long counts as no longer typing.
@@ -28,6 +37,10 @@ public struct EmberTiming: Sendable {
         connectTimeout: Duration = .seconds(10),
         backoffBase: Duration = .milliseconds(500),
         backoffMax: Duration = .seconds(15),
+        reconnectFloor: Duration = .milliseconds(250),
+        stablePeriod: Duration = .seconds(10),
+        sidebarRefresh: Duration = .seconds(10),
+        directoryRefresh: Duration = .seconds(60),
         typingThrottle: Duration = .seconds(1),
         typingPause: Duration = .seconds(5),
         clock: any Clock<Duration> = ContinuousClock(),
@@ -37,6 +50,10 @@ public struct EmberTiming: Sendable {
         self.connectTimeout = connectTimeout
         self.backoffBase = backoffBase
         self.backoffMax = backoffMax
+        self.reconnectFloor = reconnectFloor
+        self.stablePeriod = stablePeriod
+        self.sidebarRefresh = sidebarRefresh
+        self.directoryRefresh = directoryRefresh
         self.typingThrottle = typingThrottle
         self.typingPause = typingPause
         self.clock = clock
@@ -52,6 +69,11 @@ public struct EmberTiming: Sendable {
         let doubled = backoffBase * Double(1 << min(max(attempt, 0), 20))
         let capped = min(doubled, backoffMax)
         return capped * (0.75 + random() / 2)
+    }
+
+    /// How long to wait before reconnecting when the server asks to: `reconnectFloor`, give or take half.
+    public func reconnectDelay() -> Duration {
+        reconnectFloor * (0.5 + random())
     }
 
     /// Sleeps for `duration` on `clock`.

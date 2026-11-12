@@ -35,6 +35,21 @@ public enum AvatarStyle {
         return String(found)
     }
 
+    /// The initials to draw in a small circle: Campfire's, but no more than `limit` of them, the
+    /// first and then the last, so "David Heinemeier Hansson" is "DH" and "Dirk van den Berg" is
+    /// "DB". A name Campfire finds none in, such as "Élodie", has its first letter or digit of any
+    /// script instead, so the circle isn't left empty.
+    public static func initials(of name: String, atMost limit: Int) -> String {
+        guard limit > 0 else { return "" }
+        let all = Array(initials(of: name))
+        if all.isEmpty {
+            return name.first { $0.isLetter || $0.isNumber }.map { String($0).uppercased() } ?? ""
+        }
+        guard all.count > limit else { return String(all) }
+        guard limit > 1 else { return String(all[0]) }
+        return String(all.prefix(limit - 1) + [all[all.count - 1]])
+    }
+
     /// zlib's CRC32 of `text` as UTF-8, which Ruby's `Zlib.crc32` gives too.
     static func crc32(_ text: String) -> UInt32 {
         var crc: UInt32 = 0xFFFF_FFFF

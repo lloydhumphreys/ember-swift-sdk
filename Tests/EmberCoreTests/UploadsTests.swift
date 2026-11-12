@@ -131,7 +131,7 @@ private func file(_ id: String, _ clientMessageId: String) -> Message {
         timeline.attach(pdf, clientMessageId: "c4", now: noon())
         _ = timeline.fail("c4", reason: "Upload failed")
         let checks = timeline.apply(.welcome(you: ada, present: [], seq: 2, page: TimelinePage(messages: [])))
-        #expect(checks == [.checkMessages(clientMessageIds: ["c1", "c4"])])
+        #expect(checks == [.checkMessages(clientMessageIds: ["c1", "c2", "c4"])])
 
         let resent = timeline.apply(.messageChecked(stored: [], missing: ["c1", "c3", "c4"]))
         #expect(resent == [.createMessage(clientMessageId: "c1", body: "Hi")])

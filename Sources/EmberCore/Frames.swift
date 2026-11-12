@@ -25,7 +25,7 @@ public struct TimelinePage: Decodable, Hashable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        messages = try container.decodeIfPresent([Message].self, forKey: .messages) ?? []
+        messages = try container.decodeIfPresent(Lossy<Message>.self, forKey: .messages)?.elements ?? []
         hasMore = try container.decodeIfPresent(Bool.self, forKey: .hasMore) ?? false
         hasNewer = try container.decodeIfPresent(Bool.self, forKey: .hasNewer) ?? false
         around = try container.decodeIfPresent(String.self, forKey: .around)
@@ -252,10 +252,10 @@ public enum ServerFrame: Equatable, Sendable {
         switch type {
         case "welcome":
             let f = try read(Welcome.self)
-            return .welcome(you: f.you, present: f.present ?? [], seq: f.seq, page: try read(TimelinePage.self))
+            return .welcome(you: f.you, present: f.present?.elements ?? [], seq: f.seq, page: try read(TimelinePage.self))
         case "resumed":
             let f = try read(Resumed.self)
-            return .resumed(you: f.you, messages: f.messages ?? [], deletedIds: f.deletedIds ?? [], present: f.present ?? [], seq: f.seq)
+            return .resumed(you: f.you, messages: f.messages?.elements ?? [], deletedIds: f.deletedIds ?? [], present: f.present?.elements ?? [], seq: f.seq)
         case "message.created":
             let f = try read(MessageChange.self)
             return .messageCreated(f.message, seq: f.seq)
@@ -280,10 +280,10 @@ public enum ServerFrame: Equatable, Sendable {
             return .typing(user: f.user, typing: f.typing, threadId: f.threadId)
         case "history":
             let f = try read(History.self)
-            return .history(before: f.before, messages: f.messages ?? [], hasMore: f.hasMore ?? false)
+            return .history(before: f.before, messages: f.messages?.elements ?? [], hasMore: f.hasMore ?? false)
         case "history.after":
             let f = try read(HistoryAfter.self)
-            return .historyAfter(after: f.after, messages: f.messages ?? [], hasNewer: f.hasNewer ?? false)
+            return .historyAfter(after: f.after, messages: f.messages?.elements ?? [], hasNewer: f.hasNewer ?? false)
         case "history.around":
             return .historyAround(try read(TimelinePage.self))
         case "message.checked":
@@ -291,10 +291,10 @@ public enum ServerFrame: Equatable, Sendable {
             return .messageChecked(stored: f.stored ?? [], missing: f.missing ?? [])
         case "thread.opened":
             let f = try read(ThreadOpened.self)
-            return .threadOpened(parentId: f.parentId, parent: f.parent, messages: f.messages ?? [], hasMore: f.hasMore ?? false)
+            return .threadOpened(parentId: f.parentId, parent: f.parent?.value, messages: f.messages?.elements ?? [], hasMore: f.hasMore ?? false)
         case "thread.history":
             let f = try read(ThreadHistory.self)
-            return .threadHistory(parentId: f.parentId, before: f.before, messages: f.messages ?? [], hasMore: f.hasMore ?? false)
+            return .threadHistory(parentId: f.parentId, before: f.before, messages: f.messages?.elements ?? [], hasMore: f.hasMore ?? false)
         case "error":
             let f = try read(ErrorFrame.self)
             return .error(message: f.message ?? "", clientMessageId: f.clientMessageId, clientMessageIds: f.clientMessageIds, failed: f.failed)
@@ -305,8 +305,9 @@ public enum ServerFrame: Equatable, Sendable {
         }
     }
 
-    private struct Welcome: Decodable { var you: User; var present: [User]?; var seq: Int }
-    private struct Resumed: Decodable { var you: User; var messages: [Message]?; var deletedIds: [String]?; var present: [User]?; var seq: Int }
+    // Lists are read one element at a time: one the build can't read is left out, never the frame.
+    private struct Welcome: Decodable { var you: User; var present: Lossy<User>?; var seq: Int }
+    private struct Resumed: Decodable { var you: User; var messages: Lossy<Message>?; var deletedIds: [String]?; var present: Lossy<User>?; var seq: Int }
     private struct MessageChange: Decodable { var message: Message; var seq: Int }
     private struct MessageDeleted: Decodable { var messageId: String; var seq: Int }
     private struct BoostCreated: Decodable { var boost: Boost; var seq: Int }
@@ -314,16 +315,25 @@ public enum ServerFrame: Equatable, Sendable {
     private struct PresenceJoined: Decodable { var user: User }
     private struct PresenceLeft: Decodable { var userId: UserID }
     private struct Typing: Decodable { var user: User; var typing: Bool; var threadId: String? }
-    private struct History: Decodable { var before: String; var messages: [Message]?; var hasMore: Bool? }
-    private struct HistoryAfter: Decodable { var after: String; var messages: [Message]?; var hasNewer: Bool? }
+    private struct History: Decodable { var before: String; var messages: Lossy<Message>?; var hasMore: Bool? }
+    private struct HistoryAfter: Decodable { var after: String; var messages: Lossy<Message>?; var hasNewer: Bool? }
     private struct Checked: Decodable { var stored: [String]?; var missing: [String]? }
-    private struct ThreadOpened: Decodable { var parentId: String; var parent: Message?; var messages: [Message]?; var hasMore: Bool? }
-    private struct ThreadHistory: Decodable { var parentId: String; var before: String; var messages: [Message]?; var hasMore: Bool? }
+    private struct ThreadOpened: Decodable { var parentId: String; var parent: Lenient<Message>?; var messages: Lossy<Message>?; var hasMore: Bool? }
+    private struct ThreadHistory: Decodable { var parentId: String; var before: String; var messages: Lossy<Message>?; var hasMore: Bool? }
     private struct ErrorFrame: Decodable { var message: String?; var clientMessageId: String?; var clientMessageIds: [String]?; var failed: String? }
 }
 
 /// A frame's `type`, read before the rest.
 private struct FrameType: Decodable { var type: String }
+
+/// A value read if this build can, and nil if it can't.
+private struct Lenient<Value: Decodable>: Decodable {
+    var value: Value?
+
+    init(from decoder: Decoder) throws {
+        value = try? Value(from: decoder)
+    }
+}
 
 // MARK: - Workspace frames
 

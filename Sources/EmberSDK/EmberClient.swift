@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 /// One Ember server, as the person using this app knows it: its HTTP API, its cookies, and the
 /// sockets it opens.
@@ -10,7 +11,8 @@ import Foundation
 /// The client attaches the session cookie itself from `cookies` and keeps what the server sets
 /// there, so the same rules hold over any transport.
 public final class EmberClient: Sendable {
-    /// The server's origin, such as `https://chat.example.com`.
+    /// The server's origin, such as `https://chat.example.com`: lowercased, with no default port
+    /// and nothing after the host, as `ServerAddress.normalizedOrigin(_:)` writes it.
     public let origin: URL
     /// Where HTTP requests go.
     public let transport: any HTTPTransport
@@ -20,8 +22,11 @@ public final class EmberClient: Sendable {
     public let cookies: HTTPCookieStorage
     /// The intervals this client's sockets and stores wait on.
     public let timing: EmberTiming
+    /// Where this client's sockets hear whether there's a network.
+    public let network: any NetworkPathSource
 
     private let signedOutHandlers = SignedOutHandlers()
+    private let lastSignOut = Mutex<SignOutReason?>(nil)
 
     /// The real thing: URLSession, with cookies in `HTTPCookieStorage.shared`, which is what keeps
     /// someone signed in between launches.
@@ -37,17 +42,24 @@ public final class EmberClient: Sendable {
             origin: origin,
             transport: URLSessionHTTPTransport(session: session),
             connector: URLSessionSocketConnector(session: session),
-            cookies: cookies
+            cookies: cookies,
+            network: SystemNetworkPath()
         )
     }
 
-    /// Any transports: what tests and previews use.
-    public init(origin: URL, transport: any HTTPTransport, connector: any SocketConnector, cookies: HTTPCookieStorage = .shared, timing: EmberTiming = .standard) {
-        self.origin = Self.bareOrigin(origin)
+    /// Any transports: what tests and previews use. Its sockets take the network to be always there.
+    public convenience init(origin: URL, transport: any HTTPTransport, connector: any SocketConnector, cookies: HTTPCookieStorage = .shared, timing: EmberTiming = .standard) {
+        self.init(origin: origin, transport: transport, connector: connector, cookies: cookies, timing: timing, network: SteadyNetworkPath())
+    }
+
+    /// Any transports, with sockets that hear from `network` whether there's a network to try.
+    public init(origin: URL, transport: any HTTPTransport, connector: any SocketConnector, cookies: HTTPCookieStorage = .shared, timing: EmberTiming = .standard, network: any NetworkPathSource) {
+        self.origin = ServerAddress.normalizedOrigin(origin)
         self.transport = transport
         self.connector = connector
         self.cookies = cookies
         self.timing = timing
+        self.network = network
     }
 
     // MARK: Addresses
@@ -104,6 +116,18 @@ public final class EmberClient: Sendable {
         try await get("/api/bootstrap")
     }
 
+    /// `bootstrap()`, also answering the origin it was finally answered from: a server that redirects
+    /// (`http` to `https`, or `chat.example.com` to `ember.example.com`) is reached there, so that's
+    /// the origin to keep and make a client for. A redirect from `https` to `http` isn't followed
+    /// down: `origin` stays this client's.
+    public func checkServer() async throws -> ServerCheck {
+        let (data, response) = try await perform(try request("GET", "/api/bootstrap"))
+        let bootstrap = try decode(Bootstrap.self, from: data, status: response.statusCode)
+        var reached = response.url.map(ServerAddress.normalizedOrigin) ?? origin
+        if origin.scheme == "https" && reached.scheme != "https" { reached = origin }
+        return ServerCheck(bootstrap: bootstrap, origin: reached)
+    }
+
     /// `GET /api/me`: who's signed in. 401 when nobody is.
     public func me() async throws -> Me {
         try await get("/api/me", as: SignedIn.self).user
@@ -121,9 +145,23 @@ public final class EmberClient: Sendable {
     }
 
     /// `DELETE /api/session`, then forgets this server's cookies whatever it answered.
+    /// `signOutReason` becomes `.asked`, unless the session had ended already.
     public func signOut() async {
+        lastSignOut.withLock { $0 = $0 ?? .asked }
         _ = try? await perform(try request("DELETE", "/api/session"))
         forgetCookies()
+    }
+
+    /// Why someone was last signed out on this client: they asked (`signOut()`), or the server
+    /// ended the session (a 401). nil since signing in, or when nobody's been signed out.
+    public var signOutReason: SignOutReason? {
+        lastSignOut.withLock { $0 }
+    }
+
+    /// A socket found the session gone (closed as revoked, or its upgrade refused 401) and the app is
+    /// about to hear it: `signOutReason` becomes `.sessionEnded`, unless someone asked to sign out.
+    func sessionEnded() {
+        lastSignOut.withLock { $0 = $0 ?? .sessionEnded }
     }
 
     /// Whether a session cookie for this server is kept: someone may still be signed in.
@@ -199,19 +237,21 @@ public final class EmberClient: Sendable {
         socketRequest("/api/rooms/\(Self.segment(roomID))/socket?\(RoomSocket.query(visible: visible, since: since, around: around))")
     }
 
-    /// The workspace socket, keeping itself connected on this client's connector.
+    /// The workspace socket, keeping itself connected on this client's connector and network.
     @MainActor public func workspaceSocket() -> ReconnectingSocket {
-        ReconnectingSocket(connector: connector, timing: timing) { [self] in workspaceSocketRequest() }
+        ReconnectingSocket(connector: connector, timing: timing, network: network) { [self] in workspaceSocketRequest() }
     }
 
     /// A room's socket, keeping itself connected; `request` is asked again for each attempt.
     @MainActor public func roomSocket(request: @escaping @MainActor () -> URLRequest) -> ReconnectingSocket {
-        ReconnectingSocket(connector: connector, timing: timing, request: request)
+        ReconnectingSocket(connector: connector, timing: timing, network: network, request: request)
     }
 
     // MARK: Signed out
 
-    /// Calls `handler` whenever a request on this client is answered 401 (signing in excepted), until
+    /// Calls `handler` whenever a request on this client is answered 401 (signing in excepted) for the
+    /// session it's signed in with now (an answer about a session replaced while it was on its way
+    /// doesn't count), until
     /// the returned token is passed to `removeSignedOutHandler`. `Workspace` uses it so that any
     /// request, the app's own included, sends someone back to signing in.
     @discardableResult
@@ -273,12 +313,20 @@ public final class EmberClient: Sendable {
     }
 
     /// A 2xx answer as it is; anything else as the server's `EmberError`.
-    private func answered(_ request: URLRequest, _ answer: (Data, HTTPURLResponse)) throws -> (Data, HTTPURLResponse) {
-        let (data, response) = answer
+    private func answered(_ request: URLRequest, _ answer: Exchanged) throws -> (Data, HTTPURLResponse) {
+        let (data, response) = (answer.data, answer.response)
         guard (200..<300).contains(response.statusCode) else {
-            throw refusal(response.statusCode, data: data, request: request, response: response)
+            throw refusal(response.statusCode, data: data, request: request, response: response, sessionWasCurrent: answer.sessionWasCurrent)
         }
+        if request.url?.path == "/api/session", request.httpMethod == "POST" { lastSignOut.withLock { $0 = nil } }
         return (data, response)
+    }
+
+    /// An answer, and whether the session cookie it went with is still the one kept.
+    private struct Exchanged {
+        var data: Data
+        var response: HTTPURLResponse
+        var sessionWasCurrent: Bool
     }
 
     /// Whether `url` is on this server: the same scheme, host and port as `origin`.
@@ -286,21 +334,10 @@ public final class EmberClient: Sendable {
         Self.sameOrigin(url, origin)
     }
 
-    /// Whether two URLs have the same scheme, host and port.
+    /// Whether two URLs have the same origin, as `ServerAddress.normalizedOrigin(_:)` writes them.
     static func sameOrigin(_ one: URL, _ other: URL) -> Bool {
-        guard let scheme = one.scheme?.lowercased(), scheme == other.scheme?.lowercased() else { return false }
-        guard let host = one.host?.lowercased(), host == other.host?.lowercased() else { return false }
-        return port(of: one) == port(of: other)
-    }
-
-    /// `url`'s port, or its scheme's default.
-    private static func port(of url: URL) -> Int? {
-        if let port = url.port { return port }
-        switch url.scheme?.lowercased() {
-        case "https", "wss": return 443
-        case "http", "ws": return 80
-        default: return nil
-        }
+        guard one.scheme != nil, one.host != nil else { return false }
+        return ServerAddress.normalizedOrigin(one) == ServerAddress.normalizedOrigin(other)
     }
 
     /// Whether the answer came from this server: the request was to it, and wasn't redirected away.
@@ -310,8 +347,9 @@ public final class EmberClient: Sendable {
     }
 
     /// Sends `request` with cookies attached and keeps those the answer sets, whatever its status.
-    private func exchange(_ request: URLRequest, through send: (URLRequest) async throws -> (Data, HTTPURLResponse)) async throws -> (Data, HTTPURLResponse) {
+    private func exchange(_ request: URLRequest, through send: (URLRequest) async throws -> (Data, HTTPURLResponse)) async throws -> Exchanged {
         var request = request
+        let sentSession = sessionToken()
         if let url = request.url, isOwn(url) {
             if let sent = cookies.cookies(for: url), !sent.isEmpty {
                 for (name, value) in HTTPCookie.requestHeaderFields(with: sent) {
@@ -333,10 +371,16 @@ public final class EmberClient: Sendable {
             if Task.isCancelled || (error as? URLError)?.code == .cancelled || error is CancellationError { throw CancellationError() }
             throw EmberError.unreachable(origin)
         }
+        let sessionWasCurrent = sessionToken() == sentSession
         if isOwn(request, response), let url = response.url ?? request.url {
             keepCookies(from: response, for: url)
         }
-        return (data, response)
+        return Exchanged(data: data, response: response, sessionWasCurrent: sessionWasCurrent)
+    }
+
+    /// The session cookie kept for this server now, if any.
+    private func sessionToken() -> String? {
+        (cookies.cookies(for: origin) ?? []).first { Self.sessionCookieNames.contains($0.name) }?.value
     }
 
     /// Keeps the cookies `response` sets for `url`'s host, and none it names another domain for.
@@ -361,9 +405,12 @@ public final class EmberClient: Sendable {
         return !isAddress && host.hasSuffix("." + domain)
     }
 
-    private func refusal(_ status: Int, data: Data, request: URLRequest, response: HTTPURLResponse) -> EmberError {
+    private func refusal(_ status: Int, data: Data, request: URLRequest, response: HTTPURLResponse, sessionWasCurrent: Bool) -> EmberError {
         let error = EmberError.refusal(status: status, data: data)
-        if status == 401, isOwn(request, response), request.url?.path != "/api/session" { signedOutHandlers.call() }
+        if status == 401, sessionWasCurrent, isOwn(request, response), request.url?.path != "/api/session" {
+            lastSignOut.withLock { $0 = .sessionEnded }
+            signedOutHandlers.call()
+        }
         return error
     }
 
@@ -405,15 +452,28 @@ public final class EmberClient: Sendable {
     static func segment(_ id: String) -> String {
         id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? id
     }
+}
 
-    private static func bareOrigin(_ url: URL) -> URL {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return url }
-        components.path = ""
-        components.query = nil
-        components.fragment = nil
-        components.user = nil
-        components.password = nil
-        return components.url ?? url
+/// Why someone was signed out.
+public enum SignOutReason: Equatable, Sendable {
+    /// They signed out: `EmberClient.signOut()`.
+    case asked
+    /// The server no longer knows their session: a request was answered 401, or a socket closed as
+    /// revoked or had its upgrade refused 401.
+    case sessionEnded
+}
+
+/// What `EmberClient.checkServer()` found.
+public struct ServerCheck: Sendable {
+    /// What the server answered.
+    public var bootstrap: Bootstrap
+    /// The origin that answered, after any redirects: the one to keep.
+    public var origin: URL
+
+    /// A server's answer, and where it came from.
+    public init(bootstrap: Bootstrap, origin: URL) {
+        self.bootstrap = bootstrap
+        self.origin = origin
     }
 }
 

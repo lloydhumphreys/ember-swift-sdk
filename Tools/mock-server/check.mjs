@@ -494,6 +494,12 @@ await check("an edit, a boost and a delete are broadcast, and others' messages a
   maya.send({ type: "message.update", messageId: message.id, body: "<p>Edited</p>" });
   const updated = await sam.next((frame) => frame.type === "message.updated" && frame.message.id === message.id, "message.updated");
   expect(updated.message.plainText === "Edited" && updated.message.editedAt !== null, "edited text and time");
+  const samId = (await request("GET", "/api/me", { cookie: state.sam })).json.user.id;
+  const mentioning = `<p>Edited <strong>for <action-text-attachment content-type="application/vnd.campfire.mention" sgid="${samId}"></action-text-attachment></strong></p>`;
+  maya.send({ type: "message.update", messageId: message.id, body: mentioning });
+  const mentioned = await sam.next((frame) => frame.type === "message.updated" && frame.message.id === message.id, "message.updated with a mention");
+  expect(mentioned.message.body === mentioning && mentioned.message.plainText === `Edited for @${mentioned.message.mentions[0]?.name}`, "an edit adds a mention, kept as sent");
+  expect(mentioned.message.mentions.length === 1 && mentioned.message.mentions[0].id === samId, "the edit's mention is listed");
   sam.send({ type: "message.update", messageId: message.id, body: "<p>Not yours</p>" });
   const refused = await sam.nextOfType("error");
   expect(refused.message === "You can only edit your own messages", "refused with the real message");
@@ -568,6 +574,21 @@ await check("message.check says which messages the room stored", async () => {
   maya.send({ type: "message.check", clientMessageIds: [state.sent.clientMessageId, "never-sent"] });
   const checked = await maya.nextOfType("message.checked");
   expect(checked.stored.includes(state.sent.clientMessageId) && checked.missing.includes("never-sent"), "stored and missing");
+});
+
+await check("a create sent twice under one id is stored twice, as on the real server", async () => {
+  const maya = await roomSocket(state.rooms.Launch, state.maya);
+  await maya.nextOfType("welcome");
+  const clientMessageId = `check-${randomBytes(4).toString("hex")}`;
+  const isMine = (frame) => frame.type === "message.created" && frame.message.clientMessageId === clientMessageId;
+  maya.send({ type: "message.create", clientMessageId, body: "<p>Twice</p>" });
+  const first = await maya.next(isMine, "the first");
+  maya.send({ type: "message.create", clientMessageId, body: "<p>Twice</p>" });
+  const second = await maya.next(isMine, "the second");
+  expect(first.message.id !== second.message.id, "two messages");
+  maya.send({ type: "message.check", clientMessageIds: [clientMessageId] });
+  const checked = await maya.nextOfType("message.checked");
+  expect(checked.stored.includes(clientMessageId) && checked.missing.length === 0, "the check says it's stored");
 });
 
 await check("the scripted person types, then replies, in a DM", async () => {
@@ -1348,6 +1369,109 @@ await check("saying alert in Engineering brings Uptime's alert, which Uptime the
   }
   maya.send({ type: "message.delete", messageId: created.message.id });
   await maya.nextOfType("message.deleted");
+});
+
+// The keyed bot API
+
+const botKeys = {};
+const botMessages = () => `/rooms/${state.rooms.Engineering}/${botKeys.deploy}/messages`;
+const multipart = (parts) => {
+  const boundary = `check-${randomBytes(6).toString("hex")}`;
+  const chunks = parts.flatMap(({ name, filename, type, bytes }) => [
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"${filename === undefined ? "" : `; filename="${filename}"`}\r\n${type ? `Content-Type: ${type}\r\n` : ""}\r\n`),
+    bytes,
+    Buffer.from("\r\n"),
+  ]);
+  return { headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` }, body: Buffer.concat([...chunks, Buffer.from(`--${boundary}--\r\n`)]) };
+};
+const permalinkId = (res) => /\/rooms\/[^/]+\/@([^/?#]+)$/.exec(res.headers.location ?? "")?.[1];
+
+await check("an administrator lists the bots with their keys and rooms, and a member can't", async () => {
+  const res = await request("GET", "/api/account/bots", { cookie: state.maya });
+  expectStatus(res, 200);
+  const deploy = res.json.bots.find((bot) => bot.name === "Deploy Bot");
+  expect(deploy && /^[^-]+-[a-z0-9]{12}$/.test(deploy.key) && deploy.role === "bot", "Deploy Bot has a key");
+  expect(deploy.rooms.some((room) => room.id === state.rooms.Engineering && room.name === "Engineering"), "it is in Engineering");
+  botKeys.deploy = deploy.key;
+  expectStatus(await request("GET", "/api/account/bots", { cookie: state.leo }), 403);
+  expectStatus(await request("GET", "/api/account/bots"), 401);
+});
+
+await check("a bot posts markup to a room with only its key, and the answer's Location is the message's permalink", async () => {
+  const watcher = await roomSocket(state.rooms.Engineering, state.leo);
+  await watcher.nextOfType("welcome");
+  const res = await raw("POST", botMessages(), { headers: { "Content-Type": "text/plain" }, body: Buffer.from("Deploy <b>finished</b>") });
+  expectStatus(res, 201);
+  const id = permalinkId(res);
+  expect(id && res.headers.location.startsWith(`${origin}/rooms/${state.rooms.Engineering}/@`), "a permalink");
+  expect(res.bytes.toString("utf8") === "null" || res.bytes.length === 0, "no body worth reading");
+  const created = await watcher.next((frame) => frame.type === "message.created" && frame.message.id === id, "the message");
+  expect(created.message.creator.name === "Deploy Bot" && created.message.body.includes("<b>finished</b>"), "posted as the bot, markup kept");
+});
+
+await check("a bot posts a file as a multipart attachment", async () => {
+  const bytes = Buffer.from("build log line 1\nbuild log line 2\n");
+  const form = multipart([{ name: "attachment", filename: "build.log", type: "text/plain", bytes }]);
+  const res = await raw("POST", botMessages(), form);
+  expectStatus(res, 201);
+  const id = permalinkId(res);
+  expect(id, "a permalink");
+  const welcome = await (async () => {
+    const socket = await roomSocket(state.rooms.Engineering, state.leo, `visible=1&protocol=4&around=${id}`);
+    return socket.nextOfType("welcome");
+  })();
+  const message = welcome.messages.find((candidate) => candidate.id === id);
+  expect(message?.attachment?.name === "build.log" && message.attachment.byteSize === bytes.length, "the attachment");
+  const served = await raw("GET", message.attachment.url);
+  expect(served.status === 200 && served.bytes.equals(bytes), "its bytes are served");
+});
+
+await check("a bot's file field that isn't a file is refused, and a form with no attachment is too", async () => {
+  const text = multipart([{ name: "attachment", bytes: Buffer.from("not a file") }]);
+  const refused = await raw("POST", botMessages(), text);
+  expect(refused.status === 422 && refused.json?.error === "An attachment has to be a file", `a field is not a file (${refused.status})`);
+  const other = multipart([{ name: "other", filename: "a.txt", type: "text/plain", bytes: Buffer.from("x") }]);
+  expectStatus(await raw("POST", botMessages(), other), 422);
+});
+
+await check("a bot's blank message is refused with no body", async () => {
+  const res = await raw("POST", botMessages(), { body: Buffer.from("  \n") });
+  expect(res.status === 422 && res.bytes.length === 0, `got ${res.status}`);
+});
+
+await check("a bot boosts a message and the answer is the boost with its booster and message", async () => {
+  const posted = await raw("POST", botMessages(), { body: Buffer.from("Boost me") });
+  const id = permalinkId(posted);
+  const watcher = await roomSocket(state.rooms.Engineering, state.leo);
+  await watcher.nextOfType("welcome");
+  const res = await raw("POST", `/rooms/${state.rooms.Engineering}/${botKeys.deploy}/messages/${id}/boosts`, { body: Buffer.from(" ship it ") });
+  expectStatus(res, 201);
+  expect(res.json.content === "ship it" && res.json.booster.name === "Deploy Bot" && res.json.message.id === id, "the boost");
+  expect(res.json.message.url === `${origin}/rooms/${state.rooms.Engineering}/@${id}` && typeof res.json.created_at === "string", "its links and time");
+  const frame = await watcher.nextOfType("boost.created");
+  expect(frame.boost.messageId === id && frame.boost.content === "ship it", "everyone in the room sees it");
+});
+
+await check("a boost on a missing message is 404, and a blank or long one is refused", async () => {
+  const posted = await raw("POST", botMessages(), { body: Buffer.from("Another") });
+  const id = permalinkId(posted);
+  const boosts = (target) => `/rooms/${state.rooms.Engineering}/${botKeys.deploy}/messages/${target}/boosts`;
+  expectStatus(await raw("POST", boosts("nothing"), { body: Buffer.from("hi") }), 404);
+  expectStatus(await raw("POST", boosts(id), { body: Buffer.from("   ") }), 422);
+  const long = await raw("POST", boosts(id), { body: Buffer.from("x".repeat(17)) });
+  expect(long.status === 422 && /16 characters/.test(long.json?.error ?? ""), "too long");
+});
+
+await check("an unknown key is 401, a bot that isn't in the room is an empty 404, and no session is read", async () => {
+  const wrongToken = `${botKeys.deploy.split("-")[0]}-${"z".repeat(12)}`;
+  for (const key of ["nobody", wrongToken, `${botKeys.deploy}x`]) {
+    const res = await raw("POST", `/rooms/${state.rooms.Engineering}/${key}/messages`, { cookie: state.maya, body: Buffer.from("hi") });
+    expect(res.status === 401 && res.json?.error === "Unknown bot key", `${res.status} for a bad key`);
+  }
+  const elsewhere = await raw("POST", `/rooms/${state.rooms.Design}/${botKeys.deploy}/messages`, { body: Buffer.from("hi") });
+  expect(elsewhere.status === 404 && elsewhere.bytes.length === 0 && /text\/html/.test(elsewhere.headers["content-type"] ?? ""), "not in that room");
+  const unknownRoom = await raw("POST", `/rooms/nowhere/${botKeys.deploy}/messages`, { body: Buffer.from("hi") });
+  expectStatus(unknownRoom, 404);
 });
 
 await check("signing out answers 204, forgets the session and revokes its sockets", async () => {

@@ -180,6 +180,8 @@ import Testing
         session.jump(to: "m100")
         #expect(await eventually { first.sent("history.around").count == 1 })
         first.serverCloses(code: SocketClose.reconnect)
+        #expect(await eventually { session.status == .connecting && clock.sleeperCount == 1 })
+        clock.advance(by: timing.reconnectFloor)
         #expect(await eventually { connector.connections.count == 2 })
         #expect(connector.latest?.request.query?.contains("around=m100") == true)
         // The timeline stays loaded across the drop, so wait on the jump itself, not on loading.
@@ -211,6 +213,8 @@ import Testing
     @Test func aPlainWelcomeClearsTheAnchor() async throws {
         let (session, socket) = try await onAPage()
         socket.serverCloses(code: SocketClose.reconnect)
+        #expect(await eventually { session.status == .connecting && clock.sleeperCount == 1 })
+        clock.advance(by: timing.reconnectFloor)
         #expect(await eventually { connector.connections.count == 2 && session.timeline.anchor == nil })
     }
 }

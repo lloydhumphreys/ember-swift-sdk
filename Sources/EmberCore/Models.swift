@@ -7,16 +7,39 @@ import Foundation
 public typealias UserID = String
 public typealias RoomID = String
 
-/// An enum the server may grow. An unknown case decodes as `fallback` rather
-/// than failing the whole answer: one new role shouldn't empty the directory.
-public protocol FallbackDecodable: RawRepresentable, Decodable where RawValue == String {
-    static var fallback: Self { get }
+/// An enum the server may grow. A value this build doesn't know decodes as
+/// `unknown` with the server's string, rather than failing the whole answer
+/// (one new role shouldn't empty the directory) or passing for a value it
+/// isn't, and encodes back to that same string. A question asked of an
+/// unknown value answers no: it grants nothing and is shown as nothing it isn't.
+public protocol OpenEnum: RawRepresentable, Codable, Hashable, Sendable where RawValue == String {
+    /// The values this build knows.
+    static var known: [Self] { get }
+    static func unknown(_ rawValue: String) -> Self
 }
 
-extension FallbackDecodable {
+extension OpenEnum {
+    /// The known value with this string, or `unknown` keeping it.
+    public init(_ rawValue: String) {
+        self = Self.known.first { $0.rawValue == rawValue } ?? .unknown(rawValue)
+    }
+
+    /// The known value with this string, or nil.
+    public init?(rawValue: String) {
+        guard let known = Self.known.first(where: { $0.rawValue == rawValue }) else { return nil }
+        self = known
+    }
+
+    /// Whether this build knows the value.
+    public var isKnown: Bool { Self.known.contains(self) }
+
     public init(from decoder: Decoder) throws {
-        let raw = try decoder.singleValueContainer().decode(String.self)
-        self = Self(rawValue: raw) ?? Self.fallback
+        self.init(try decoder.singleValueContainer().decode(String.self))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
     }
 }
 
@@ -47,14 +70,39 @@ public struct Me: Codable, Hashable, Identifiable, Sendable {
     public var user: User { User(id: id, name: name) }
 }
 
-public enum Role: String, Encodable, FallbackDecodable, Sendable {
+/// Someone's role. An unknown one is neither an administrator nor a bot.
+public enum Role: OpenEnum {
     case member, administrator, bot
-    public static let fallback = Role.member
+    case unknown(String)
+
+    public static let known: [Role] = [.member, .administrator, .bot]
+
+    public var rawValue: String {
+        switch self {
+        case .member: "member"
+        case .administrator: "administrator"
+        case .bot: "bot"
+        case .unknown(let raw): raw
+        }
+    }
 }
 
-public enum UserStatus: String, Encodable, FallbackDecodable, Sendable {
+/// Whether someone can take part. An unknown status is not active.
+public enum UserStatus: OpenEnum {
     case active, deactivated, banned, suspended
-    public static let fallback = UserStatus.active
+    case unknown(String)
+
+    public static let known: [UserStatus] = [.active, .deactivated, .banned, .suspended]
+
+    public var rawValue: String {
+        switch self {
+        case .active: "active"
+        case .deactivated: "deactivated"
+        case .banned: "banned"
+        case .suspended: "suspended"
+        case .unknown(let raw): raw
+        }
+    }
 }
 
 /// Someone as the people directory lists them (`GET /api/users`).
@@ -90,9 +138,21 @@ public enum Assistant {
 
 // MARK: - Rooms
 
-public enum RoomKind: String, Encodable, FallbackDecodable, Sendable {
+/// A room's kind. An unknown kind is neither open to everyone nor direct.
+public enum RoomKind: OpenEnum {
     case open, closed, direct
-    public static let fallback = RoomKind.closed
+    case unknown(String)
+
+    public static let known: [RoomKind] = [.open, .closed, .direct]
+
+    public var rawValue: String {
+        switch self {
+        case .open: "open"
+        case .closed: "closed"
+        case .direct: "direct"
+        case .unknown(let raw): raw
+        }
+    }
 }
 
 /// A room of any kind. A shared room (`open` or `closed`) has a `name` and an
@@ -119,10 +179,24 @@ public struct Room: Codable, Hashable, Identifiable, Sendable {
 }
 
 /// How much of a room reaches someone, from most rooms' starting level down
-/// to a room hidden from their sidebar.
-public enum Involvement: String, Encodable, FallbackDecodable, CaseIterable, Sendable {
+/// to a room hidden from their sidebar. An unknown level neither hides the
+/// room nor turns its notifications off; `allCases` lists the known levels.
+public enum Involvement: OpenEnum, CaseIterable {
     case mentions, everything, nothing, invisible
-    public static let fallback = Involvement.mentions
+    case unknown(String)
+
+    public static let known: [Involvement] = [.mentions, .everything, .nothing, .invisible]
+    public static var allCases: [Involvement] { known }
+
+    public var rawValue: String {
+        switch self {
+        case .mentions: "mentions"
+        case .everything: "everything"
+        case .nothing: "nothing"
+        case .invisible: "invisible"
+        case .unknown(let raw): raw
+        }
+    }
 
     /// The level a room starts at: everything in a DM, mentions elsewhere.
     public static func starting(for kind: RoomKind) -> Involvement {
@@ -248,9 +322,20 @@ public struct Account: Decodable, Hashable, Sendable {
 
 /// `GET /api/bootstrap`: what the app needs before anyone signs in.
 public struct Bootstrap: Decodable, Sendable {
-    public enum Setup: String, FallbackDecodable, Sendable {
+    /// An unknown setup state is not pending, so the app never offers to set up a workspace it can't read.
+    public enum Setup: OpenEnum {
         case pending, complete
-        public static let fallback = Setup.complete
+        case unknown(String)
+
+        public static let known: [Setup] = [.pending, .complete]
+
+        public var rawValue: String {
+            switch self {
+            case .pending: "pending"
+            case .complete: "complete"
+            case .unknown(let raw): raw
+            }
+        }
     }
 
     /// Whether anyone has set the workspace up yet.
@@ -410,21 +495,21 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
         clientMessageId = try container.decodeIfPresent(String.self, forKey: .clientMessageId) ?? id
         roomId = try container.decode(RoomID.self, forKey: .roomId)
         creator = try container.decode(User.self, forKey: .creator)
-        body = try container.decodeIfPresent(String.self, forKey: .body) ?? ""
-        plainText = try container.decodeIfPresent(String.self, forKey: .plainText) ?? ""
-        mentions = try container.decodeIfPresent([User].self, forKey: .mentions) ?? []
         createdAt = try container.decode(Date.self, forKey: .createdAt)
-        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
-        editedAt = try container.decodeIfPresent(Date.self, forKey: .editedAt)
-        boosts = try container.decodeIfPresent([Boost].self, forKey: .boosts) ?? []
-        attachment = try container.decodeIfPresent(StoredFile.self, forKey: .attachment)
-        // A list the server sent that this build can't read leaves the message without cards, never unread.
-        cards = Card.list((try? container.decodeIfPresent(JSONValue.self, forKey: .cards)) ?? nil)
         parentId = try container.decodeIfPresent(String.self, forKey: .parentId)
-        alsoSent = try container.decodeIfPresent(Bool.self, forKey: .alsoSent)
-        parentText = try container.decodeIfPresent(String.self, forKey: .parentText)
-        thread = try container.decodeIfPresent(ThreadSummary.self, forKey: .thread)
-        deleted = try container.decodeIfPresent(Bool.self, forKey: .deleted)
+        // Past what places it, a part this build can't read is left out and the message kept.
+        body = (try? container.decodeIfPresent(String.self, forKey: .body)) ?? ""
+        plainText = (try? container.decodeIfPresent(String.self, forKey: .plainText)) ?? ""
+        mentions = (try? container.decodeIfPresent(Lossy<User>.self, forKey: .mentions))?.elements ?? []
+        updatedAt = (try? container.decodeIfPresent(Date.self, forKey: .updatedAt)) ?? createdAt
+        editedAt = try? container.decodeIfPresent(Date.self, forKey: .editedAt)
+        boosts = (try? container.decodeIfPresent(Lossy<Boost>.self, forKey: .boosts))?.elements ?? []
+        attachment = try? container.decodeIfPresent(StoredFile.self, forKey: .attachment)
+        cards = Card.list((try? container.decodeIfPresent(JSONValue.self, forKey: .cards)) ?? nil)
+        alsoSent = try? container.decodeIfPresent(Bool.self, forKey: .alsoSent)
+        parentText = try? container.decodeIfPresent(String.self, forKey: .parentText)
+        thread = try? container.decodeIfPresent(ThreadSummary.self, forKey: .thread)
+        deleted = try? container.decodeIfPresent(Bool.self, forKey: .deleted)
     }
 }
 
@@ -470,6 +555,24 @@ public enum Limits {
 }
 
 // MARK: - Loose JSON
+
+/// A list read one element at a time, leaving out any this build can't read.
+struct Lossy<Element: Decodable>: Decodable {
+    var elements: [Element]
+
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var elements: [Element] = []
+        while !container.isAtEnd {
+            if let element = try? container.decode(Element.self) {
+                elements.append(element)
+            } else {
+                _ = try container.decode(JSONValue.self)
+            }
+        }
+        self.elements = elements
+    }
+}
 
 /// JSON the app carries without reading yet.
 public enum JSONValue: Codable, Hashable, Sendable {

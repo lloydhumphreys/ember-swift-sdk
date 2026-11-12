@@ -306,7 +306,7 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
         state.disconnected()
 
         let checks = open(&state, [])
-        #expect(checks == [.checkMessages(clientMessageIds: ["c2", "c5"])])
+        #expect(checks == [.checkMessages(clientMessageIds: ["c2", "c3", "c5"])])
         let resent = state.apply(.messageChecked(stored: [], missing: ["c2", "c3", "c5", "c9"]))
         #expect(resent == [.createMessage(clientMessageId: "c2", body: "Two", parentId: "m001", alsoSend: true)])
         #expect(state.pending.map(\.id) == ["c2", "c3", "c4", "c5"])

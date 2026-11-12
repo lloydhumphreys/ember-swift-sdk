@@ -1,8 +1,12 @@
 import Foundation
 
 /// One socket that keeps itself connected: reconnects with backoff, pings every 25 s, and gives up
-/// only when the server says the session or the room is gone. A port of the web client's
-/// `reconnecting-socket.ts`.
+/// only when the server says the session or the room is gone, or refuses it outright. A port of the
+/// web client's `reconnecting-socket.ts`.
+///
+/// Backoff starts over only once a connection has stayed open for `EmberTiming.stablePeriod`. While
+/// the network is gone it waits without backing off further, and it tries again as soon as the
+/// network is back.
 ///
 /// It lives on the main actor, and its callbacks arrive there in order. `stop()` stops it wherever it
 /// is, connecting or waiting to try again, and `start()` brings it back.
@@ -25,6 +29,9 @@ import Foundation
         case signedOut
         /// The room is gone, or you're no longer in it (4004).
         case notFound
+        /// The upgrade was refused with `status`, a 4xx that trying again won't change (anything
+        /// but 401, 408 and 429), such as 403 or 404 when the server doesn't take this origin.
+        case refused(status: Int)
     }
 
     /// Where the socket is now.
@@ -33,6 +40,10 @@ import Foundation
     public var onStatus: (@MainActor (Status) -> Void)?
     /// Every text frame but `pong`, in order.
     public var onText: (@MainActor (String) -> Void)?
+    /// Whether the network was there when last heard, while the socket is started.
+    public private(set) var isNetworkAvailable = true
+    /// Hears every change of `isNetworkAvailable`.
+    var onNetwork: (@MainActor (Bool) -> Void)?
 
     /// The text of a ping, which the server answers `{"type":"pong"}`.
     public static let ping = #"{"type":"ping"}"#
@@ -40,18 +51,27 @@ import Foundation
     private let connector: any SocketConnector
     private let request: @MainActor () -> URLRequest
     private let timing: EmberTiming
+    private let network: any NetworkPathSource
     /// Bumped by every `start()` and `stop()`, so a loop that's been stopped notices on waking.
     private var generation = 0
     private var loop: Task<Void, Never>?
     private var connection: (any SocketConnection)?
     private var outbox: AsyncStream<String>.Continuation?
     private var attempt = 0
+    /// The wait before the next try, which the network coming back cuts short.
+    private var waiting: Task<Void, any Error>?
 
     /// A socket on `connector`. `request` is asked again for each attempt, so a room socket can name
     /// the latest `seq`. `timing` says how long it waits; tests pass one on a `ManualClock`.
-    public init(connector: any SocketConnector, timing: EmberTiming = .standard, request: @escaping @MainActor () -> URLRequest) {
+    public convenience init(connector: any SocketConnector, timing: EmberTiming = .standard, request: @escaping @MainActor () -> URLRequest) {
+        self.init(connector: connector, timing: timing, network: SteadyNetworkPath(), request: request)
+    }
+
+    /// A socket on `connector` that hears from `network` whether there's a network to try.
+    public init(connector: any SocketConnector, timing: EmberTiming = .standard, network: any NetworkPathSource, request: @escaping @MainActor () -> URLRequest) {
         self.connector = connector
         self.timing = timing
+        self.network = network
         self.request = request
     }
 
@@ -77,6 +97,8 @@ import Foundation
     public func stop() {
         generation += 1
         tearDown()
+        waiting?.cancel()
+        waiting = nil
         loop?.cancel()
         loop = nil
         set(.idle)
@@ -93,25 +115,47 @@ import Foundation
     // MARK: The loop
 
     private func run(_ generation: Int) async {
+        let watcher = Task { [weak self, network] in
+            for await available in network.availability() {
+                guard let self, self.isCurrent(generation) else { return }
+                self.networkChanged(available)
+            }
+        }
+        defer { watcher.cancel() }
+
         var delay: Duration? = nil
+        // Whether the last connection ended at the server's asking (4001) without hearing a thing.
+        var askedAgainUnheard = false
         while isCurrent(generation) {
             if let delay {
                 set(.connecting)
-                do { try await timing.sleep(for: delay) } catch { return }
-                guard isCurrent(generation) else { return }
+                guard await wait(delay, generation) else { return }
             }
             set(.connecting)
             let ended = await connectOnce(generation)
             guard isCurrent(generation) else { return }
             tearDown()
-            switch ended {
+            if ended.openFor >= timing.stablePeriod { attempt = 0 }
+            var ending = ended.ending
+            if ending == .now {
+                // Asked twice running without a word between: the server's closing every socket as it
+                // opens, so it's backed off from like any other failure.
+                if askedAgainUnheard && !ended.heard { ending = .later }
+                askedAgainUnheard = !ended.heard
+            } else {
+                askedAgainUnheard = false
+            }
+            switch ending {
             case .stop(let reason):
                 generation == self.generation ? set(.stopped(reason)) : ()
                 loop = nil
                 return
             case .now:
-                attempt = 0
-                delay = .zero
+                delay = timing.reconnectDelay()
+            case .later where !isNetworkAvailable:
+                // Nothing will get through until the network's back, which cuts this short; the
+                // backoff isn't spent on it.
+                delay = timing.backoffMax
             case .later:
                 delay = timing.backoff(attempt: attempt)
                 attempt += 1
@@ -119,22 +163,55 @@ import Foundation
         }
     }
 
-    private enum Ending {
+    /// Waits `delay`, or until the network comes back. False when the socket was stopped meanwhile.
+    private func wait(_ delay: Duration, _ generation: Int) async -> Bool {
+        let timing = timing
+        let sleeper = Task { try await timing.sleep(for: delay) }
+        waiting = sleeper
+        await withTaskCancellationHandler {
+            _ = await sleeper.result
+        } onCancel: {
+            sleeper.cancel()
+        }
+        if waiting == sleeper { waiting = nil }
+        return isCurrent(generation)
+    }
+
+    private func networkChanged(_ available: Bool) {
+        guard available != isNetworkAvailable else { return }
+        isNetworkAvailable = available
+        onNetwork?(available)
+        if available, let waiting {
+            attempt = 0
+            waiting.cancel()
+        }
+    }
+
+    private enum Ending: Equatable {
         case stop(StopReason)
         case now
         case later
     }
 
+    /// How a connection ended, whether anything came from the server on it, and how long it was open.
+    private struct Ended {
+        var ending: Ending
+        var heard = false
+        var openFor: Duration = .zero
+    }
+
     /// One connection, from asking for it to its end.
-    private func connectOnce(_ generation: Int) async -> Ending {
+    private func connectOnce(_ generation: Int) async -> Ended {
         let connection = connector.connect(request())
         self.connection = connection
 
         guard await opens(connection) else {
             connection.close()
-            return isCurrent(generation) ? ending(of: lastClose) : .later
+            return Ended(ending: isCurrent(generation) ? ending(of: lastClose) : .later)
         }
-        guard isCurrent(generation) else { return .later }
+        guard isCurrent(generation) else { return Ended(ending: .later) }
+        let openFor = timing.stopwatch()
+        var heardAny = false
 
         let (stream, continuation) = AsyncStream<String>.makeStream()
         outbox = continuation
@@ -178,14 +255,12 @@ import Foundation
             do {
                 text = try await connection.receive()
             } catch {
-                guard isCurrent(generation) else { return .later }
-                return ending(of: error as? SocketClosed ?? SocketClosed())
+                guard isCurrent(generation) else { return Ended(ending: .later) }
+                return Ended(ending: ending(of: error as? SocketClosed ?? SocketClosed()), heard: heardAny, openFor: openFor())
             }
-            guard isCurrent(generation) else { return .later }
+            guard isCurrent(generation) else { return Ended(ending: .later) }
             heard.since = true
-            // Hearing from the server means it let this connection in, so the next close backs off from
-            // the start again. (A server that closes a socket as soon as it opens keeps being backed off from.)
-            attempt = 0
+            heardAny = true
             if Self.isPong(text) { continue }
             onText?(text)
         }
@@ -233,6 +308,9 @@ import Foundation
     private func ending(of closed: SocketClosed) -> Ending {
         if closed.httpStatus == 401 || closed.closeCode == SocketClose.revoked { return .stop(.signedOut) }
         if closed.closeCode == SocketClose.notFound { return .stop(.notFound) }
+        if let status = closed.httpStatus, (400..<500).contains(status), status != 408, status != 429 {
+            return .stop(.refused(status: status))
+        }
         if closed.closeCode == SocketClose.reconnect { return .now }
         return .later
     }

@@ -26,7 +26,7 @@ public struct UploadSource: Sendable, Hashable {
     public init(fileURL: URL, name: String? = nil, contentType: String, preview: UploadPreview? = nil, isTemporary: Bool = false) throws {
         let name = name ?? fileURL.lastPathComponent
         if let refusal = Uploads.refusal(name: name, contentType: contentType) {
-            throw EmberError(status: 422, message: refusal)
+            throw EmberError(kind: .invalid, status: 422, message: refusal)
         }
         let size: Int?
         do {
@@ -36,7 +36,7 @@ public struct UploadSource: Sendable, Hashable {
             size = nil
         }
         guard let size, FileManager.default.isReadableFile(atPath: fileURL.path) else {
-            throw EmberError(status: 0, message: "That file can’t be read.")
+            throw EmberError.unreadableFile
         }
         self.fileURL = fileURL
         self.name = name
@@ -70,11 +70,12 @@ extension EmberClient {
     /// PUTs one part. Answers the posted message when this part completed the upload (201, or 200
     /// for a repeat), nil otherwise (204).
     ///
-    /// A part the network failed to deliver is sent again, twice at most, after a wait as a socket
-    /// waits to reconnect; one the server refused isn't. The exception is a 409 for part 1: the
-    /// first part sent again while the server still had the try before it, whose answer was lost.
-    /// It's sent again at once within the same budget, and if the 409 lasts, it fails as
-    /// `Uploads.failed` rather than with the server's words.
+    /// A part the network failed to deliver, or the server couldn't take just then (408, 429 or a
+    /// 5xx), is sent again, `partRetries` times at most, after a wait as a socket waits to
+    /// reconnect; one the server refused isn't. The exception is a 409 for part 1: the first part
+    /// sent again while the server still had the try before it, whose answer was lost. It's sent
+    /// again at once within the same budget, and if the 409 lasts, it fails as `Uploads.failed`
+    /// rather than with the server's words.
     public func uploadPart(
         in roomID: RoomID, upload uploadID: String, part: Int, data: Data,
         progress: @escaping @Sendable (Int) -> Void = { _ in }
@@ -86,7 +87,7 @@ extension EmberClient {
                 let (body, response) = try await perform(bytes(path, data.count), uploading: data, progress: progress)
                 guard response.statusCode != 204, !body.isEmpty else { return nil }
                 return try decode(Message.self, from: body, status: response.statusCode)
-            } catch let error as EmberError where error.isUnreachable && attempt < Self.partRetries {
+            } catch let error as EmberError where Self.isPassing(error) && attempt < Self.partRetries {
                 try await timing.sleep(for: timing.backoff(attempt: attempt))
                 attempt += 1
             } catch let error as EmberError where part == 1 && error.status == 409 {
@@ -118,42 +119,80 @@ extension EmberClient {
         parentId: String? = nil, alsoSend: Bool = false,
         progress: @escaping @Sendable (Int) -> Void = { _ in }
     ) async throws -> Message {
-        guard source.byteSize <= Limits.fileBytes else { throw EmberError(status: 413, message: Uploads.tooLarge(source.name)) }
+        try await upload(
+            source, in: roomID, clientMessageId: clientMessageId, parentId: parentId, alsoSend: alsoSend,
+            resuming: nil, checkpoint: { _ in }, progress: progress
+        )
+    }
+
+    /// `upload(_:in:clientMessageId:parentId:alsoSend:progress:)`, going on from `resuming`, an
+    /// earlier try's last `checkpoint`: its ticket, without the parts the server took. The server
+    /// can't say which parts it has, so the checkpoint is what does; one it no longer knows (404)
+    /// starts again from the start. `checkpoint` hears each part the server takes.
+    func upload(
+        _ source: UploadSource, in roomID: RoomID, clientMessageId: String,
+        parentId: String?, alsoSend: Bool, resuming: UploadCheckpoint?,
+        checkpoint: @escaping @Sendable (UploadCheckpoint) async -> Void,
+        progress: @escaping @Sendable (Int) -> Void
+    ) async throws -> Message {
+        guard source.byteSize <= Limits.fileBytes else { throw EmberError(kind: .invalid, status: 413, message: Uploads.tooLarge(source.name)) }
         let file: FileHandle
         do {
             file = try FileHandle(forReadingFrom: source.fileURL)
         } catch {
-            throw EmberError(status: 0, message: "That file can’t be read.")
+            throw EmberError.unreadableFile
         }
         defer { try? file.close() }
 
-        let ticket = try await startUpload(in: roomID, NewUpload(
-            name: source.name, type: source.contentType, size: source.byteSize,
-            clientMessageId: clientMessageId, parentId: parentId, alsoSend: alsoSend
-        ))
-        // Checked before any part goes: a ticket that doesn't fit the file would trap reading it,
-        // or send parts for a very long time.
-        guard ticket.fits(size: source.byteSize) else { throw EmberError.unreadable(status: 201) }
-        var sent = 0
-        for part in 1 ... ticket.parts {
-            try Task.checkCancellation()
-            if part == ticket.parts, let preview = source.preview {
-                // A file without its picture is still the file, so a refused preview doesn't stop it.
-                try? await uploadPreview(in: roomID, upload: ticket.id, preview)
-                try Task.checkCancellation()
+        var resuming = resuming.flatMap { $0.fits(size: source.byteSize) ? $0 : nil }
+        while true {
+            let ticket: UploadTicket
+            if let resuming {
+                ticket = resuming.ticket
+            } else {
+                ticket = try await startUpload(in: roomID, NewUpload(
+                    name: source.name, type: source.contentType, size: source.byteSize,
+                    clientMessageId: clientMessageId, parentId: parentId, alsoSend: alsoSend
+                ))
+                // Checked before any part goes: a ticket that doesn't fit the file would trap reading it,
+                // or send parts for a very long time.
+                guard ticket.fits(size: source.byteSize) else { throw EmberError.unreadable(status: 201) }
             }
-            let data = try Self.read(file, ticket.range(ofPart: part, size: source.byteSize))
-            let before = sent
-            let message = try await uploadPart(in: roomID, upload: ticket.id, part: part, data: data) { progress(before + $0) }
-            sent += data.count
-            // An earlier part can answer the message too, when the upload was finished already.
-            if let message { return message }
+            let done = resuming?.partsDone ?? 0
+            var sent = done == 0 ? 0 : ticket.range(ofPart: done, size: source.byteSize).upperBound
+            if done > 0 { progress(sent) }
+            do {
+                for part in done + 1 ... ticket.parts {
+                    try Task.checkCancellation()
+                    if part == ticket.parts, let preview = source.preview {
+                        // A file without its picture is still the file, so a refused preview doesn't stop it.
+                        try? await uploadPreview(in: roomID, upload: ticket.id, preview)
+                        try Task.checkCancellation()
+                    }
+                    let data = try Self.read(file, ticket.range(ofPart: part, size: source.byteSize))
+                    let before = sent
+                    let message = try await uploadPart(in: roomID, upload: ticket.id, part: part, data: data) { progress(before + $0) }
+                    sent += data.count
+                    // An earlier part can answer the message too, when the upload was finished already.
+                    if let message { return message }
+                    await checkpoint(UploadCheckpoint(ticket: ticket, partsDone: part))
+                }
+            } catch let error as EmberError where resuming != nil && error.status == 404 {
+                resuming = nil
+                continue
+            }
+            throw EmberError(kind: .undecodable, status: 204, message: Uploads.failed)
         }
-        throw EmberError(status: 0, message: Uploads.failed)
     }
 
     /// How many times a part the network dropped is sent again.
-    static let partRetries = 2
+    static let partRetries = 6
+
+    /// Whether a part's failure may pass if it's sent again: no answer, a timeout, too many at once,
+    /// or the server's own trouble.
+    static func isPassing(_ error: EmberError) -> Bool {
+        error.isUnreachable || error.status == 408 || error.status == 429 || (500 ... 599).contains(error.status)
+    }
 
     private static func uploadsPath(_ roomID: RoomID) -> String {
         "/api/rooms/\(segment(roomID))/uploads"
@@ -175,7 +214,19 @@ extension EmberClient {
             guard data.count == range.count else { throw CocoaError(.fileReadCorruptFile) }
             return data
         } catch {
-            throw EmberError(status: 0, message: "That file can’t be read.")
+            throw EmberError.unreadableFile
         }
+    }
+}
+
+/// How far an upload got: its ticket, and how many parts from the first the server took.
+struct UploadCheckpoint: Hashable, Sendable {
+    let ticket: UploadTicket
+    let partsDone: Int
+
+    /// Whether an upload of a file of `size` bytes can go on from here: the ticket fits it, and a
+    /// part is left to send.
+    func fits(size: Int) -> Bool {
+        ticket.fits(size: size) && (1 ..< ticket.parts).contains(partsDone)
     }
 }

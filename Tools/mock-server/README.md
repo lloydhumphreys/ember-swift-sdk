@@ -16,6 +16,7 @@ A small Node server (no dependencies, Node 18 or later) that speaks Ember's HTTP
 | `EMBER_SEED_PASSWORD` | The shared password for every seeded account. |
 | `EMBER_GUEST_SIGN_IN` | `1` turns on signing in with just a name. Otherwise `POST /api/session {name}` answers 403. |
 | `EMBER_REPLIER` | `0` turns off the scripted replier. |
+| `EMBER_WORKSPACE_NAME` | The workspace's name in the bootstrap and welcome. Default Fernwood. Messages still say Fernwood. |
 | `EMBER_SEARCH_PAGE` | Search page size. Default 100. Lower it to test paging. |
 | `MEDIA_ORIGIN` | Origin written into the seeded cards' image URLs. Default `http://media.localhost:<PORT>`. |
 | `EMBER_BOT_DELAY` | Milliseconds before a scripted bot posts its card. Default 1500. |
@@ -81,6 +82,12 @@ Card images are generated PNGs at `GET /card-media/<name>.png` (`avatar`, `icon`
 Editing a card message answers `Messages with cards can't be edited.` (`failed: "message.update"`). Boosts and deletes work.
 
 While the replier is on, a person's top-level message in Engineering containing "deploy" (any case) brings a Deploy Bot card after `EMBER_BOT_DELAY`, and "alert" brings an Uptime alert card that Uptime replaces `EMBER_BOT_REPLACE_DELAY` later with plain text. The replacement drops the cards and everyone connected gets `message.updated` without a `cards` key.
+
+## Bots
+
+`POST /rooms/:room/:key/messages` and `POST /rooms/:room/:key/messages/:id/boosts` are the keyed bot API: no session or cookie, and the key is `<bot id>-<token>`. A text body is the message's markup whatever its type. A multipart body with an `attachment` file posts a file. A message answers 201 with the permalink in `Location` and no body; a boost answers 201 with `{id, content, created_at, booster, message}`. A key that is no bot's is 401 `Unknown bot key`; a bot that isn't in the room, a missing message, or a blank body is an empty 404 or 422, as the real server answers.
+
+Deploy Bot and Uptime are in Engineering. Their keys are made at start-up, and an administrator reads them from `GET /api/account/bots`. Not ported: reading, editing and deleting through a key, removing a boost, and the `/slack` webhook.
 
 ## Not implemented
 

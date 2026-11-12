@@ -134,6 +134,14 @@ import Testing
         #expect(workspace.room(alan.id) != nil)
     }
 
+    @Test func aMessageSentBeforeTheRoomsFirstWelcomeIsSavedAtOnce() throws {
+        let session = workspace.session(for: Fixtures.general.id)
+        let store = try #require(session.unsentStore as? MemoryUnsentMessageStore)
+        let id = session.send(body: "<p>Early</p>", plainText: "Early")
+        #expect(store.saved.values.flatMap { $0 }.map(\.clientMessageId) == [id])
+        #expect(store.saved.keys.map(\.userID) == [Fixtures.me.id])
+    }
+
     @Test func aRoomKeepsItsSession() async {
         let session = workspace.session(for: Fixtures.general.id)
         #expect(workspace.session(for: Fixtures.general.id) === session)
@@ -156,6 +164,27 @@ import Testing
         #expect(await eventually { session.status == .idle })
         await settle()
         #expect(signedOut == 1)
+    }
+
+    @Test func anUpgradeRefused401SaysTheSessionEndedBeforeTheAppHears() async throws {
+        try await started()
+        let client = workspace.client
+        var heard: [SignOutReason?] = []
+        workspace.onSignedOut = { heard.append(client.signOutReason) }
+        transport.stub("GET", "/api/me", status: 401, json: Fixtures.errorJSON("Sign in."))
+        connector.autoOpen = false
+        connector.onConnect { $0.serverCloses(httpStatus: 401) }
+        let socket = try #require(connector.latest)
+        socket.serverCloses(code: SocketClose.reconnect)
+        for _ in 0 ..< 12 where connector.connections.count < 2 {
+            clock.advance(by: .seconds(5))
+            await settle()
+        }
+        #expect(connector.connections.count == 2)
+        #expect(await eventually { heard == [.sessionEnded] })
+
+        await client.signOut()
+        #expect(client.signOutReason == .sessionEnded)
     }
 
     @Test func aRefusedUpgradeIsCheckedBeforeSigningOut() async throws {

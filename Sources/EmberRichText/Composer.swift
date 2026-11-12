@@ -5,7 +5,7 @@ import Foundation
 enum Composer {
     /// The mention attachment as render.ts's `mentionAttachment` builds it (content-type, then sgid;
     /// an sgid is the user's id, mentions.ts `mentionSgid`). The server fills in `content` itself.
-    private static func mention(_ userId: String) -> String {
+    static func mention(_ userId: String) -> String {
         "<action-text-attachment content-type=\"application/vnd.campfire.mention\" sgid=\"\(userId)\"></action-text-attachment>"
     }
 
@@ -19,6 +19,56 @@ enum Composer {
 
     static func body(fromPlainText text: String) -> String {
         body(from: [.text(text)])
+    }
+
+    /// `text` as segments, each "@" and name of someone in `mentions` (a user id to the name the
+    /// composer wrote for them) a mention of them, and the rest text. A name counts only as a whole:
+    /// at the start or after something that isn't a letter or digit, and not running on into one, so
+    /// "@Ann" isn't found in "@Anna" or "x@Ann". Where two names fit, the longer one wins.
+    static func segments(_ text: String, mentions: [String: String]) -> [ComposeSegment] {
+        var segments: [ComposeSegment] = []
+        var runStart = text.startIndex
+        for match in matches(text, mentions: mentions) {
+            if runStart < match.range.lowerBound { segments.append(.text(String(text[runStart..<match.range.lowerBound]))) }
+            segments.append(.mention(userId: match.userId, name: match.name))
+            runStart = match.range.upperBound
+        }
+        if runStart < text.endIndex || segments.isEmpty { segments.append(.text(String(text[runStart...]))) }
+        return segments
+    }
+
+    /// Where `text` has the "@" and name of someone in `mentions`, in order, as `segments` finds them.
+    static func matches(_ text: String, mentions: [String: String]) -> [(userId: String, name: String, range: Range<String.Index>)] {
+        let people = mentions
+            .filter { !$0.value.isEmpty }
+            .sorted { ($0.value.count, $1.key) > ($1.value.count, $0.key) }
+        guard !people.isEmpty else { return [] }
+        var matches: [(userId: String, name: String, range: Range<String.Index>)] = []
+        var index = text.startIndex
+        var previous: Character?
+        while index < text.endIndex {
+            let character = text[index]
+            let afterAt = text.index(after: index)
+            if character == "@", !(previous.map(isWordCharacter) ?? false),
+               let (userId, name, end) = people.lazy.compactMap({ person -> (String, String, String.Index)? in
+                   guard text[afterAt...].hasPrefix(person.value) else { return nil }
+                   let end = text.index(afterAt, offsetBy: person.value.count)
+                   guard end == text.endIndex || !isWordCharacter(text[end]) else { return nil }
+                   return (person.key, person.value, end)
+               }).first {
+                matches.append((userId, name, index..<end))
+                previous = text[text.index(before: end)]
+                index = end
+                continue
+            }
+            previous = character
+            index = afterAt
+        }
+        return matches
+    }
+
+    private static func isWordCharacter(_ character: Character) -> Bool {
+        character.isLetter || character.isNumber
     }
 
     static func body(from segments: [ComposeSegment]) -> String {

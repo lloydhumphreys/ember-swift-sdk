@@ -59,6 +59,8 @@ import Testing
 
         session.retry(id)
         #expect(session.timeline.pending.first?.failure == nil)
+        #expect(await eventually { socket.sent("message.check").last == .checkMessages(clientMessageIds: [id]) })
+        socket.serverSends(Fixtures.RoomFrames.messageChecked(stored: [], missing: [id]))
         #expect(await eventually { socket.sent("message.create").count == 2 })
         session.discard(id)
         #expect(session.timeline.pending.isEmpty)
@@ -215,6 +217,32 @@ import Testing
         session.onSignedOut = { signedOut = true }
         session.start()
         #expect(await eventually { signedOut })
+    }
+
+    @Test func aRevokedRoomSocketSaysTheSessionEndedBeforeTheAppHears() async {
+        connector.onConnect { connection in connection.serverCloses(code: SocketClose.revoked) }
+        let session = session(welcome: false)
+        let client = session.client
+        var heard: [SignOutReason?] = []
+        session.onSignedOut = { heard.append(client.signOutReason) }
+        session.start()
+        #expect(await eventually { heard == [.sessionEnded] })
+
+        // The app signing out on hearing it doesn't make it asked.
+        await client.signOut()
+        #expect(client.signOutReason == .sessionEnded)
+    }
+
+    @Test func aSignOutYouAskedForStaysAskedWhenTheRoomSocketCloses() async throws {
+        let session = session()
+        let socket = try await opened(session)
+        let client = session.client
+        var signedOut = false
+        session.onSignedOut = { signedOut = true }
+        await client.signOut()
+        socket.serverCloses(code: SocketClose.revoked)
+        #expect(await eventually { signedOut })
+        #expect(client.signOutReason == .asked)
     }
 
     @Test func visibilityIsSent() async throws {

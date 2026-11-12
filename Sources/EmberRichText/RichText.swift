@@ -28,6 +28,19 @@ public enum RichText {
         Composer.body(from: segments)
     }
 
+    /// Text typed in plain as segments for `body(from:)`: each "@" and the name of someone in
+    /// `mentions` (a user id to the name the composer wrote for them) mentions them, where it stands
+    /// as a whole name rather than the start of a longer word.
+    public static func segments(_ text: String, mentions: [String: String]) -> [ComposeSegment] {
+        Composer.segments(text, mentions: mentions)
+    }
+
+    /// Where in `text` `segments` finds each mention, "@" and name, in order: what a composer shows
+    /// as a mention while it's being written.
+    public static func mentionRanges(in text: String, mentions: [String: String]) -> [Range<String.Index>] {
+        Composer.matches(text, mentions: mentions).map(\.range)
+    }
+
     /// Whether the body holds something the model cannot show, whose plain text ("[Image]") is the best stand-in.
     private static func hasUnshownMedia(_ root: HTMLNode) -> Bool {
         let media: Set<String> = [PreviewReader.attachmentTag, "img", "video", "audio", "embed", "source"]

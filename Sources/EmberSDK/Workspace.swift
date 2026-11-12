@@ -14,7 +14,9 @@ import Observation
     /// The workspace's name and switches.
     public private(set) var account: Account
     /// The directory, by id.
-    public private(set) var people: [UserID: DirectoryUser] = [:]
+    public private(set) var people: [UserID: DirectoryUser] = [:] {
+        didSet { directory = Array(people.values) }
+    }
     /// Whether the first sidebar has arrived.
     public private(set) var isLoaded = false
     /// Why the latest sidebar didn't arrive; nil once one does.
@@ -25,6 +27,9 @@ import Observation
     public var notice: String?
     /// Where the directory is: `people` is empty until it has loaded once.
     public private(set) var directoryStatus: DirectoryStatus = .loading
+    /// Whether the workspace socket last heard there's a network. Its sockets try again as soon as
+    /// it's back.
+    public private(set) var isNetworkAvailable = true
 
     /// Where the directory is.
     public enum DirectoryStatus: Equatable, Sendable {
@@ -42,14 +47,26 @@ import Observation
 
     /// The room on screen, which counts as read while it's open. A room view sets and clears it.
     public var currentRoomID: RoomID? {
-        didSet { if let currentRoomID { markRead(currentRoomID) } }
+        didSet {
+            if let currentRoomID { markRead(currentRoomID) }
+            publishUnread()
+        }
     }
 
     /// The server no longer knows this session (the socket closed as revoked, or a request answered
     /// 401). The app goes back to signing in.
     @ObservationIgnored public var onSignedOut: (@MainActor () -> Void)?
 
-    private var state = SidebarState()
+    /// What the sidebar knows. Each change publishes what's observed of it, each list sorted once.
+    @ObservationIgnored private var state = SidebarState() {
+        didSet { publish() }
+    }
+    /// The position of each room in `rooms`.
+    @ObservationIgnored private var roomIndex: [RoomID: Int] = [:]
+    /// `people`'s values, for the frames that look someone up.
+    @ObservationIgnored private var directory: [DirectoryUser] = []
+    /// How many times the sidebar's lists have been sorted.
+    @ObservationIgnored private(set) var sortCount = 0
 
     @ObservationIgnored private var socket: ReconnectingSocket?
     @ObservationIgnored private var sessions: [RoomID: RoomSession] = [:]
@@ -73,6 +90,14 @@ import Observation
     @ObservationIgnored private var involvementAsked = 0
     @ObservationIgnored private var loadAgain = false
     @ObservationIgnored private var check: Task<Void, Never>?
+    /// Whether the next load reads the directory too.
+    @ObservationIgnored private var directoryWanted = false
+    /// How long since a welcome last read the sidebar again.
+    @ObservationIgnored private var sinceWelcomeRefresh: (@Sendable () -> Duration)?
+    /// How long since the directory last arrived.
+    @ObservationIgnored private var sinceDirectory: (@Sendable () -> Duration)?
+    /// A welcome's reload put off until `EmberTiming.sidebarRefresh` has passed since the last.
+    @ObservationIgnored private var refresh: Task<Void, Never>?
     @ObservationIgnored private let relay = Relay()
     @ObservationIgnored private let signedOutToken: UUID
 
@@ -98,43 +123,76 @@ import Observation
     // MARK: The sidebar
 
     /// The rooms you're in, as `GET /api/sidebar` lists them, with what the socket has said since.
-    public var rooms: [SidebarRoom] { state.rooms }
+    public private(set) var rooms: [SidebarRoom] = []
     /// Your stars.
-    public var favorites: Favorites { state.favorites }
+    public private(set) var favorites = Favorites(rooms: [], version: 0)
     /// The workspace's order for shared rooms.
-    public var sharedOrder: [RoomID] { state.sharedOrder }
+    public private(set) var sharedOrder: [RoomID] = []
     /// The people the sidebar offers DMs with.
-    public var suggestions: [User] { state.suggestions }
+    public private(set) var suggestions: [User] = []
     /// An invitation an administrator hasn't dismissed yet.
-    public var invitation: Invitation? { state.invitation }
+    public private(set) var invitation: Invitation?
 
     /// Shared rooms, none hidden, in sidebar order.
-    public var sharedRooms: [SidebarRoom] {
-        RoomList.shared(state.rooms, favorites: state.favorites.rooms, sharedOrder: state.sharedOrder)
-    }
+    public private(set) var sharedRooms: [SidebarRoom] = []
 
     /// DMs, none hidden, latest active first.
-    public var directRooms: [SidebarRoom] { RoomList.directs(state.rooms) }
+    public private(set) var directRooms: [SidebarRoom] = []
 
     /// The people to suggest DMs with, leaving out those you have DMs with.
-    public var suggestedPeople: [User] { RoomList.suggestedPeople(state.suggestions, rooms: state.rooms) }
+    public private(set) var suggestedPeople: [User] = []
 
     /// The rooms marked unread, shared then DMs. The room on screen never is.
-    public var unreadRooms: [SidebarRoom] {
-        (sharedRooms + directRooms).filter { RoomList.isMarkedUnread($0, currentRoomID: currentRoomID) }
-    }
+    public private(set) var unreadRooms: [SidebarRoom] = []
 
     /// How many rooms are marked unread.
     public var unreadCount: Int { unreadRooms.count }
 
     /// The room with `id`, when you're in it.
     public func room(_ id: RoomID) -> SidebarRoom? {
-        state.rooms.first { $0.id == id }
+        let rooms = rooms
+        guard let index = roomIndex[id], rooms.indices.contains(index), rooms[index].id == id else { return nil }
+        return rooms[index]
     }
 
     /// Whether you've starred the room.
     public func isFavorite(_ id: RoomID) -> Bool {
-        state.favorites.rooms.contains(id)
+        favorites.rooms.contains(id)
+    }
+
+    /// Sets each observed part of the sidebar that `state` has changed, sorting the lists again only
+    /// when what they're sorted from has changed, so a view reading one part hears only its changes.
+    private func publish() {
+        let roomsChanged = state.rooms != rooms
+        let favoritesChanged = state.favorites != favorites
+        let orderChanged = state.sharedOrder != sharedOrder
+        let suggestionsChanged = state.suggestions != suggestions
+        if roomsChanged {
+            rooms = state.rooms
+            roomIndex = Dictionary(rooms.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
+        }
+        if favoritesChanged { favorites = state.favorites }
+        if orderChanged { sharedOrder = state.sharedOrder }
+        if suggestionsChanged { suggestions = state.suggestions }
+        if state.invitation != invitation { invitation = state.invitation }
+        guard roomsChanged || favoritesChanged || orderChanged || suggestionsChanged else { return }
+        sortCount += 1
+        if roomsChanged || favoritesChanged || orderChanged {
+            assign(\.sharedRooms, RoomList.shared(rooms, favorites: favorites.rooms, sharedOrder: sharedOrder))
+        }
+        if roomsChanged { assign(\.directRooms, RoomList.directs(rooms)) }
+        if roomsChanged || suggestionsChanged {
+            assign(\.suggestedPeople, RoomList.suggestedPeople(suggestions, rooms: rooms))
+        }
+        publishUnread()
+    }
+
+    private func publishUnread() {
+        assign(\.unreadRooms, (sharedRooms + directRooms).filter { RoomList.isMarkedUnread($0, currentRoomID: currentRoomID) })
+    }
+
+    private func assign<Value: Equatable>(_ keyPath: ReferenceWritableKeyPath<Workspace, Value>, _ value: Value) {
+        if self[keyPath: keyPath] != value { self[keyPath: keyPath] = value }
     }
 
     // MARK: People
@@ -194,6 +252,8 @@ import Observation
         started = false
         check?.cancel()
         check = nil
+        refresh?.cancel()
+        refresh = nil
         socket?.stop()
         for session in liveSessions { session.holdBack() }
     }
@@ -218,7 +278,14 @@ import Observation
     /// Loads the sidebar and directory again, as pull to refresh does. A reload asked for while one
     /// is on its way runs once more after it, since the one on its way may have read too early.
     public func reload() async {
+        await load(directory: true)
+    }
+
+    /// Loads the sidebar again, and the directory too when `directory`, coalescing with any load on
+    /// its way.
+    private func load(directory: Bool) async {
         guard !isShutDown else { return }
+        if directory { directoryWanted = true }
         if let loading {
             loadAgain = true
             await loading.value
@@ -303,20 +370,37 @@ import Observation
     /// Sessions something holds a lease on are kept, and the `idleSessionLimit` latest used of the
     /// rest; the others are let go of, but one that's still held elsewhere is the one answered here
     /// again. Its socket waits for `start()` while the workspace is stopped.
+    ///
+    /// Without `messageID`, a session left on a page around a message (a search's jump) goes back
+    /// to the newest messages, as opening a room does.
     public func session(for roomID: RoomID, around messageID: String? = nil) -> RoomSession {
         if let session = sessions[roomID] ?? takeBack(roomID) {
-            if let messageID { session.jump(to: messageID) }
+            if let messageID {
+                session.jump(to: messageID)
+            } else if session.isJumping || session.timeline.hasNewer || session.timeline.anchor != nil {
+                session.jumpToLatest()
+            }
             touch(roomID)
             trimSessions()
             return session
         }
         let session = RoomSession(client: client, roomID: roomID, around: messageID)
+        session.signedIn(as: me.id)
         if !started { session.holdBack() }
         guard !isShutDown else { return session }
         adopt(session)
         touch(roomID)
         trimSessions()
         return session
+    }
+
+    /// A thread in a room's live session, opening at `replyID` when given. The room's session stays
+    /// on whatever page it shows, unlike `session(for:)`.
+    public func thread(_ parentID: String, in roomID: RoomID, at replyID: String? = nil) -> ThreadSession {
+        let room = sessions[roomID] ?? takeBack(roomID) ?? session(for: roomID)
+        touch(roomID)
+        trimSessions()
+        return room.thread(parentID, at: replyID)
     }
 
     /// Every session still alive: the cache's, and those it let go of that something still holds.
@@ -389,6 +473,7 @@ import Observation
         let socket = client.workspaceSocket()
         socket.onStatus = { [weak self] status in self?.socketChanged(status) }
         socket.onText = { [weak self] text in self?.handle(WorkspaceFrame(text: text)) }
+        socket.onNetwork = { [weak self] available in self?.isNetworkAvailable = available }
         return socket
     }
 
@@ -403,11 +488,11 @@ import Observation
         case let .welcome(you, account):
             me = you
             self.account = account
-            Task { await reload() }
+            refreshAfterWelcome()
         case let .accountUpdated(account):
             self.account = account
         case let .userUpdated(user):
-            let refetch = state.apply(frame, me: me, directory: Array(people.values))
+            let refetch = state.apply(frame, me: me, directory: directory)
             people[user.id] = user
             if user.id == me.id {
                 me = Me(id: me.id, name: user.name, administrator: user.role == .administrator)
@@ -420,8 +505,35 @@ import Observation
         case let .error(message):
             if !message.isEmpty { notice = message }
         default:
-            if state.apply(frame, me: me, directory: Array(people.values)) { Task { await reload() } }
+            if state.apply(frame, me: me, directory: directory) { Task { await reload() } }
         }
+    }
+
+    /// A welcome means the socket may have missed something, so the sidebar is read again: at once,
+    /// or once `EmberTiming.sidebarRefresh` has passed since a welcome last read it, so a socket
+    /// that keeps reconnecting doesn't read it each time. The directory comes too once
+    /// `EmberTiming.directoryRefresh` has passed since it last arrived.
+    private func refreshAfterWelcome() {
+        guard refresh == nil, !isShutDown else { return }
+        let timing = client.timing
+        let wait = sinceWelcomeRefresh.map { timing.sidebarRefresh - $0() } ?? .zero
+        guard wait > .zero else {
+            sinceWelcomeRefresh = timing.stopwatch()
+            Task { await load(directory: directoryIsStale) }
+            return
+        }
+        refresh = Task { [weak self] in
+            try? await timing.sleep(for: wait)
+            guard !Task.isCancelled, let self else { return }
+            self.refresh = nil
+            self.sinceWelcomeRefresh = timing.stopwatch()
+            await self.load(directory: self.directoryIsStale)
+        }
+    }
+
+    private var directoryIsStale: Bool {
+        guard directoryStatus == .loaded, let sinceDirectory else { return true }
+        return sinceDirectory() >= client.timing.directoryRefresh
     }
 
     /// The socket stopped as signed out: a revoked session is gone, but an upgrade refused on a bad
@@ -433,6 +545,7 @@ import Observation
             do {
                 _ = try await client.me()
             } catch let error as EmberError where error.isSignedOut {
+                client.sessionEnded()
                 self?.signedOut()
                 return
             } catch {}
@@ -447,8 +560,10 @@ import Observation
 
     private func loadOnce() async {
         state.willLoad()
+        let withDirectory = directoryWanted
+        directoryWanted = false
         async let sidebar = client.sidebar()
-        async let directory: Void = loadDirectory()
+        async let directory: Void = loadDirectory(if: withDirectory)
         let answer: Result<Sidebar, any Error>
         do { answer = .success(try await sidebar) } catch { answer = .failure(error) }
         // Nothing lands once shut down: the workspace is done with.
@@ -467,6 +582,10 @@ import Observation
         await directory
     }
 
+    private func loadDirectory(if wanted: Bool) async {
+        if wanted { await loadDirectory() }
+    }
+
     private func loadDirectory() async {
         if case .failed = directoryStatus { directoryStatus = .loading }
         let answer: Result<Directory, any Error>
@@ -476,6 +595,7 @@ import Observation
         case let .success(directory):
             people = Dictionary(directory.users.map { ($0.id, $0) }, uniquingKeysWith: { $1 })
             directoryStatus = .loaded
+            sinceDirectory = client.timing.stopwatch()
         case let .failure(error):
             // A directory that loaded once is still worth showing.
             if directoryStatus != .loaded {

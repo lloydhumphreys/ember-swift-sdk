@@ -174,13 +174,7 @@ public struct ThreadTimeline: Equatable, Sendable {
                 }
                 return []
             case "thread.before":
-                // A failed page leaves nothing in flight, so the reader can page again, though the
-                // thread stops paging back to the reply a permalink goes to.
-                if isLoadingOlder {
-                    isLoadingOlder = false
-                    openingAt = nil
-                    notice = text
-                }
+                olderPageFailed(text)
                 return []
             default:
                 let ids = Set(clientMessageIds ?? clientMessageId.map { [$0] } ?? [])
@@ -234,8 +228,10 @@ public struct ThreadTimeline: Equatable, Sendable {
         upsert(message, always: true, replacing: false)
     }
 
-    /// Sends a refused reply again, under the same id. nil when it isn't pending, and for a file,
-    /// which starts again from its first byte: the session uploads it again.
+    /// Puts a failed reply on its way again, under the same id, and answers the frame that creates
+    /// it. nil when it isn't pending, and for a file, which the session uploads again. The room
+    /// doesn't de-duplicate a create, so `ThreadSession` asks it with `message.check` first and sends
+    /// this only for a reply the room says is missing.
     public mutating func retry(_ clientMessageId: String) -> ClientFrame? {
         guard let index = pending.firstIndex(where: { $0.clientMessageId == clientMessageId }) else { return nil }
         pending[index].failure = nil
@@ -274,6 +270,16 @@ public struct ThreadTimeline: Equatable, Sendable {
     /// The screen has brought `focus` into view: forget it, so it isn't brought there again.
     public mutating func clearFocus() {
         focus = nil
+    }
+
+    /// The page of older replies didn't come: the room refused it, or didn't answer in time. It
+    /// leaves nothing in flight, so the reader can page again, though the thread stops paging back
+    /// to the reply a permalink goes to, and `notice` says `reason`. Nothing when none is on its way.
+    public mutating func olderPageFailed(_ reason: String = Timeline.pageNotLoaded) {
+        guard isLoadingOlder else { return }
+        isLoadingOlder = false
+        openingAt = nil
+        notice = reason
     }
 
     /// The socket dropped: loading flags and typing clear; replies and pendings stay.

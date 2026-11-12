@@ -190,6 +190,9 @@ import Testing
         #expect(session.notice == nil)
 
         thread.retry(id)
+        #expect(await eventually { socket.sent("message.check").last == .checkMessages(clientMessageIds: [id]) })
+        #expect(socket.sent("message.create").count == 1)
+        socket.serverSends(Fixtures.RoomFrames.messageChecked(stored: [], missing: [id]))
         #expect(await eventually { socket.sent("message.create").count == 2 })
         thread.discard(id)
         #expect(thread.timeline.pending.isEmpty)
@@ -306,6 +309,31 @@ import Testing
         lease.close()
     }
 
+    @Test func aThreadPageTheRoomDoesntAnswerFailsWithANoticeAndPagingWorksAgain() async throws {
+        let (session, socket) = try await opened()
+        let thread = session.thread("m001")
+        let lease = thread.open()
+        let replies = (2 ... 4).map { Fixtures.reply(String(format: "r%03d", $0), "Reply \($0)", to: "m001", minute: $0) }
+        socket.serverSends(Fixtures.RoomFrames.threadOpened("m001", parent: parent, replies: replies, hasMore: true))
+        #expect(await eventually { thread.timeline.isLoaded })
+
+        thread.loadOlder()
+        #expect(await eventually { socket.sent("thread.before").count == 1 })
+        await settle()
+        for _ in 0 ..< 3 {
+            clock.advance(by: .seconds(5))
+            await settle()
+        }
+        #expect(await eventually { !thread.timeline.isLoadingOlder && thread.notice == Timeline.pageNotLoaded })
+
+        thread.loadOlder()
+        #expect(await eventually { socket.sent("thread.before").count == 2 })
+        let older = Fixtures.reply("r001", "Reply 1", to: "m001", minute: 1)
+        socket.serverSends(Fixtures.RoomFrames.threadHistory("m001", before: "r002", replies: [older], hasMore: false))
+        #expect(await eventually { thread.timeline.replies.first == older })
+        lease.close()
+    }
+
     @Test func aTombstoneCanStillBeRepliedTo() async throws {
         let (session, socket) = try await opened()
         let thread = session.thread("m001")
@@ -418,5 +446,125 @@ import Testing
         #expect(!session.timeline.messages.contains { $0.id == "r100" })
         #expect(thread.timeline.replies == [posted])
         lease.close()
+    }
+
+    // MARK: Replies across a launch
+
+    func session(store: MemoryUnsentMessageStore, connector: MockSocketConnector) -> RoomSession {
+        connector.welcomeEverySocket()
+        return RoomSession(client: .mock(transport: transport, connector: connector, timing: timing), roomID: Fixtures.general.id, unsentStore: store)
+    }
+
+    var key: UnsentMessageKey {
+        UnsentMessageKey(server: URL(string: "https://ember.test")!, userID: Fixtures.ada.id, roomID: Fixtures.general.id)
+    }
+
+    @Test func aReplyIsSavedAndSentAgainUnderItsOwnIdAfterARelaunch() async throws {
+        let store = MemoryUnsentMessageStore()
+        let first = session(store: store, connector: connector)
+        first.start()
+        try #require(await eventually { first.isAdmitted })
+        let thread = first.thread("m001")
+        let lease = thread.open()
+        let id = thread.reply(body: "<p>Both</p>", plainText: "Both", alsoSend: true)
+        #expect(store.saved[key]?.map(\.clientMessageId) == [id])
+        #expect(store.saved[key]?.first?.parentId == "m001")
+        #expect(store.saved[key]?.first?.alsoSend == true)
+        lease.close()
+
+        let relaunched = MockSocketConnector()
+        let second = session(store: store, connector: relaunched)
+        second.start()
+        try #require(await eventually { second.isAdmitted })
+        let socket = try #require(relaunched.latest)
+        #expect(second.threads.map(\.parentID) == ["m001"])
+        #expect(await eventually { threadFrames(socket).first == "open m001" })
+        socket.serverSends(Fixtures.RoomFrames.threadOpened("m001", parent: parent))
+        #expect(await eventually { socket.sent("message.check").contains(.checkMessages(clientMessageIds: [id])) })
+        socket.serverSends(Fixtures.RoomFrames.messageChecked(stored: [], missing: [id]))
+        #expect(await eventually {
+            socket.sent("message.create") == [.createMessage(clientMessageId: id, body: "<p>Both</p>", parentId: "m001", alsoSend: true)]
+        })
+        let reply = Fixtures.reply("r001", "Both", to: "m001", by: Fixtures.ada, minute: 2, clientMessageId: id)
+        socket.serverSends(Fixtures.RoomFrames.messageCreated(reply, seq: 11))
+        #expect(await eventually { store.saved[key] == nil })
+    }
+
+    @Test func aReplyUnansweredOnAnOpenConnectionFailsAndIsKeptFailed() async throws {
+        let store = MemoryUnsentMessageStore()
+        let session = session(store: store, connector: connector)
+        session.start()
+        try #require(await eventually { session.isAdmitted })
+        session.sendTimeout = .seconds(5)
+        let thread = session.thread("m001")
+        let lease = thread.open()
+        let before = clock.sleeperCount
+        let id = thread.reply(body: "<p>Yes</p>", plainText: "Yes")
+        #expect(await eventually { clock.sleeperCount > before })
+        clock.advance(by: .seconds(5))
+        #expect(await eventually { thread.timeline.pending.first?.failure == RoomSession.notSent })
+        #expect(store.saved[key]?.first?.failure == RoomSession.notSent)
+
+        thread.retry(id)
+        #expect(thread.timeline.pending.first?.failure == nil)
+        #expect(store.saved[key]?.first?.failure == nil)
+        let socket = try #require(connector.latest)
+        #expect(await eventually { socket.sent("message.check").last == .checkMessages(clientMessageIds: [id]) })
+        #expect(socket.sent("message.create").count == 1)
+        socket.serverSends(Fixtures.RoomFrames.messageChecked(stored: [id], missing: []))
+        #expect(await eventually { thread.timeline.pending.isEmpty })
+        #expect(socket.sent("message.create").count == 1)
+        lease.close()
+    }
+
+    @Test func aFailedReplyInAThreadLetGoOfComesBackWhenItsAskedForAgain() async throws {
+        let store = MemoryUnsentMessageStore()
+        let session = session(store: store, connector: connector)
+        session.start()
+        try #require(await eventually { session.isAdmitted })
+        let socket = try #require(connector.latest)
+        let thread = session.thread("m001")
+        let lease = thread.open()
+        let id = thread.reply(body: "<p>No</p>", plainText: "No")
+        socket.serverSends(Fixtures.RoomFrames.error("That’s too long.", clientMessageId: id, failed: "message.create"))
+        #expect(await eventually { thread.timeline.pending.first?.failure != nil })
+        lease.close()
+        #expect(await eventually { session.threads.isEmpty })
+        #expect(store.saved[key]?.map(\.clientMessageId) == [id])
+
+        let again = session.thread("m001")
+        #expect(again !== thread)
+        #expect(again.timeline.pending.map(\.clientMessageId) == [id])
+        #expect(again.timeline.pending.first?.failure == "That’s too long.")
+        again.discard(id)
+        #expect(store.saved[key] == nil)
+    }
+
+    @Test func removingAllForAnAccountLeavesOtherAccountsAlone() throws {
+        let server = URL(string: "https://ember.test")!
+        let mine = UnsentMessageKey(server: server, userID: "user_ada", roomID: "room_a")
+        let mineElsewhere = UnsentMessageKey(server: server, userID: "user_ada", roomID: "room_b")
+        let theirs = UnsentMessageKey(server: server, userID: "user_grace", roomID: "room_a")
+        let otherServer = UnsentMessageKey(server: URL(string: "https://other.test")!, userID: "user_ada", roomID: "room_a")
+        let message = UnsentMessage(clientMessageId: "c1", body: "<p>Hi</p>", plainText: "Hi", createdAt: Date(timeIntervalSince1970: 0))
+        let folder = FileManager.default.temporaryDirectory.appending(path: "unsent-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let stores: [any UnsentMessageStore] = [MemoryUnsentMessageStore(), FileUnsentMessageStore(folder: folder)]
+        for store in stores {
+            for key in [mine, mineElsewhere, theirs, otherServer] { store.save([message], for: key) }
+            store.removeAll(server: server, userID: "user_ada")
+            #expect(store.messages(for: mine).isEmpty)
+            #expect(store.messages(for: mineElsewhere).isEmpty)
+            #expect(store.messages(for: theirs) == [message])
+            #expect(store.messages(for: otherServer) == [message])
+        }
+    }
+
+    @Test func aMessageSavedBeforeRepliesWereKeptStillReads() throws {
+        let json = #"[{"clientMessageId":"c1","body":"<p>Hi</p>","plainText":"Hi","createdAt":0}]"#
+        let messages = try JSONDecoder().decode([UnsentMessage].self, from: Data(json.utf8))
+        #expect(messages.map(\.clientMessageId) == ["c1"])
+        #expect(messages.first?.parentId == nil)
+        #expect(messages.first?.alsoSend == false)
     }
 }

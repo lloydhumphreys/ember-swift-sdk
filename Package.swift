@@ -22,7 +22,7 @@ let package = Package(
     targets: [
         .target(name: "EmberCore"),
         .target(name: "EmberRichText"),
-        .target(name: "EmberSDK", dependencies: ["EmberCore"]),
+        .target(name: "EmberSDK", dependencies: ["EmberCore", "EmberRichText"]),
         .target(name: "EmberTesting", dependencies: ["EmberSDK"]),
         .testTarget(name: "EmberCoreTests", dependencies: ["EmberCore"]),
         .testTarget(name: "EmberRichTextTests", dependencies: ["EmberRichText"]),

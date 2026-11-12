@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Package.swift is swift-tools-version 6.0 and targets macOS 15 and iOS 18, so the tests run on the
+  # oldest toolchain that reads it (Swift 6.0, Xcode 16.0) and on the newest Xcode the runner has.
+  test:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        xcode: ["16.0", latest]
+    env:
+      # Both the stand-in server and its check read the shared password from here. It protects nothing.
+      EMBER_SEED_PASSWORD: ci-stand-in-password
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Choose Xcode ${{ matrix.xcode }}
+        run: |
+          if [ "${{ matrix.xcode }}" = latest ]; then
+            app=$(ls -d /Applications/Xcode_*.app | grep -viE 'beta|candidate' | sort -V | tail -1)
+          else
+            app=/Applications/Xcode_${{ matrix.xcode }}.app
+          fi
+          echo "DEVELOPER_DIR=$app/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Show the toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Swift tests
+        run: swift test
+
+      - name: Stand-in server check
+        run: |
+          PORT=8790 node Tools/mock-server/server.mjs > server.log 2>&1 &
+          for _ in $(seq 1 50); do
+            curl -fs http://127.0.0.1:8790/api/bootstrap > /dev/null && break
+            sleep 0.2
+          done
+          node Tools/mock-server/check.mjs http://127.0.0.1:8790 || { cat server.log; exit 1; }

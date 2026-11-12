@@ -52,6 +52,8 @@ import Testing
         #expect(session.timeline.seq == 1)
 
         first.serverCloses(code: SocketClose.reconnect)
+        #expect(await eventually { session.status == .connecting && clock.sleeperCount == 1 })
+        clock.advance(by: timing.reconnectFloor)
         #expect(await eventually { connector.connections.count == 2 })
         #expect(query(connector.latest)["since"] == "1")
         #expect(query(connector.latest)["around"] == nil)
@@ -130,6 +132,8 @@ import Testing
         #expect(await eventually { !session.isJumping && session.timeline.hasNewer })
 
         session.retry(id)
+        #expect(await eventually { socket.sent("message.check").last == .checkMessages(clientMessageIds: [id]) })
+        socket.serverSends(Fixtures.RoomFrames.messageChecked(stored: [], missing: [id]))
         #expect(await eventually { socket.sent("message.create").count == 2 })
         #expect(pagesAndMessages(socket).suffix(2) == [.historyAround(messageId: nil), .createMessage(clientMessageId: id, body: "Hi")])
     }
