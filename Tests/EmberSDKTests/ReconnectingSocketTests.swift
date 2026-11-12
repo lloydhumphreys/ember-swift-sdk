@@ -20,16 +20,14 @@ import Testing
         socket.onStatus = { [heard] in heard.statuses.append($0) }
     }
 
-    /// Waits for the socket to be waiting to try again after `connections` tries.
-    /// A moment's settling tells the wait from a connect timeout that's about to be cancelled.
-    func waitingToRetry(after connections: Int) async -> Bool {
-        guard await eventually({ isWaiting(after: connections) }) else { return false }
-        await settle()
-        return await eventually { isWaiting(after: connections) }
-    }
-
-    func isWaiting(after connections: Int) -> Bool {
-        connector.connections.count == connections && socket.status == .connecting && clock.sleeperCount == 1
+    /// Waits for the socket to be waiting to try again after `connections` tries, `delay` from now:
+    /// its one sleep is due by then, which, for a delay shorter than the connect timeout, tells the
+    /// wait from a connect timeout that's about to be cancelled.
+    func waitingToRetry(after connections: Int, in delay: Duration) async -> Bool {
+        await eventually {
+            connector.connections.count == connections && socket.status == .connecting
+                && clock.sleeperCount == 1 && clock.sleeperCount(dueWithin: delay) == 1
+        }
     }
 
     @Test func opens() async {
@@ -85,7 +83,7 @@ import Testing
         // The failure closes the connection, so nothing after it is taken as sent.
         #expect(await eventually { first.isClosedByClient })
         #expect(!socket.send("after"))
-        #expect(await waitingToRetry(after: 1))
+        #expect(await waitingToRetry(after: 1, in: .milliseconds(500)))
         clock.advance(by: .milliseconds(500))
         #expect(await eventually { connector.connections.count == 2 && socket.status == .open })
         #expect(socket.send("again"))
@@ -111,7 +109,7 @@ import Testing
         #expect(await eventually { clock.sleeperCount == 1 })
         clock.advance(by: .seconds(25))
         #expect(await eventually { first.isClosedByClient })
-        #expect(await waitingToRetry(after: 1))
+        #expect(await waitingToRetry(after: 1, in: .milliseconds(500)))
         clock.advance(by: .milliseconds(500))
         #expect(await eventually { connector.connections.count == 2 && socket.status == .open })
     }
@@ -121,7 +119,7 @@ import Testing
         #expect(await eventually { socket.status == .open })
 
         connector.latest?.serverCloses(code: 1006)
-        #expect(await waitingToRetry(after: 1))
+        #expect(await waitingToRetry(after: 1, in: .milliseconds(500)))
         clock.advance(by: .milliseconds(499))
         await settle()
         #expect(connector.connections.count == 1)
@@ -130,7 +128,7 @@ import Testing
 
         // A socket that closes before the server says anything is backed off from further.
         connector.latest?.serverCloses(code: 1006)
-        #expect(await waitingToRetry(after: 2))
+        #expect(await waitingToRetry(after: 2, in: .seconds(1)))
         clock.advance(by: .milliseconds(999))
         await settle()
         #expect(connector.connections.count == 2)
@@ -142,7 +140,7 @@ import Testing
         connector.latest?.serverSends(#"{"type":"welcome"}"#)
         #expect(await eventually { heard.texts.count == 1 })
         connector.latest?.serverCloses(code: 1006)
-        #expect(await waitingToRetry(after: 3))
+        #expect(await waitingToRetry(after: 3, in: .seconds(2)))
         clock.advance(by: .milliseconds(1999))
         await settle()
         #expect(connector.connections.count == 3)
@@ -154,7 +152,7 @@ import Testing
         clock.advance(by: timing.stablePeriod)
         await settle()
         connector.latest?.serverCloses(code: 1006)
-        #expect(await waitingToRetry(after: 4))
+        #expect(await waitingToRetry(after: 4, in: .milliseconds(500)))
         clock.advance(by: .milliseconds(500))
         #expect(await eventually { connector.connections.count == 5 })
     }
@@ -173,7 +171,7 @@ import Testing
         #expect(await eventually { connector.connections.count == 1 && clock.sleeperCount == 1 })
         clock.advance(by: .seconds(10))
         #expect(await eventually { connector.connections.first?.isClosedByClient == true })
-        #expect(await waitingToRetry(after: 1))
+        #expect(await waitingToRetry(after: 1, in: .milliseconds(500)))
     }
 
     @Test func reconnectsSoonWhenAskedTo() async {
@@ -183,7 +181,7 @@ import Testing
         #expect(await eventually { heard.texts.count == 1 })
         connector.latest?.serverCloses(code: SocketClose.reconnect)
         // Not in the same instant: a whole room's clients would all come back at once.
-        #expect(await waitingToRetry(after: 1))
+        #expect(await waitingToRetry(after: 1, in: timing.reconnectFloor))
         #expect(timing.reconnectDelay() == .milliseconds(250))
         clock.advance(by: .milliseconds(249))
         await settle()
@@ -200,20 +198,20 @@ import Testing
     @Test func aServerThatKeepsAskingToReconnectIsBackedOffFrom() async {
         connector.onConnect { connection in connection.serverCloses(code: SocketClose.reconnect) }
         socket.start()
-        #expect(await waitingToRetry(after: 1))
+        #expect(await waitingToRetry(after: 1, in: timing.reconnectFloor))
         clock.advance(by: .milliseconds(250))
         // Asked again with nothing heard between: an ordinary failure, backed off from.
-        #expect(await waitingToRetry(after: 2))
+        #expect(await waitingToRetry(after: 2, in: .milliseconds(500)))
         clock.advance(by: .milliseconds(499))
         await settle()
         #expect(connector.connections.count == 2)
         clock.advance(by: .milliseconds(1))
-        #expect(await waitingToRetry(after: 3))
+        #expect(await waitingToRetry(after: 3, in: .seconds(1)))
         clock.advance(by: .milliseconds(999))
         await settle()
         #expect(connector.connections.count == 3)
         clock.advance(by: .milliseconds(1))
-        #expect(await waitingToRetry(after: 4))
+        #expect(await waitingToRetry(after: 4, in: .seconds(2)))
     }
 
     @Test(arguments: [
@@ -247,7 +245,7 @@ import Testing
         socket.start()
         #expect(await eventually { connector.connections.count == 1 })
         connector.latest?.serverCloses(httpStatus: status)
-        #expect(await waitingToRetry(after: 1))
+        #expect(await waitingToRetry(after: 1, in: .milliseconds(500)))
     }
 
     // MARK: The network
@@ -258,7 +256,7 @@ import Testing
         network.set(available: false)
         #expect(await eventually { !socket.isNetworkAvailable })
         connector.latest?.serverCloses(code: 1006)
-        #expect(await waitingToRetry(after: 1))
+        #expect(await waitingToRetry(after: 1, in: timing.backoffMax))
         clock.advance(by: .seconds(1))
         await settle()
         #expect(connector.connections.count == 1)
@@ -275,7 +273,7 @@ import Testing
         for tries in 1...3 {
             #expect(await eventually { connector.connections.count == tries && socket.status == .open })
             connector.latest?.serverCloses(code: 1006)
-            #expect(await waitingToRetry(after: tries))
+            #expect(await waitingToRetry(after: tries, in: timing.backoffMax))
             clock.advance(by: timing.backoffMax)
         }
         // Back online, the next failure waits the first backoff, not the fourth.
@@ -283,7 +281,7 @@ import Testing
         network.set(available: true)
         #expect(await eventually { socket.isNetworkAvailable })
         connector.latest?.serverCloses(code: 1006)
-        #expect(await waitingToRetry(after: 4))
+        #expect(await waitingToRetry(after: 4, in: .milliseconds(500)))
         clock.advance(by: .milliseconds(500))
         #expect(await eventually { connector.connections.count == 5 })
     }
@@ -299,7 +297,7 @@ import Testing
         socket.start()
         #expect(await eventually { socket.status == .open })
         connector.latest?.serverCloses(code: 1006)
-        #expect(await waitingToRetry(after: 1))
+        #expect(await waitingToRetry(after: 1, in: .milliseconds(500)))
         socket.stop()
         #expect(socket.status == .idle)
         #expect(await eventually { clock.sleeperCount == 0 })

@@ -48,27 +48,16 @@ import Testing
         #expect(session.timeline.olderPageFailure == nil)
     }
 
-    /// Moves the clock on by `duration`, a few seconds at a time, so each timer started meanwhile
-    /// is reached.
-    func pass(_ duration: Duration) async {
-        await settle()
-        var left = duration
-        while left > .zero {
-            let step = min(left, .seconds(5))
-            clock.advance(by: step)
-            left -= step
-            await settle()
-        }
-    }
-
     @Test func anOlderPageTheRoomDoesntAnswerFailsAsARefusedOneDoesAndRetryLoadsIt() async throws {
         let session = session()
         let socket = try await opened(session, welcome: Fixtures.RoomFrames.welcome(messages: Fixtures.messages(3, from: 5), hasMore: true))
         session.loadOlder()
         #expect(await eventually { olderPages(socket) == 1 })
-        await pass(RoomSession.pageTimeout - .seconds(1))
+        #expect(await clock.sleeping(dueWithin: RoomSession.pageTimeout))
+        clock.advance(by: RoomSession.pageTimeout - .seconds(1))
+        await settle()
         #expect(session.timeline.isLoadingOlder)
-        await pass(.seconds(1))
+        #expect(await clock.pass(.seconds(1)))
         #expect(await eventually { session.timeline.olderPageFailure == Timeline.pageNotLoaded })
         #expect(!session.timeline.isLoadingOlder)
 
@@ -88,7 +77,7 @@ import Testing
         #expect(await eventually { session.timeline.olderPageFailure == Timeline.pageNotLoaded })
         #expect(!session.timeline.isLoadingOlder)
 
-        await pass(.seconds(5))
+        #expect(await clock.pass(.seconds(5)))
         #expect(await eventually { connector.connections.count == 2 && session.phase == .admitted })
         let second = try #require(connector.latest)
         session.retryOlder()
@@ -102,7 +91,7 @@ import Testing
         session.loadNewer()
         let newer = { socket.sentFrames.filter { if case .historyAfter = $0 { true } else { false } }.count }
         #expect(await eventually { newer() == 1 })
-        await pass(RoomSession.pageTimeout)
+        #expect(await clock.pass(RoomSession.pageTimeout))
         #expect(await eventually { session.timeline.newerPageFailure == Timeline.pageNotLoaded })
         session.retryNewer()
         #expect(await eventually { newer() == 2 })
@@ -153,7 +142,7 @@ import Testing
         session.setAwayFromLatest(away)
         connector.onConnect { $0.serverSends(reconnect) }
         first.serverCloses(code: 1006)
-        await pass(.seconds(5))
+        #expect(await clock.pass(.seconds(5)))
         #expect(await eventually { connector.connections.count == 2 && session.phase == .admitted })
         let second = try #require(connector.latest)
         #expect(query(second)["since"] == "10")
@@ -209,7 +198,13 @@ import Testing
             session.loadOlder()
             #expect(await eventually { olderPages(first) == 2 })
         }
-        await pass(.seconds(55))
+        // The next beat pings, the one after finds it unanswered and drops the socket, and the
+        // backoff after that connects again.
+        #expect(await clock.pass(timing.heartbeat, waking: inFlight ? 2 : 1))
+        #expect(await eventually { first.sent.contains(ReconnectingSocket.ping) })
+        #expect(await clock.pass(timing.heartbeat))
+        #expect(await eventually { first.isClosedByClient })
+        #expect(await clock.pass(.seconds(5)))
         #expect(await eventually { connector.connections.count > 1 })
         #expect(session.phase != .admitted)
         session.loadOlder()
@@ -233,7 +228,8 @@ import Testing
         #expect(await eventually { session.phase == .reconnecting })
         session.loadOlder()
         session.loadOlder()
-        await pass(.seconds(5))
+        #expect(await clock.pass(.seconds(5)))
+        #expect(await eventually { connector.connections.count == 2 })
         let second = try #require(connector.latest)
         #expect(second !== first)
         second.serverSends(Fixtures.RoomFrames.resumed(seq: 10))
@@ -255,7 +251,8 @@ import Testing
         first.serverCloses(code: 1006)
         #expect(await eventually { session.phase == .reconnecting })
         session.loadNewer()
-        await pass(.seconds(5))
+        #expect(await clock.pass(.seconds(5)))
+        #expect(await eventually { connector.connections.count == 2 })
         let second = try #require(connector.latest)
         second.serverSends(Fixtures.RoomFrames.resumed(seq: 10))
         second.open()
@@ -272,7 +269,8 @@ import Testing
         #expect(await eventually { session.phase == .reconnecting })
         session.loadOlder()
         session.jumpToLatest()
-        await pass(.seconds(5))
+        #expect(await clock.pass(.seconds(5)))
+        #expect(await eventually { connector.connections.count == 2 })
         let second = try #require(connector.latest)
         second.serverSends(Fixtures.RoomFrames.welcome(messages: Fixtures.messages(40, from: 200), seq: 400, hasMore: true))
         second.open()

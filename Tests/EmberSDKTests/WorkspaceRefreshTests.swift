@@ -48,7 +48,7 @@ import Testing
         await settle()
         #expect(sidebarReads == sidebar)
 
-        clock.advance(by: timing.sidebarRefresh)
+        #expect(await clock.pass(timing.sidebarRefresh))
         #expect(await eventually { sidebarReads == sidebar + 1 })
         await settle()
         #expect(sidebarReads == sidebar + 1)
@@ -82,7 +82,7 @@ import Testing
         let socket = try await started()
         let sidebar = sidebarReads
         socket.serverSends(Fixtures.WorkspaceFrames.welcome())
-        await settle()
+        #expect(await clock.sleeping(dueWithin: timing.sidebarRefresh))
         workspace.stop()
         clock.advance(by: timing.sidebarRefresh)
         await settle()

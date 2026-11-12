@@ -32,6 +32,7 @@ All notable changes to this project are listed here. The format follows [Keep a 
 - The stand-in server answers the bot API, and lists bot keys to an administrator at `GET /api/account/bots`. `Tools/mock-server/check.mjs` checks both.
 - README sections on sending plain text, unsent messages and Retry, changes that throw, signing out and why, checking a server, network status, search, one message, bots, and app extensions and widgets, each sample run by a test. A compatibility table names the upstream Ember commit the SDK was built against.
 - A CI workflow that runs `swift test` and the stand-in server check on macOS.
+- `ManualClock.sleeperCount(dueWithin:)`, how many waiting sleeps a move of that length would wake, so a test can wait for a timer to be sleeping before it moves the clock.
 
 ### Changed
 
@@ -66,4 +67,5 @@ All notable changes to this project are listed here. The format follows [Keep a 
 - Retry on a message that failed as not sent could post it twice, as the room stores a create twice. `retry` now asks with `message.check` first and sends again only when the room says it's missing, and failed texts are asked about after each reconnect. The stand-in server no longer de-duplicates a create, so it behaves as the real one does.
 - A thread reply held behind a file, or sent while a check on it was on its way, could be posted twice: the check came back saying the reply was missing and created it again. A reply is now remembered as created once it's sent, as a room message is.
 - A session ended that a room socket found (closed as revoked, or its upgrade refused 401) left `signOutReason` as `.asked` once the app signed out. It is now `.sessionEnded` before the app hears, and a sign-out someone asked for still says `.asked`.
+- The SDK's own tests of reconnecting, timeouts and typing failed now and then on a busy machine: they moved the clock before the timer they meant to fire was sleeping. They now wait for that sleep first.
 

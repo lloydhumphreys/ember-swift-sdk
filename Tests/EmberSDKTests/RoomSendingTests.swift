@@ -11,7 +11,12 @@ import Testing
     let clock: ManualClock
 
     init() {
-        (timing, clock) = manualTiming()
+        var (timing, clock) = manualTiming()
+        // A socket left connecting stays so while the tests move the clock, instead of timing out
+        // and trying again.
+        timing.connectTimeout = .seconds(1_000_000)
+        self.timing = timing
+        self.clock = clock
     }
 
     func session(connector: MockSocketConnector? = nil, store: MemoryUnsentMessageStore = MemoryUnsentMessageStore(), welcome: Bool = true) -> RoomSession {
@@ -24,11 +29,6 @@ import Testing
         session.start()
         try #require(await eventually { session.timeline.isLoaded && session.status == .open && session.phase == .admitted })
         return try #require((connector ?? self.connector).latest)
-    }
-
-    /// Waits until something new sleeps on the clock, so advancing it reaches that sleeper.
-    func newSleeper(after count: Int) async -> Bool {
-        await eventually { clock.sleeperCount > count }
     }
 
     func created(_ id: String, clientMessageId: String, seq: Int) -> String {
@@ -97,10 +97,7 @@ import Testing
 
         connector.onConnect { $0.serverCloses(httpStatus: 403) }
         socket.serverCloses(code: 1006)
-        for _ in 0 ..< 12 where session.phase != .stopped(.refused(status: 403)) {
-            clock.advance(by: .seconds(5))
-            await settle()
-        }
+        #expect(await clock.pass(timing.backoff(attempt: 0)))
         #expect(await eventually { session.phase == .stopped(.refused(status: 403)) })
         session.stop()
         let stopped = connector.connections.count
@@ -198,10 +195,8 @@ import Testing
         let session = session()
         let socket = try await opened(session)
         session.sendTimeout = .seconds(5)
-        let before = clock.sleeperCount
         let id = session.send(body: "<p>Hello</p>", plainText: "Hello")
-        #expect(await newSleeper(after: before))
-        clock.advance(by: .seconds(5))
+        #expect(await clock.pass(.seconds(5)))
         #expect(await eventually { session.timeline.pending.first?.failure == RoomSession.notSent })
 
         session.retry(id)
@@ -217,10 +212,8 @@ import Testing
     /// Sends a message the room never answers, and waits until it shows as not sent.
     func notSent(_ session: RoomSession) async throws -> String {
         session.sendTimeout = .seconds(5)
-        let before = clock.sleeperCount
         let id = session.send(body: "<p>Hello</p>", plainText: "Hello")
-        try #require(await newSleeper(after: before))
-        clock.advance(by: .seconds(5))
+        try #require(await clock.pass(.seconds(5)))
         try #require(await eventually { session.timeline.pending.first?.failure == RoomSession.notSent })
         return id
     }
@@ -258,12 +251,9 @@ import Testing
         let first = try await opened(session)
         let id = try await notSent(session)
 
-        first.serverCloses(code: 1006)
         let count = connector.connections.count
-        for _ in 0 ..< 12 where connector.connections.count == count {
-            clock.advance(by: .seconds(5))
-            await settle()
-        }
+        first.serverCloses(code: 1006)
+        #expect(await clock.pass(timing.backoff(attempt: 0)))
         #expect(await eventually { connector.connections.count > count && session.phase == .admitted })
         let second = try #require(connector.latest)
         #expect(await eventually { second.sent("message.check") == [.checkMessages(clientMessageIds: [id])] })
@@ -277,30 +267,14 @@ import Testing
         #expect(await eventually { session.timeline.pending.isEmpty })
     }
 
-    /// Moves the clock on by `duration`, a few seconds at a time, so each timer started meanwhile
-    /// is reached.
-    func pass(_ duration: Duration) async {
-        await settle()
-        var left = duration
-        while left > .zero {
-            let step = min(left, .seconds(5))
-            clock.advance(by: step)
-            left -= step
-            await settle()
-        }
-    }
-
-    /// Drops `socket` and leaves the room reconnecting: the next sockets are asked for and wait to
-    /// be opened, each with its welcome waiting.
+    /// Drops `socket` and leaves the room reconnecting: the next socket is asked for and waits to be
+    /// opened, with its welcome waiting.
     func reconnecting(_ session: RoomSession, from socket: MockSocketConnection) async throws {
         connector.autoOpen = false
         let count = connector.connections.count
         socket.serverCloses(code: 1006)
         #expect(await eventually { session.phase == .reconnecting })
-        for _ in 0 ..< 6 where connector.connections.count == count {
-            clock.advance(by: .seconds(1))
-            await settle()
-        }
+        try #require(await clock.pass(timing.backoff(attempt: 0)))
         try #require(await eventually { connector.connections.count > count })
         #expect(session.phase == .reconnecting)
     }
@@ -320,9 +294,11 @@ import Testing
         try await reconnecting(session, from: first)
         let id = session.send(body: "<p>Hello</p>", plainText: "Hello")
 
-        await pass(session.sendTimeout - .seconds(1))
+        #expect(await clock.sleeping(dueWithin: session.sendTimeout))
+        clock.advance(by: session.sendTimeout - .seconds(1))
+        await settle()
         #expect(session.timeline.pending.map(\.failure) == [nil])
-        await pass(.seconds(1))
+        #expect(await clock.pass(.seconds(1)))
         #expect(await eventually { session.timeline.pending.map(\.failure) == [RoomSession.notSent] })
         #expect(session.phase == .reconnecting)
 
@@ -347,7 +323,8 @@ import Testing
         let first = try await opened(session)
         try await reconnecting(session, from: first)
         let id = session.send(body: "<p>Hello</p>", plainText: "Hello")
-        await pass(.seconds(5))
+        #expect(await clock.sleeping(dueWithin: session.sendTimeout))
+        clock.advance(by: .seconds(5))
 
         let back = try await comesBack(session)
         #expect(await eventually { back.sent("message.check") == [.checkMessages(clientMessageIds: [id])] })
@@ -355,7 +332,8 @@ import Testing
         #expect(await eventually { back.sent("message.create").count == 1 })
         back.serverSends(created("m009", clientMessageId: id, seq: 11))
         #expect(await eventually { session.timeline.pending.isEmpty })
-        await pass(session.sendTimeout)
+        clock.advance(by: session.sendTimeout)
+        await settle()
         #expect(session.timeline.messages.last?.id == "m009")
     }
 
@@ -364,9 +342,11 @@ import Testing
         let first = try await opened(session)
         _ = session.send(body: "<p>Hello</p>", plainText: "Hello")
         #expect(await eventually { first.sent("message.create").count == 1 })
-        await pass(.seconds(10))
+        // The send's timer and the socket's heartbeat.
+        #expect(await clock.sleeping(2, dueWithin: session.sendTimeout))
+        clock.advance(by: .seconds(10))
         try await reconnecting(session, from: first)
-        await pass(session.sendTimeout - .seconds(10))
+        #expect(await clock.pass(session.sendTimeout - .seconds(10)))
         #expect(await eventually { session.timeline.pending.map(\.failure) == [RoomSession.notSent] })
     }
 
@@ -472,11 +452,9 @@ import Testing
     @Test func anAsyncDeleteUnansweredTimesOut() async throws {
         let session = session()
         let socket = try await opened(session)
-        let before = clock.sleeperCount
         let deletion = Task { try await session.delete(message: "m002") }
         #expect(await eventually { socket.sent("message.delete").count == 1 })
-        #expect(await newSleeper(after: before))
-        clock.advance(by: RoomSession.changeTimeout)
+        try #require(await clock.pass(RoomSession.changeTimeout))
         await #expect(throws: EmberError(kind: .timedOut, message: RoomSession.changeTimedOut)) { try await deletion.value }
     }
 
@@ -485,7 +463,8 @@ import Testing
         let first = try await opened(session)
         try await reconnecting(session, from: first)
         let boost = Task { try await session.boost(message: "m002", content: "👍") }
-        await pass(.seconds(5))
+        #expect(await clock.sleeping(dueWithin: RoomSession.changeTimeout))
+        clock.advance(by: .seconds(5))
 
         let back = try await comesBack(session)
         #expect(await eventually { back.sent("boost.create") == [.createBoost(messageId: "m002", content: "👍")] })
@@ -499,7 +478,7 @@ import Testing
         let first = try await opened(session)
         try await reconnecting(session, from: first)
         let deletion = Task { try await session.delete(message: "m002") }
-        await pass(RoomSession.changeTimeout)
+        try #require(await clock.pass(RoomSession.changeTimeout))
         await #expect(throws: EmberError(kind: .timedOut, message: RoomSession.changeTimedOut)) { try await deletion.value }
 
         let back = try await comesBack(session)
@@ -513,7 +492,8 @@ import Testing
         let first = try await opened(session)
         try await reconnecting(session, from: first)
         let edit = Task { try await session.edit(message: "m001", body: "<p>Changed</p>") }
-        await pass(.seconds(5))
+        #expect(await clock.sleeping(dueWithin: RoomSession.changeTimeout))
+        clock.advance(by: .seconds(5))
         let back = try await comesBack(session)
         let marker = try await editMarker(back)
         back.serverSends(Fixtures.RoomFrames.messageChecked(stored: [], missing: [marker]))

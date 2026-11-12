@@ -52,6 +52,16 @@ public final class ManualClock: Clock, @unchecked Sendable {
         lock.withLock { sleepers.count }
     }
 
+    /// How many sleeps are waiting that moving the clock on by `duration` would wake. A sleep started
+    /// on a task of its own is waiting only a moment after whatever started it, and one that starts
+    /// after a move is due a whole `duration` after it, so a test waits for this before the move.
+    public func sleeperCount(dueWithin duration: Duration) -> Int {
+        lock.withLock {
+            let horizon = current.advanced(by: duration)
+            return sleepers.values.filter { $0.deadline <= horizon }.count
+        }
+    }
+
     /// Sleeps until the clock has been moved to `deadline`. Cancelling it throws `CancellationError`.
     public func sleep(until deadline: Instant, tolerance: Duration? = nil) async throws {
         try Task.checkCancellation()

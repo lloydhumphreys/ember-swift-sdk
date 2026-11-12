@@ -176,11 +176,8 @@ import Testing
         connector.onConnect { $0.serverCloses(httpStatus: 401) }
         let socket = try #require(connector.latest)
         socket.serverCloses(code: SocketClose.reconnect)
-        for _ in 0 ..< 12 where connector.connections.count < 2 {
-            clock.advance(by: .seconds(5))
-            await settle()
-        }
-        #expect(connector.connections.count == 2)
+        #expect(await clock.pass(.milliseconds(250)))
+        #expect(await eventually { connector.connections.count == 2 })
         #expect(await eventually { heard == [.sessionEnded] })
 
         await client.signOut()
@@ -194,8 +191,8 @@ import Testing
         let socket = try #require(connector.latest)
         socket.serverCloses(code: SocketClose.revoked)
         // `/api/me` still answers: a bad network, not a lost session, so it tries again later.
-        #expect(await eventually { transport.requests("GET", "/api/me").count == 1 && clock.sleeperCount >= 1 })
-        clock.advance(by: .seconds(15))
+        #expect(await eventually { transport.requests("GET", "/api/me").count == 1 })
+        #expect(await clock.pass(.seconds(15)))
         #expect(await eventually { connector.connections.count == 2 && workspace.connection == .open })
         #expect(signedOut == 0)
     }

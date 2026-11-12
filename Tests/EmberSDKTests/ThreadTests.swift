@@ -44,8 +44,8 @@ import Testing
     func reconnect(_ session: RoomSession, from socket: MockSocketConnection) async throws -> MockSocketConnection {
         let count = connector.connections.count
         socket.serverCloses(code: 1006)
-        #expect(await eventually { session.status == .connecting && clock.sleeperCount >= 1 })
-        clock.advance(by: timing.backoff(attempt: 0))
+        #expect(await eventually { session.status == .connecting })
+        try #require(await clock.pass(timing.backoff(attempt: 0)))
         try #require(await eventually { connector.connections.count == count + 1 && session.status == .open })
         let next = try #require(connector.latest)
         try #require(await eventually { session.isAdmitted })
@@ -158,11 +158,11 @@ import Testing
         #expect(await eventually { thread.timeline.isLoaded })
 
         socket.serverCloses(code: 1006)
-        #expect(await eventually { session.status == .connecting && clock.sleeperCount >= 1 })
+        #expect(await eventually { session.status == .connecting })
         let id = thread.reply(body: "<p>Later</p>", plainText: "Later")
         #expect(socket.sent("message.create").isEmpty)
 
-        clock.advance(by: timing.backoff(attempt: 0))
+        #expect(await clock.pass(timing.backoff(attempt: 0)))
         #expect(await eventually { connector.connections.count == 2 })
         let next = try #require(connector.latest)
         #expect(await eventually { threadFrames(next) == ["open m001"] })
@@ -220,11 +220,11 @@ import Testing
         let thread = session.thread("m001")
         let lease = thread.open()
         socket.serverCloses(code: 1006)
-        #expect(await eventually { session.status == .connecting && clock.sleeperCount >= 1 })
+        #expect(await eventually { session.status == .connecting })
         thread.reply(body: "<p>Bye</p>", plainText: "Bye")
         lease.close()
         // The room's own lease keeps the socket coming back.
-        clock.advance(by: timing.backoff(attempt: 0))
+        #expect(await clock.pass(timing.backoff(attempt: 0)))
         #expect(await eventually { connector.connections.count == 2 })
         let next = try #require(connector.latest)
         #expect(await eventually { threadFrames(next) == ["open m001", "close m001"] })
@@ -284,10 +284,10 @@ import Testing
         // The room's own typing isn't the thread's.
         #expect(session.timeline.typing.isEmpty)
 
-        clock.advance(by: .seconds(4))
+        #expect(await clock.pass(.seconds(4)))
         await settle()
         #expect(thread.timeline.typing == [bot])
-        clock.advance(by: .seconds(2))
+        #expect(await clock.pass(.seconds(2)))
         #expect(await eventually { thread.timeline.typing.isEmpty })
         lease.close()
     }
@@ -319,11 +319,7 @@ import Testing
 
         thread.loadOlder()
         #expect(await eventually { socket.sent("thread.before").count == 1 })
-        await settle()
-        for _ in 0 ..< 3 {
-            clock.advance(by: .seconds(5))
-            await settle()
-        }
+        #expect(await clock.pass(RoomSession.pageTimeout))
         #expect(await eventually { !thread.timeline.isLoadingOlder && thread.notice == Timeline.pageNotLoaded })
 
         thread.loadOlder()
@@ -498,10 +494,8 @@ import Testing
         session.sendTimeout = .seconds(5)
         let thread = session.thread("m001")
         let lease = thread.open()
-        let before = clock.sleeperCount
         let id = thread.reply(body: "<p>Yes</p>", plainText: "Yes")
-        #expect(await eventually { clock.sleeperCount > before })
-        clock.advance(by: .seconds(5))
+        #expect(await clock.pass(.seconds(5)))
         #expect(await eventually { thread.timeline.pending.first?.failure == RoomSession.notSent })
         #expect(store.saved[key]?.first?.failure == RoomSession.notSent)
 

@@ -78,8 +78,7 @@ import Testing
     @Test func aServerThatNeverWelcomesTimesOutAndCloses() async throws {
         let task = Task { try await client.message("m002", in: "room-general") }
         let connection = await waitForConnection()
-        for _ in 0 ..< 500 where clock.sleeperCount == 0 { try await Task.sleep(for: .milliseconds(2)) }
-        clock.advance(by: .seconds(11))
+        try #require(await clock.pass(.seconds(11)))
         let error = await #expect(throws: EmberError.self) { try await task.value }
         #expect(error?.isUnreachable == true)
         #expect(connection.isClosedByClient)
