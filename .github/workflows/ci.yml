@@ -6,14 +6,22 @@ on:
   pull_request:
 
 jobs:
-  # Package.swift is swift-tools-version 6.0 and targets macOS 15 and iOS 18, so the tests run on the
-  # oldest toolchain that reads it (Swift 6.0, Xcode 16.0) and on the newest Xcode the runner has.
-  test:
+  # Package.swift is swift-tools-version 6.0 and targets macOS 15 and iOS 18, so the library is built
+  # on the oldest toolchain that reads it (Swift 6.0, Xcode 16.0). The tests read the error that
+  # `#expect(throws:)` returns, which needs Swift 6.1, so they run on Xcode 16.4 and on the newest
+  # Xcode the runner has.
+  package:
     runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
-        xcode: ["16.0", latest]
+        include:
+          - xcode: "16.0"
+            run: build
+          - xcode: "16.4"
+            run: test
+          - xcode: latest
+            run: test
     env:
       # Both the stand-in server and its check read the shared password from here. It protects nothing.
       EMBER_SEED_PASSWORD: ci-stand-in-password
@@ -34,7 +42,12 @@ jobs:
           xcodebuild -version
           swift --version
 
+      - name: Build the library
+        if: matrix.run == 'build'
+        run: swift build
+
       - name: Swift tests
+        if: matrix.run == 'test'
         run: swift test
 
       - name: Stand-in server check

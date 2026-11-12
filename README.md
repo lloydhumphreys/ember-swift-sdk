@@ -332,6 +332,8 @@ swift test
 
 None of them touch the network, apart from the live tests below, which skip unless asked for.
 
+The tests need Swift 6.1 (Xcode 16.3) or later: they read the error that `#expect(throws:)` returns. The library itself builds with Swift 6.0.
+
 ## The stand-in server
 
 `Tools/mock-server` is a small Node server that speaks Ember's HTTP and socket protocol, with seeded people and rooms. Its README has the details.
