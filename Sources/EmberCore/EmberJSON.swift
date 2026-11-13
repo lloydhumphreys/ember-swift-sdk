@@ -64,3 +64,8 @@ func encodeURIComponent(_ value: String) -> String {
 func jsLess(_ a: String, _ b: String) -> Bool {
     a.utf16.lexicographicallyPrecedes(b.utf16)
 }
+
+/// Whether id `a` sorts before `b` as the server sorts them: `jsLess` on their strings.
+func jsLess<ID: EmberIdentifier>(_ a: ID, _ b: ID) -> Bool {
+    jsLess(a.rawValue, b.rawValue)
+}

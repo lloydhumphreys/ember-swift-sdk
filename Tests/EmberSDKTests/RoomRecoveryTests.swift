@@ -29,7 +29,7 @@ import Testing
     }
 
     func olderPages(_ socket: MockSocketConnection) -> Int {
-        socket.sentFrames.filter { if case .historyBefore = $0 { true } else { false } }.count
+        socket.sentClientFrames.filter { if case .historyBefore = $0 { true } else { false } }.count
     }
 
     @Test func aFailedOlderPageWaitsForARetry() async throws {
@@ -89,7 +89,7 @@ import Testing
         let session = session()
         let socket = try await opened(session, welcome: Fixtures.RoomFrames.welcome(messages: Fixtures.messages(3), hasNewer: true, around: "m002"))
         session.loadNewer()
-        let newer = { socket.sentFrames.filter { if case .historyAfter = $0 { true } else { false } }.count }
+        let newer = { socket.sentClientFrames.filter { if case .historyAfter = $0 { true } else { false } }.count }
         #expect(await eventually { newer() == 1 })
         #expect(await clock.pass(RoomSession.pageTimeout))
         #expect(await eventually { session.timeline.newerPageFailure == Timeline.pageNotLoaded })
@@ -102,7 +102,7 @@ import Testing
         let session = session()
         let first = try await opened(session, welcome: Fixtures.RoomFrames.welcome(messages: Fixtures.messages(3), seq: 10))
         for (n, seq) in [(5, 12), (6, 13), (7, 14)] {
-            first.serverSends(Fixtures.RoomFrames.messageCreated(Fixtures.message(String(format: "m%03d", n), "Later", minute: n), seq: seq))
+            first.serverSends(Fixtures.RoomFrames.messageCreated(Fixtures.message(MessageID(String(format: "m%03d", n)), "Later", minute: n), seq: seq))
         }
         #expect(await eventually { connector.connections.count == 2 })
         #expect(query(connector.latest)["since"] == "10")
@@ -156,7 +156,7 @@ import Testing
         #expect(session.timeline.anchor == nil)
         if session.timeline.olderPageFailure != nil { session.retryOlder() } else { session.loadOlder() }
         #expect(await eventually { olderPages(socket) == 1 })
-        #expect(socket.sentFrames.contains(.historyBefore(messageId: "m040")))
+        #expect(socket.sentClientFrames.contains(.historyBefore(messageId: "m040")))
         socket.serverSends(Fixtures.RoomFrames.history(before: "m040", messages: Fixtures.messages(39, from: 1), hasMore: false))
         #expect(await eventually { session.timeline.messages.first?.id == "m001" })
     }
@@ -235,7 +235,7 @@ import Testing
         second.serverSends(Fixtures.RoomFrames.resumed(seq: 10))
         second.open()
         #expect(await eventually { olderPages(second) == 1 })
-        #expect(second.sentFrames.contains(.historyBefore(messageId: "m080")))
+        #expect(second.sentClientFrames.contains(.historyBefore(messageId: "m080")))
         second.serverSends(Fixtures.RoomFrames.history(before: "m080", messages: Fixtures.messages(40, from: 40), hasMore: true))
         #expect(await eventually { session.timeline.messages.first?.id == "m040" })
         await settle()
@@ -256,7 +256,7 @@ import Testing
         let second = try #require(connector.latest)
         second.serverSends(Fixtures.RoomFrames.resumed(seq: 10))
         second.open()
-        #expect(await eventually { second.sentFrames.contains(.historyAfter(messageId: "m160")) })
+        #expect(await eventually { second.sentClientFrames.contains(.historyAfter(messageId: "m160")) })
     }
 
     /// A jump asked for while reconnecting replaces the page the wish was for: nothing goes for it.

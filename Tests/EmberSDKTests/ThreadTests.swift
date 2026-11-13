@@ -31,7 +31,7 @@ import Testing
 
     /// The parent IDs of the `thread.open` and `thread.close` frames `socket` sent, in order.
     func threadFrames(_ socket: MockSocketConnection) -> [String] {
-        socket.sentFrames.compactMap {
+        socket.sentClientFrames.compactMap {
             switch $0 {
             case let .openThread(id): "open \(id)"
             case let .closeThread(id): "close \(id)"
@@ -131,7 +131,7 @@ import Testing
         let thread = session.thread("m001")
         let lease = thread.open()
         let id = thread.reply(body: "<p>Yes</p>", plainText: "Yes")
-        let also = thread.reply(body: "<p>Both</p>", plainText: "Both", alsoSend: true)
+        let also = thread.reply(body: "<p>Both</p>", plainText: "Both", delivery: .threadAndRoom)
         #expect(await eventually {
             socket.sent("message.create") == [
                 .createMessage(clientMessageId: id, body: "<p>Yes</p>", parentId: "m001", alsoSend: false),
@@ -236,7 +236,7 @@ import Testing
         let lease = thread.open()
         let file = try TestFile([1])
         defer { file.remove() }
-        let ids = thread.send(files: [try file.source()], body: "<p>See</p>", plainText: "See", alsoSend: true)
+        let ids = thread.send(files: [try file.source()], body: "<p>See</p>", plainText: "See", delivery: .threadAndRoom)
         let posted = Fixtures.fileMessage("r100", parentID: "m001", alsoSent: true, clientMessageId: ids[0])
         transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: posted)
         #expect(thread.timeline.pending.map(\.clientMessageId) == ids)
@@ -254,6 +254,32 @@ import Testing
         #expect(await eventually {
             socket.sent("message.create") == [.createMessage(clientMessageId: ids[1], body: "<p>See</p>", parentId: "m001", alsoSend: true)]
         })
+        lease.close()
+    }
+
+    @Test func eachDeliveryReachesTheWireAsTheSameBool() async throws {
+        let (session, socket) = try await opened()
+        let thread = session.thread("m001")
+        let lease = thread.open()
+        let only = try thread.reply(text: "Yes")
+        let both = try thread.reply(text: "Both", delivery: .threadAndRoom)
+        #expect(await eventually { socket.sent("message.create").count == 2 })
+        #expect(socket.sent("message.create") == [
+            .createMessage(clientMessageId: only, body: "<p>Yes</p>", parentId: "m001", alsoSend: false),
+            .createMessage(clientMessageId: both, body: "<p>Both</p>", parentId: "m001", alsoSend: true),
+        ])
+
+        let file = try TestFile([1])
+        defer { file.remove() }
+        let gate = transport.hold("PUT", partPath(1))
+        let ids = try thread.send(files: [try file.source()], text: nil)
+        transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: Fixtures.fileMessage("r100", parentID: "m001", clientMessageId: ids[0]))
+        await gate.waitForRequest()
+        let start = try #require(transport.lastBody("POST", uploads))
+        #expect(start["parentId"] as? String == "m001")
+        #expect(start["alsoSend"] == nil)
+        gate.release()
+        #expect(await eventually { thread.timeline.pending.allSatisfy { $0.upload == nil } })
         lease.close()
     }
 
@@ -296,7 +322,7 @@ import Testing
         let (session, socket) = try await opened()
         let thread = session.thread("m001")
         let lease = thread.open()
-        let replies = (2 ... 4).map { Fixtures.reply(String(format: "r%03d", $0), "Reply \($0)", to: "m001", minute: $0) }
+        let replies = (2 ... 4).map { Fixtures.reply(MessageID(String(format: "r%03d", $0)), "Reply \($0)", to: "m001", minute: $0) }
         socket.serverSends(Fixtures.RoomFrames.threadOpened("m001", parent: parent, replies: replies, hasMore: true))
         #expect(await eventually { thread.timeline.isLoaded })
 
@@ -313,7 +339,7 @@ import Testing
         let (session, socket) = try await opened()
         let thread = session.thread("m001")
         let lease = thread.open()
-        let replies = (2 ... 4).map { Fixtures.reply(String(format: "r%03d", $0), "Reply \($0)", to: "m001", minute: $0) }
+        let replies = (2 ... 4).map { Fixtures.reply(MessageID(String(format: "r%03d", $0)), "Reply \($0)", to: "m001", minute: $0) }
         socket.serverSends(Fixtures.RoomFrames.threadOpened("m001", parent: parent, replies: replies, hasMore: true))
         #expect(await eventually { thread.timeline.isLoaded })
 
@@ -344,7 +370,7 @@ import Testing
     // MARK: A second link into the thread
 
     /// The thread under m001, open on `socket` with `replies` and more before them.
-    func openedThread(_ session: RoomSession, on socket: MockSocketConnection, replies: [Message], hasMore: Bool = false, at replyID: String? = nil) async throws -> (ThreadSession, ThreadLease) {
+    func openedThread(_ session: RoomSession, on socket: MockSocketConnection, replies: [Message], hasMore: Bool = false, at replyID: MessageID? = nil) async throws -> (ThreadSession, ThreadLease) {
         let thread = session.thread("m001", at: replyID)
         let lease = thread.open()
         try #require(await eventually { threadFrames(socket).last == "open m001" })
@@ -355,7 +381,7 @@ import Testing
 
     @Test func aLinkToALoadedReplyFocusesIt() async throws {
         let (session, socket) = try await opened()
-        let replies = (1 ... 3).map { Fixtures.reply(String(format: "r%03d", $0), "Reply \($0)", to: "m001", minute: $0) }
+        let replies = (1 ... 3).map { Fixtures.reply(MessageID(String(format: "r%03d", $0)), "Reply \($0)", to: "m001", minute: $0) }
         let (thread, lease) = try await openedThread(session, on: socket, replies: replies)
         let id = thread.reply(body: "<p>Mine</p>", plainText: "Mine")
         #expect(thread.timeline.focus == nil)
@@ -372,14 +398,14 @@ import Testing
 
     @Test func aLinkToAnOlderReplyPagesBackToIt() async throws {
         let (session, socket) = try await opened()
-        let replies = (3 ... 4).map { Fixtures.reply(String(format: "r%03d", $0), "Reply \($0)", to: "m001", minute: $0) }
+        let replies = (3 ... 4).map { Fixtures.reply(MessageID(String(format: "r%03d", $0)), "Reply \($0)", to: "m001", minute: $0) }
         let (thread, lease) = try await openedThread(session, on: socket, replies: replies, hasMore: true)
         let id = thread.reply(body: "<p>Mine</p>", plainText: "Mine")
 
         #expect(session.thread("m001", at: "r001") === thread)
         #expect(await eventually { socket.sent("thread.before") == [.threadBefore(parentId: "m001", before: "r003")] })
         #expect(thread.timeline.focus == nil)
-        let older = (1 ... 2).map { Fixtures.reply(String(format: "r%03d", $0), "Reply \($0)", to: "m001", minute: $0) }
+        let older = (1 ... 2).map { Fixtures.reply(MessageID(String(format: "r%03d", $0)), "Reply \($0)", to: "m001", minute: $0) }
         socket.serverSends(Fixtures.RoomFrames.threadHistory("m001", before: "r003", replies: older, hasMore: false))
         #expect(await eventually { thread.timeline.focus == "r001" })
         #expect(thread.timeline.replies.map(\.id) == ["r001", "r002", "r003", "r004"])
@@ -389,7 +415,7 @@ import Testing
 
     @Test func aLinkWithNoReplyLeavesTheThreadWhereItIs() async throws {
         let (session, socket) = try await opened()
-        let replies = (1 ... 3).map { Fixtures.reply(String(format: "r%03d", $0), "Reply \($0)", to: "m001", minute: $0) }
+        let replies = (1 ... 3).map { Fixtures.reply(MessageID(String(format: "r%03d", $0)), "Reply \($0)", to: "m001", minute: $0) }
         let (thread, lease) = try await openedThread(session, on: socket, replies: replies, at: "r002")
         #expect(thread.timeline.focus == "r002")
 
@@ -406,7 +432,7 @@ import Testing
 
     @Test func aLinkIntoALingeringThreadKeepsItsFileGoing() async throws {
         let (session, socket) = try await opened()
-        let replies = (1 ... 2).map { Fixtures.reply(String(format: "r%03d", $0), "Reply \($0)", to: "m001", minute: $0) }
+        let replies = (1 ... 2).map { Fixtures.reply(MessageID(String(format: "r%03d", $0)), "Reply \($0)", to: "m001", minute: $0) }
         let (thread, lease) = try await openedThread(session, on: socket, replies: replies)
         let file = try TestFile([1])
         defer { file.remove() }
@@ -462,10 +488,11 @@ import Testing
         try #require(await eventually { first.isAdmitted })
         let thread = first.thread("m001")
         let lease = thread.open()
-        let id = thread.reply(body: "<p>Both</p>", plainText: "Both", alsoSend: true)
+        let id = thread.reply(body: "<p>Both</p>", plainText: "Both", delivery: .threadAndRoom)
+        try await first.flushUnsent()
         #expect(store.saved[key]?.map(\.clientMessageId) == [id])
         #expect(store.saved[key]?.first?.parentId == "m001")
-        #expect(store.saved[key]?.first?.alsoSend == true)
+        #expect(store.saved[key]?.first?.delivery == .threadAndRoom)
         lease.close()
 
         let relaunched = MockSocketConnector()
@@ -497,10 +524,12 @@ import Testing
         let id = thread.reply(body: "<p>Yes</p>", plainText: "Yes")
         #expect(await clock.pass(.seconds(5)))
         #expect(await eventually { thread.timeline.pending.first?.failure == RoomSession.notSent })
+        try await session.flushUnsent()
         #expect(store.saved[key]?.first?.failure == RoomSession.notSent)
 
         thread.retry(id)
         #expect(thread.timeline.pending.first?.failure == nil)
+        try await session.flushUnsent()
         #expect(store.saved[key]?.first?.failure == nil)
         let socket = try #require(connector.latest)
         #expect(await eventually { socket.sent("message.check").last == .checkMessages(clientMessageIds: [id]) })
@@ -524,6 +553,7 @@ import Testing
         #expect(await eventually { thread.timeline.pending.first?.failure != nil })
         lease.close()
         #expect(await eventually { session.threads.isEmpty })
+        try await session.flushUnsent()
         #expect(store.saved[key]?.map(\.clientMessageId) == [id])
 
         let again = session.thread("m001")
@@ -531,6 +561,7 @@ import Testing
         #expect(again.timeline.pending.map(\.clientMessageId) == [id])
         #expect(again.timeline.pending.first?.failure == "That’s too long.")
         again.discard(id)
+        try await session.flushUnsent()
         #expect(store.saved[key] == nil)
     }
 
@@ -545,12 +576,12 @@ import Testing
         defer { try? FileManager.default.removeItem(at: folder) }
         let stores: [any UnsentMessageStore] = [MemoryUnsentMessageStore(), FileUnsentMessageStore(folder: folder)]
         for store in stores {
-            for key in [mine, mineElsewhere, theirs, otherServer] { store.save([message], for: key) }
-            store.removeAll(server: server, userID: "user_ada")
-            #expect(store.messages(for: mine).isEmpty)
-            #expect(store.messages(for: mineElsewhere).isEmpty)
-            #expect(store.messages(for: theirs) == [message])
-            #expect(store.messages(for: otherServer) == [message])
+            for key in [mine, mineElsewhere, theirs, otherServer] { try store.save([message], for: key) }
+            try store.removeAll(server: server, userID: "user_ada")
+            #expect(try store.messages(for: mine).isEmpty)
+            #expect(try store.messages(for: mineElsewhere).isEmpty)
+            #expect(try store.messages(for: theirs) == [message])
+            #expect(try store.messages(for: otherServer) == [message])
         }
     }
 
@@ -559,6 +590,6 @@ import Testing
         let messages = try JSONDecoder().decode([UnsentMessage].self, from: Data(json.utf8))
         #expect(messages.map(\.clientMessageId) == ["c1"])
         #expect(messages.first?.parentId == nil)
-        #expect(messages.first?.alsoSend == false)
+        #expect(messages.first?.delivery == .threadOnly)
     }
 }

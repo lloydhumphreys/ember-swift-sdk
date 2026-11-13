@@ -46,12 +46,12 @@ public enum Fixtures {
 
     /// A message, by Grace in General unless said otherwise, at a minute past ten plus `minute`.
     public static func message(
-        _ id: String,
+        _ id: MessageID,
         _ text: String,
         by creator: User = grace,
         in roomID: RoomID = general.id,
         minute: Int = 0,
-        clientMessageId: String? = nil
+        clientMessageId: ClientMessageID? = nil
     ) -> Message {
         let at = date("2026-10-12T10:00:00.000Z").addingTimeInterval(TimeInterval(minute * 60))
         return Message(
@@ -63,7 +63,7 @@ public enum Fixtures {
     /// `count` messages in a room, oldest first, with ids `m001`, `m002`… that sort as the server's do.
     public static func messages(_ count: Int, in roomID: RoomID = general.id, from first: Int = 1) -> [Message] {
         (first ..< first + count).map { n in
-            message(String(format: "m%03d", n), "Message \(n)", by: n.isMultiple(of: 2) ? ada : grace, in: roomID, minute: n)
+            message(MessageID(String(format: "m%03d", n)), "Message \(n)", by: n.isMultiple(of: 2) ? ada : grace, in: roomID, minute: n)
         }
     }
 
@@ -98,7 +98,7 @@ public enum Fixtures {
         json([
             "rooms": rooms.map(sidebarRoomObject),
             "favorites": value(favorites),
-            "sharedOrder": sharedOrder,
+            "sharedOrder": sharedOrder.map(\.rawValue),
             "invitation": NSNull(),
             "suggestions": suggestions.map { value($0) },
         ])
@@ -147,16 +147,16 @@ public enum Fixtures {
 
     /// What a room's socket sends: `welcome` and the rest, as JSON.
     public enum RoomFrames {
-        public static func welcome(you: User = ada, messages: [Message] = Fixtures.messages(3), seq: Int = 10, present: [User] = [ada], hasMore: Bool = false, hasNewer: Bool = false, around: String? = nil) -> String {
+        public static func welcome(you: User = ada, messages: [Message] = Fixtures.messages(3), seq: Int = 10, present: [User] = [ada], hasMore: Bool = false, hasNewer: Bool = false, around: MessageID? = nil) -> String {
             json([
                 "type": "welcome", "you": value(you), "present": present.map { value($0) }, "seq": seq,
-                "messages": messages.map { value($0) }, "hasMore": hasMore, "hasNewer": hasNewer, "around": around ?? NSNull(),
+                "messages": messages.map { value($0) }, "hasMore": hasMore, "hasNewer": hasNewer, "around": around?.rawValue ?? NSNull(),
             ])
         }
 
-        public static func resumed(you: User = ada, messages: [Message] = [], deletedIds: [String] = [], seq: Int, present: [User] = [ada]) -> String {
+        public static func resumed(you: User = ada, messages: [Message] = [], deletedIds: [MessageID] = [], seq: Int, present: [User] = [ada]) -> String {
             json([
-                "type": "resumed", "you": value(you), "messages": messages.map { value($0) }, "deletedIds": deletedIds,
+                "type": "resumed", "you": value(you), "messages": messages.map { value($0) }, "deletedIds": deletedIds.map(\.rawValue),
                 "present": present.map { value($0) }, "seq": seq,
             ])
         }
@@ -169,27 +169,27 @@ public enum Fixtures {
             json(["type": "message.updated", "message": value(message), "seq": seq])
         }
 
-        public static func messageDeleted(_ messageId: String, seq: Int) -> String {
-            json(["type": "message.deleted", "messageId": messageId, "seq": seq])
+        public static func messageDeleted(_ messageId: MessageID, seq: Int) -> String {
+            json(["type": "message.deleted", "messageId": messageId.rawValue, "seq": seq])
         }
 
-        public static func history(before: String, messages: [Message], hasMore: Bool) -> String {
-            json(["type": "history", "before": before, "messages": messages.map { value($0) }, "hasMore": hasMore])
+        public static func history(before: MessageID, messages: [Message], hasMore: Bool) -> String {
+            json(["type": "history", "before": before.rawValue, "messages": messages.map { value($0) }, "hasMore": hasMore])
         }
 
-        public static func historyAfter(after: String, messages: [Message], hasNewer: Bool) -> String {
-            json(["type": "history.after", "after": after, "messages": messages.map { value($0) }, "hasNewer": hasNewer])
+        public static func historyAfter(after: MessageID, messages: [Message], hasNewer: Bool) -> String {
+            json(["type": "history.after", "after": after.rawValue, "messages": messages.map { value($0) }, "hasNewer": hasNewer])
         }
 
-        public static func historyAround(messages: [Message], hasMore: Bool = true, hasNewer: Bool = true, around: String?) -> String {
+        public static func historyAround(messages: [Message], hasMore: Bool = true, hasNewer: Bool = true, around: MessageID?) -> String {
             json([
                 "type": "history.around", "messages": messages.map { value($0) }, "hasMore": hasMore, "hasNewer": hasNewer,
-                "around": around ?? NSNull(),
+                "around": around?.rawValue ?? NSNull(),
             ])
         }
 
-        public static func messageChecked(stored: [String], missing: [String]) -> String {
-            json(["type": "message.checked", "stored": stored, "missing": missing])
+        public static func messageChecked(stored: [ClientMessageID], missing: [ClientMessageID]) -> String {
+            json(["type": "message.checked", "stored": stored.map(\.rawValue), "missing": missing.map(\.rawValue)])
         }
 
         public static func typing(_ user: User, _ typing: Bool) -> String {
@@ -197,9 +197,9 @@ public enum Fixtures {
         }
 
         /// A refusal; with a `clientMessageId` it's a message's, otherwise something else's.
-        public static func error(_ message: String, clientMessageId: String? = nil, failed: String? = nil) -> String {
+        public static func error(_ message: String, clientMessageId: ClientMessageID? = nil, failed: String? = nil) -> String {
             var object: [String: Any] = ["type": "error", "message": message]
-            if let clientMessageId { object["clientMessageId"] = clientMessageId }
+            if let clientMessageId { object["clientMessageId"] = clientMessageId.rawValue }
             if let failed { object["failed"] = failed }
             return json(object)
         }
@@ -216,11 +216,11 @@ public enum Fixtures {
         }
 
         public static func roomUnread(_ roomID: RoomID) -> String {
-            json(["type": "room.unread", "roomId": roomID])
+            json(["type": "room.unread", "roomId": roomID.rawValue])
         }
 
         public static func roomRead(_ roomID: RoomID) -> String {
-            json(["type": "room.read", "roomId": roomID])
+            json(["type": "room.read", "roomId": roomID.rawValue])
         }
 
         public static func roomSaved(_ room: Room) -> String {
@@ -228,7 +228,7 @@ public enum Fixtures {
         }
 
         public static func roomGone(_ roomID: RoomID) -> String {
-            json(["type": "room.gone", "roomId": roomID])
+            json(["type": "room.gone", "roomId": roomID.rawValue])
         }
 
         public static func favoritesChanged(_ favorites: Favorites) -> String {

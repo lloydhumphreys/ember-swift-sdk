@@ -7,30 +7,31 @@ public struct NewUpload: Codable, Hashable, Sendable {
     public var name: String
     public var type: String
     public var size: Int
-    public var clientMessageId: String
+    public var clientMessageId: ClientMessageID
     /// The message in whose thread the file is a reply.
-    public var parentId: String?
-    /// Left out unless there's a `parentId` and it's true, as the room keeps it only then.
+    public var parentId: MessageID?
+    /// True for a reply that goes to the room too (a `parentId` and `.threadAndRoom`); left out
+    /// otherwise, as the room keeps it only then.
     public var alsoSend: Bool?
 
-    public init(name: String, type: String, size: Int, clientMessageId: String, parentId: String? = nil, alsoSend: Bool = false) {
+    public init(name: String, type: String, size: Int, clientMessageId: ClientMessageID, parentId: MessageID? = nil, delivery: ReplyDelivery = .threadOnly) {
         self.name = name
         self.type = type
         self.size = size
         self.clientMessageId = clientMessageId
         self.parentId = parentId
-        self.alsoSend = parentId != nil && alsoSend ? true : nil
+        self.alsoSend = parentId != nil && delivery == .threadAndRoom ? true : nil
     }
 }
 
 /// What starting an upload answers: where the parts go. Every part but the last carries `partSize`
 /// bytes, the last the rest, and there's always at least one, even for an empty file.
 public struct UploadTicket: Codable, Hashable, Sendable {
-    public var id: String
+    public var id: UploadID
     public var partSize: Int
     public var parts: Int
 
-    public init(id: String, partSize: Int, parts: Int) {
+    public init(id: UploadID, partSize: Int, parts: Int) {
         self.id = id
         self.partSize = partSize
         self.parts = parts

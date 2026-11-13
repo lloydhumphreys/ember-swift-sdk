@@ -2,20 +2,20 @@
 
 A Swift client for [Ember](https://github.com/NYLLON-SOFTWARE/ember-cloudflare), a team chat app that runs on Cloudflare Workers and Durable Objects.
 
+[Ember for iOS](https://github.com/lloydhumphreys/ember-ios) is an iPhone app built on this SDK.
+
 ## Layers
 
-| Product | What it is |
+| Product | Description |
 | --- | --- |
-| `EmberCore` | The wire shapes and the pure logic over them (timeline, sidebar, search). No I/O. |
-| `EmberRichText` | Message bodies, read into blocks and written from what someone typed. |
-| `EmberSDK` | The HTTP client, the two sockets, and the stores an app holds: `Workspace` and `RoomSession`. Re-exports `EmberCore`. |
-| `EmberTesting` | Stand-in transports, a manual clock and fixtures, for an app's tests and previews. |
+| `EmberCore` | Wire shapes and logic (timeline, sidebar, search). No I/O. |
+| `EmberRichText` | Message bodies, read into blocks. |
+| `EmberSDK` | HTTP client, two sockets, and stores: `Workspace` and `RoomSession`. Re-exports `EmberCore`. |
+| `EmberTesting` | Fixtures etc, for an app's tests and previews. |
 
 Swift 6, iOS 18 and macOS 15. Foundation and Observation only.
 
 Bot cards, Ember's message attachments for bots, are read in `EmberCore` and their text in `EmberRichText`.
-
-The SDK is built and tested against the stand-in server below. It has not yet been exercised end to end against a production Ember server.
 
 | | |
 | --- | --- |
@@ -23,10 +23,6 @@ The SDK is built and tested against the stand-in server below. It has not yet be
 | Swift | 6.0 or later (`swift-tools-version: 6.0`) |
 | Xcode | 16.0 or later |
 | Platforms | iOS 18, macOS 15 |
-
-That is the commit the SDK and the stand-in server were written against. A later Ember may change what they rely on.
-
-[Ember for iOS](https://github.com/lloydhumphreys/ember-ios) is the reference client: an iPhone app built on these products.
 
 ## Installing
 
@@ -47,49 +43,35 @@ let client = EmberClient(origin: URL(string: "https://chat.example.com")!)
 let me = try await client.signIn(emailAddress: email, password: password)
 let bootstrap = try await client.bootstrap()
 
-// The sidebar, kept live by the workspace socket. Observable, so SwiftUI redraws as it changes.
+// Observable sidebar
 let workspace = Workspace(client: client, me: me, account: bootstrap.account)
 workspace.onSignedOut = { /* back to signing in */ }
 workspace.start()
 
-// A room, kept live by its own socket while a lease on it is open. The workspace keeps one
-// session per room.
+// A room, kept live by its own socket. The workspace keeps one session per room.
 let room = workspace.session(for: roomID)
 let lease = room.open()          // in onAppear; lease.close() in onDisappear
 room.send(body: "<p>Hello</p>", plainText: "Hello")
 // room.timeline.messages, room.timeline.pending, room.loadOlder(), room.jump(to:)…
 
-// Search. An empty query reads just the recent searches.
+// Search
 let results = try await client.search(SearchQuery(q: "launch"), record: true)
 ```
 
 `EmberClient(origin:)` keeps the session cookie in `HTTPCookieStorage.shared`, so someone stays signed in between launches. `client.hasSessionCookie` says whether to try `me()` before showing sign-in. Every call throws `EmberError`, whose `message` can be shown as it is, and whose `kind` says what went wrong: `.unreachable`, `.http`, `.undecodable`, `.unreadableFile`, `.invalid`, `.refused` or `.timedOut`.
 
-## Checking a server
-
-```swift
-let check = try await EmberClient(origin: typed).checkServer()
-let client = EmberClient(origin: check.origin)      // where the server answered, after redirects
-// check.bootstrap.setup, check.bootstrap.account…
-```
-
-- `checkServer()` is `bootstrap()` that also answers the origin it ended at, so a server that redirects (`http` to `https`, or to another host) is kept at its real address. A redirect from `https` down to `http` isn't followed: `origin` stays the one asked.
-- `ServerAddress.normalizedOrigin(_:)` is the one form of an origin the client uses: lowercased, no default port, no path. A bare private, loopback or `.local` address defaults to `http`, anything else to `https`, and `ServerAddress.needsHTTPS(_:)` says when an `http` address would be blocked by App Transport Security.
-
-## Signing out, and why
+## Sign out
 
 ```swift
 workspace.onSignedOut = {
     switch client.signOutReason {
-    case .sessionEnded: break     // the server ended the session: a request was answered 401
-    case .asked, nil: break       // they signed out
+    case .sessionEnded: break     // the server ended the session (a request was answered 401)
+    case .userInitiated, nil: break // signed out manually
     }
 }
 ```
 
-`signOutReason` is `.asked` after `signOut()` and `.sessionEnded` when the server no longer knows the session. It's nil again once someone signs in. A 401 signs out only when it answers the session that's current, so a late answer from a replaced one doesn't.
-
-## More than one account
+## Multiple account management
 
 `HTTPCookieStorage.shared` keeps one session cookie per server, so two people signed in to one server would overwrite each other's. Give each account a `KeychainCookieStorage` of its own instead:
 
@@ -98,11 +80,23 @@ let cookies = KeychainCookieStorage(account: accountID)   // any name that stays
 let client = EmberClient(origin: origin, cookies: cookies)
 ```
 
-It keeps the cookies in memory and writes them to one Keychain item (readable after first unlock, this device only) whenever they change, so the session outlives the app. Each `EmberClient(origin:cookies:)` has a URLSession of its own, with no cookie store or cache of its own. `cookies.eraseAll()` forgets the cookies and the Keychain item, as when the account is removed. The Keychain can't be read while a device is locked after a restart: then `cookies.readFailure` says why and the storage starts empty, without erasing the item. A write the Keychain refuses is tried again at the next change. `cookies.syncVault()` tries both again now, as when the app comes to the foreground, and answers whether the Keychain is up to date. `KeychainCookieStorage(vault:)` takes any `CookieVault`; tests use `MemoryCookieVault`.
+This keeps the cookies in memory and writes them to one Keychain item (readable after first unlock, this device only) whenever they change. Each `EmberClient(origin:cookies:)` has a URLSession of its own, with no cookie store or cache of its own. `cookies.eraseAll()` forgets the cookies and the Keychain item, as when the account is removed. 
+
+Keychain can't be read while a device is locked after a restart: `cookies.readFailure` returns a failure. A write the Keychain refuses is retried at the next change. `cookies.syncVault()` tries both again now, as when the app comes to the foreground, and answers whether the Keychain is up to date. `KeychainCookieStorage(vault:)` takes any `CookieVault`; tests use `MemoryCookieVault`.
+
+## Your own transport
+
+```swift
+var environment = EmberEnvironment.system()
+environment.transport = MyTransport()                // any HTTPTransport
+let client = EmberClient(origin: origin, environment: environment)
+```
+
+`EmberEnvironment` is what a client runs on: transport, socket connector, cookies, timing, network path, unsent-message store and background time. `.system()` is what `EmberClient(origin:)` uses, so the rest stays as it is: unsent messages on disk, and time asked for while a file goes up.
 
 ## Network status
 
-`workspace.isNetworkAvailable` is false while the device has no network, and each socket's `isNetworkAvailable` the same for it. A socket waiting to reconnect tries again the moment the network is back, and doesn't use up its backoff while there is none. `EmberClient(…, network:)` takes the `NetworkPathSource` that says so: `SystemNetworkPath` unless given, and in tests EmberTesting's `MockNetworkPath`, whose `set(available:)` takes the network away.
+`workspace.isNetworkAvailable` is false while the device has no network, and each socket's `isNetworkAvailable` the same for it. A socket waiting to reconnect tries again the moment the network is back, and doesn't use up its backoff while there is none. The client's `EmberEnvironment` has the `NetworkPathSource` that says so: `SystemNetworkPath` in `.system()`, and in tests EmberTesting's `MockNetworkPath`, whose `set(available:)` takes the network away.
 
 ## The workspace
 
@@ -110,6 +104,16 @@ It keeps the cookies in memory and writes them to one Keychain item (readable af
 - `shutdown()` is for signing out: it stops everything for good, and nothing it was loading lands afterwards. Calling it twice is the same as once. The workspace does it itself when the session turns out to be gone, before `onSignedOut`. Each room's files stop, their temporary copies deleted and their pending messages dropped; its threads are let go of, their pending replies left as they are. A room or thread shut down sends no files afterwards: `send(files:…)` answers no ids and deletes temporary sources.
 - `directoryStatus` is `.loading`, `.loaded` or `.failed(message)`; `reloadDirectory()` tries again. A directory that loaded once stays `.loaded` through a later failure.
 - Sessions with an open lease are kept, and so are the 8 (`Workspace.idleSessionLimit`) used most recently without one. An older one is let go of: its socket closes, and its files stop, as on `shutdown()`, but its threads stay. While anything still holds it, `session(for:)` answers that same session again, and opening it takes it back into the cache. Keep the lease, not just the session, for as long as a screen shows the room.
+
+## Ids
+
+```swift
+let general: RoomID = "general"
+let message = MessageID(url.lastPathComponent)   // a String needs wrapping
+general.rawValue                                 // "general"
+```
+
+`UserID`, `RoomID`, `MessageID`, `ClientMessageID`, `BoostID`, `UploadID` and `FileID` each hold the server's string as it is, and one can't be passed for another. In JSON, and as a dictionary key, each is just that string.
 
 ## Rooms
 
@@ -145,7 +149,7 @@ room.unsentStore.removeAll(server: client.origin, userID: me.id)
 - `retry` asks the room with `message.check` first, and sends the text again only if the room says it's missing, since the room stores a create twice if it's sent twice. A failed text is asked about after each reconnect too, and one the room has after all leaves the pending list.
 - An unsent text keeps its room's socket open after the last lease closes, until it's confirmed, failed or discarded.
 - Unsent and failed texts and thread replies are kept on disk by `FileUnsentMessageStore`, per server, person and room, so they're sent again, under the same id, after the app was quit. A room's come back when it next opens, and a thread's replies when the thread does. Files going up aren't kept: one on its way when the app quits is lost.
-- `RoomSession(client:roomID:around:unsentStore:)` takes any `UnsentMessageStore`; `MemoryUnsentMessageStore` keeps nothing on disk.
+- A session uses its client's `unsentStore`. `RoomSession(client:roomID:around:unsentStore:)` takes any other `UnsentMessageStore`; `MemoryUnsentMessageStore` keeps nothing on disk.
 
 ## Changes that throw
 

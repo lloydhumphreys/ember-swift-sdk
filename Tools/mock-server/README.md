@@ -89,6 +89,60 @@ While the replier is on, a person's top-level message in Engineering containing 
 
 Deploy Bot and Uptime are in Engineering. Their keys are made at start-up, and an administrator reads them from `GET /api/account/bots`. Not ported: reading, editing and deleting through a key, removing a boost, and the `/slack` webhook.
 
+## Rooms, people and getting in
+
+Routes, messages, permissions and socket frames follow the real worker.
+
+| Route | Answer | Frames |
+| --- | --- | --- |
+| `POST /api/rooms` | 201 `{room}` | `room.saved` to its members |
+| `GET /api/rooms/new` | `{people}` | |
+| `GET /api/rooms/:id/settings` | `{room, canAdminister, people}`; 404 for a non-member or a DM | |
+| `PATCH /api/rooms/:id` | `{room}`; administrators and the creator | `room.saved`, and `room.gone` plus a 4004 socket close for people removed |
+| `DELETE /api/rooms/:id` | 204; administrators and the creator, any member for a DM | `room.gone`, sockets closed 4004 |
+| `PUT /api/sidebar/order` | `{favorites}` | `favorites.changed` to that person |
+| `PUT /api/account/room_order` | `{sharedOrder}`; administrators | `rooms.reordered` to everyone |
+| `DELETE /api/sidebar/invitation` | 204 | `invitation.dismissed` to that person |
+| `GET`, `PATCH /api/users/me/profile` | `{profile, transferId}` | `user.updated` to everyone |
+| `PUT`, `DELETE /api/users/me/avatar` | `{profile}` | `user.updated` to everyone |
+| `GET /api/users/:id` | `{person}`; administrators also get the email address and `transferId` | |
+| `POST`, `DELETE /api/users/:id/ban` | `{user}`; administrators | `user.updated`; a ban ends their sessions (close 4003) and deletes their messages |
+| `POST /api/session/transfers` | 201 `{user}` and a cookie; an empty 400 for any failure | |
+| `POST`, `PUT /api/password_resets` | 202, then 201 `{user}`; a reset ends every other session (close 4001) | |
+| `POST /api/invitations`, `POST /api/invitations/:id/resend`, `DELETE /api/invitations/:id` | `{outcomes}`, `{invitation, link}`, 204; administrators | |
+| `GET /api/account` | `{account, joinCode, invitations, ...}`; members get no invitations | |
+| `POST /api/email_links/lookup` | `{kind, emailAddress}` or 404 | |
+| `POST /api/unfurl` | 200 preview, 204 none, 429 past 30 a minute | |
+
+Banned people and bots can't sign in. A changed password replaces the shared seed password for that person.
+
+### No email: the log and the outbox
+
+The mock sends nothing. Where the real server would email, it prints to stdout:
+
+    RESET CODE <address> <code>
+    INVITATION LINK <address> <url>
+
+The same are returned by `GET /mock/outbox` (mock only, no sign-in): `{resetCodes: [{emailAddress, code, expiresAt}], invitationLinks: [{emailAddress, link}]}`, newest link per address. A reset code is 8 digits, lasts 15 minutes and allows 5 wrong tries. Invitation links look like `http://<host>/join/invitation#token=<43 characters>`; resending or inviting again replaces the link. A reset is only "sent" to an active, non-bot person. Bootstrap says `passwordResetCodes: true`.
+
+### Seeded invitations
+
+`first.guest@example.com` and `second.guest@example.com` are pending at start; their links are logged at start-up and are the same each run. Maya's sidebar carries the invitation card (room and join code); dismissing it is per person.
+
+### Link previews
+
+`POST /api/unfurl` has no network access. An `http` or `https` address on `example.com` or any subdomain gets `{title: "Example Domain", url, image: null, description}`; every other address, a non-string, and this server's own address get 204.
+
+### Differences from the real server
+
+- No IP bans, Turnstile, email rate limits or `PASSWORD_RESETS_LIMITED`; no real email.
+- A new avatar never refuses for being too soon; its version moves to a later second instead.
+- Room icons are accepted by pattern (lower-case words joined by hyphens, at most 64 characters), not the real list.
+- Room creation is never restricted to administrators.
+- The shared room order is one list for everyone, so `room_order` keeps ranks of rooms the administrator can't see.
+- A closed room made through the API holds only the listed people, as on the real server.
+- Seeded invitation tokens are derived from the address; real ones are random.
+
 ## Not implemented
 
-Real email, invitations and join codes beyond the seeded one, user management, push notifications, rate limits, and persistence. Search matches prefixes of words, which approximates the real full-text index.
+Real email, join codes beyond the seeded one, push notifications, rate limits, and persistence. Search matches prefixes of words, which approximates the real full-text index.

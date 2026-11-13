@@ -107,7 +107,7 @@ private final class RedirectGuard: NSObject, URLSessionTaskDelegate, Sendable {
 /// Why a socket ended, as far as it's known: the close code the server sent, or the HTTP status it
 /// answered the upgrade with instead of letting the socket in. Both nil when the network dropped it.
 public struct SocketClosed: Error, Equatable, Sendable {
-    /// The WebSocket close code, such as `SocketClose.revoked` (4003).
+    /// The WebSocket close code, such as 4003 when the person was removed from the workspace.
     public var closeCode: Int?
     /// The status an upgrade was refused with, such as 401 when the session is gone.
     public var httpStatus: Int?
@@ -119,7 +119,7 @@ public struct SocketClosed: Error, Equatable, Sendable {
     }
 }
 
-/// One live WebSocket, as `ReconnectingSocket` drives it.
+/// One live WebSocket, as the workspace's and rooms' sockets drive it.
 public protocol SocketConnection: Sendable {
     /// Waits until the server has let the socket in, throwing `SocketClosed` when it refuses or the
     /// socket ends first. A connection that can't tell may return at once (the default does).
@@ -137,7 +137,7 @@ extension SocketConnection {
     public func waitUntilOpen() async throws {}
 }
 
-/// Opens sockets. `ReconnectingSocket` asks it for each attempt, so a test hands it EmberTesting's
+/// Opens sockets. Each socket asks it again for every attempt, so a test hands it EmberTesting's
 /// `MockSocketConnector` and scripts the server's side.
 public protocol SocketConnector: Sendable {
     /// Starts connecting to `request`'s address and answers the connection at once; it opens later.

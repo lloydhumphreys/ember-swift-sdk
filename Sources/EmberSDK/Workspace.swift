@@ -15,14 +15,21 @@ import Observation
     public private(set) var account: Account
     /// The directory, by id.
     public private(set) var people: [UserID: DirectoryUser] = [:] {
-        didSet { directory = Array(people.values) }
+        didSet {
+            directory = Array(people.values)
+            // Someone suggested who's been banned or let back in since is left out or back.
+            if suggestions.contains(where: { RoomList.isSuggestable($0.id, people: oldValue) != RoomList.isSuggestable($0.id, people: people) }) {
+                sortCount += 1
+                publishSuggestedPeople()
+            }
+        }
     }
     /// Whether the first sidebar has arrived.
     public private(set) var isLoaded = false
     /// Why the latest sidebar didn't arrive; nil once one does.
     public private(set) var loadError: EmberError?
     /// The workspace socket's state.
-    public private(set) var connection: ReconnectingSocket.Status = .idle
+    public private(set) var connection: ConnectionStatus = .idle
     /// The latest thing the server refused (a star, a level), to show once and set back to nil.
     public var notice: String?
     /// Where the directory is: `people` is empty until it has loaded once.
@@ -90,12 +97,20 @@ import Observation
     @ObservationIgnored private var involvementAsked = 0
     @ObservationIgnored private var loadAgain = false
     @ObservationIgnored private var check: Task<Void, Never>?
-    /// Whether the next load reads the directory too.
+    /// Whether the next load reads the directory too, and since which person heard (`heardCount`)
+    /// it was first asked for.
     @ObservationIgnored private var directoryWanted = false
+    @ObservationIgnored private var directoryWantedSince: Int?
     /// How long since a welcome last read the sidebar again.
     @ObservationIgnored private var sinceWelcomeRefresh: (@Sendable () -> Duration)?
     /// How long since the directory last arrived.
     @ObservationIgnored private var sinceDirectory: (@Sendable () -> Duration)?
+    /// How many directory loads are asked for or under way.
+    @ObservationIgnored private var directoryLoads = 0
+    /// Each person heard of while a directory load was asked for or under way, numbered, so its
+    /// answer doesn't undo them: it puts back those heard since it was asked for.
+    @ObservationIgnored private var heardDuringLoads: [(number: Int, user: DirectoryUser)] = []
+    @ObservationIgnored private var heardCount = 0
     /// A welcome's reload put off until `EmberTiming.sidebarRefresh` has passed since the last.
     @ObservationIgnored private var refresh: Task<Void, Never>?
     @ObservationIgnored private let relay = Relay()
@@ -136,10 +151,17 @@ import Observation
     /// Shared rooms, none hidden, in sidebar order.
     public private(set) var sharedRooms: [SidebarRoom] = []
 
+    /// The starred rooms at the start of `sharedRooms`, which `moveFavorites` moves.
+    public var favoriteRooms: [SidebarRoom] { sharedRooms.filter { isFavorite($0.id) } }
+
+    /// Shared rooms, hidden ones too, in the shared order, stars aside, which `moveSharedRooms` moves.
+    public private(set) var roomsInSharedOrder: [SidebarRoom] = []
+
     /// DMs, none hidden, latest active first.
     public private(set) var directRooms: [SidebarRoom] = []
 
-    /// The people to suggest DMs with, leaving out those you have DMs with.
+    /// The people to suggest DMs with, leaving out those you have DMs with and anyone the directory
+    /// has as banned, deactivated or suspended. It changes as they're banned or let back in.
     public private(set) var suggestedPeople: [User] = []
 
     /// The rooms marked unread, shared then DMs. The room on screen never is.
@@ -180,11 +202,16 @@ import Observation
         if roomsChanged || favoritesChanged || orderChanged {
             assign(\.sharedRooms, RoomList.shared(rooms, favorites: favorites.rooms, sharedOrder: sharedOrder))
         }
-        if roomsChanged { assign(\.directRooms, RoomList.directs(rooms)) }
-        if roomsChanged || suggestionsChanged {
-            assign(\.suggestedPeople, RoomList.suggestedPeople(suggestions, rooms: rooms))
+        if roomsChanged || orderChanged {
+            assign(\.roomsInSharedOrder, RoomList.inSharedOrder(rooms, sharedOrder: sharedOrder))
         }
+        if roomsChanged { assign(\.directRooms, RoomList.directs(rooms)) }
+        if roomsChanged || suggestionsChanged { publishSuggestedPeople() }
         publishUnread()
+    }
+
+    private func publishSuggestedPeople() {
+        assign(\.suggestedPeople, RoomList.suggestedPeople(suggestions, rooms: rooms, people: people))
     }
 
     private func publishUnread() {
@@ -233,7 +260,8 @@ import Observation
     // MARK: Actions
 
     /// Opens the socket and loads the sidebar and directory, and opens again every room something
-    /// holds a lease on, each catching up from its `seq`. Nothing when already started, or after
+    /// holds a lease on, each catching up from its `seq`. Unsent messages that failed to be saved, and
+    /// removals that failed, are tried again. Nothing when already started, or after
     /// `shutdown()`.
     public func start() {
         guard !started, !isShutDown else { return }
@@ -242,6 +270,7 @@ import Observation
         self.socket = socket
         socket.start()
         for session in liveSessions { session.resume() }
+        UnsentWriter.writer(for: client.unsentStore).retry()
         if !isLoaded { Task { await reload() } }
     }
 
@@ -275,6 +304,18 @@ import Observation
         recency = []
     }
 
+    /// Waits for every room's unsent messages to be written, as the app goes to the background, failed
+    /// ones tried again first. Throws the first error, once every room has been tried; what failed is
+    /// kept and goes at the next retry.
+    public func flushUnsent() async throws {
+        var failure: (any Error)?
+        for session in liveSessions {
+            do { try await session.flushUnsent() } catch { failure = failure ?? error }
+        }
+        do { try await client.flushUnsent() } catch { failure = failure ?? error }
+        if let failure { throw failure }
+    }
+
     /// Loads the sidebar and directory again, as pull to refresh does. A reload asked for while one
     /// is on its way runs once more after it, since the one on its way may have read too early.
     public func reload() async {
@@ -285,7 +326,10 @@ import Observation
     /// its way.
     private func load(directory: Bool) async {
         guard !isShutDown else { return }
-        if directory { directoryWanted = true }
+        if directory {
+            directoryWanted = true
+            if directoryWantedSince == nil { directoryWantedSince = heardCount }
+        }
         if let loading {
             loadAgain = true
             await loading.value
@@ -359,6 +403,153 @@ import Observation
         return self.room(room.id) ?? SidebarRoom(room: room)
     }
 
+    /// Creates a shared room and adds it to the sidebar. A closed room always has you in it.
+    public func createRoom(_ newRoom: NewRoom) async throws -> SidebarRoom {
+        var newRoom = newRoom
+        if case let .closed(memberIDs) = newRoom.access, !memberIDs.contains(me.id) {
+            newRoom.access = .closed(memberIDs: [me.id] + memberIDs)
+        }
+        let room = try await client.createRoom(newRoom)
+        state.add(room)
+        return self.room(room.id) ?? SidebarRoom(room: room)
+    }
+
+    /// Changes a room, answering it as saved. Closing it without you in it takes it out of the sidebar.
+    @discardableResult
+    public func changeRoom(_ roomID: RoomID, _ changes: RoomChanges) async throws -> Room {
+        let room = try await client.changeRoom(roomID, changes)
+        if case let .closed(memberIDs) = changes.access, !memberIDs.contains(me.id) {
+            state.remove(roomID)
+        } else {
+            state.add(room)
+        }
+        return room
+    }
+
+    /// Deletes a room or DM and takes it out of the sidebar.
+    public func deleteRoom(_ roomID: RoomID) async throws {
+        try await client.deleteRoom(roomID)
+        state.remove(roomID)
+    }
+
+    /// Moves starred rooms, as `favoriteRooms` lists them, at once. If the server refuses, they go
+    /// back, `notice` says why, and the sidebar loads again.
+    public func moveFavorites(fromOffsets offsets: IndexSet, toOffset destination: Int) async {
+        let shown = favoriteRooms.map(\.id)
+        let moved = RoomList.moving(shown, fromOffsets: offsets, toOffset: destination)
+        guard moved != shown else { return }
+        let order = RoomList.reordered(favorites.rooms, by: moved)
+        let guess = state.beginFavoriteOrder(order)
+        do {
+            let answer = try await client.setFavoriteOrder(order)
+            guard !isShutDown else { return }
+            state.acceptFavoriteOrder(guess, favorites: answer)
+        } catch {
+            guard !isShutDown else { return }
+            state.rejectFavoriteOrder(guess)
+            refused(error)
+            await load(directory: false)
+        }
+    }
+
+    /// Moves rooms in the shared order, as `roomsInSharedOrder` lists them, at once, for everyone.
+    /// Administrators only. If the server refuses, they go back, `notice` says why, and the sidebar
+    /// loads again.
+    public func moveSharedRooms(fromOffsets offsets: IndexSet, toOffset destination: Int) async {
+        let shown = roomsInSharedOrder.map(\.id)
+        let moved = RoomList.moving(shown, fromOffsets: offsets, toOffset: destination)
+        guard moved != shown else { return }
+        await saveSharedOrder(moved)
+    }
+
+    /// Clears the shared order, so shared rooms go by name. Administrators only.
+    public func clearSharedOrder() async {
+        await saveSharedOrder([])
+    }
+
+    private func saveSharedOrder(_ order: [RoomID]) async {
+        let guess = state.beginSharedOrder(order)
+        do {
+            let answer = try await client.setSharedOrder(order)
+            guard !isShutDown else { return }
+            state.acceptSharedOrder(guess, order: answer)
+        } catch {
+            guard !isShutDown else { return }
+            state.rejectSharedOrder(guess)
+            refused(error)
+            await load(directory: false)
+        }
+    }
+
+    /// Dismisses the invitation at once, and shows it again if the server refuses.
+    public func dismissInvitation() async {
+        guard invitation != nil else { return }
+        state.beginDismissal()
+        do {
+            try await client.dismissInvitation()
+            guard !isShutDown else { return }
+            state.acceptDismissal()
+        } catch {
+            guard !isShutDown else { return }
+            state.rejectDismissal()
+            refused(error)
+        }
+    }
+
+    /// Changes your profile, and shows your new name and bio here at once. Answers it as saved.
+    @discardableResult
+    public func changeProfile(_ changes: ProfileChanges) async throws -> UserProfile {
+        let profile = try await client.changeProfile(changes).profile
+        took(profile)
+        return profile
+    }
+
+    /// Gives you a new picture, and shows it here at once. `variant` is a smaller copy to show in
+    /// lists; without one the SDK makes it, when it can read the picture.
+    @discardableResult
+    public func changeAvatar(_ data: Data, contentType: String, variant: AvatarVariant? = nil) async throws -> UserProfile {
+        let profile = try await client.changeAvatar(data, contentType: contentType, variant: variant).profile
+        took(profile)
+        return profile
+    }
+
+    /// Takes your picture away, leaving your initials.
+    @discardableResult
+    public func removeAvatar() async throws -> UserProfile {
+        let profile = try await client.removeAvatar().profile
+        took(profile)
+        return profile
+    }
+
+    /// Your profile as the server just saved it, shown here before the socket says so.
+    private func took(_ profile: UserProfile) {
+        me.name = profile.name
+        guard var mine = people[me.id] else { return }
+        mine.name = profile.name
+        mine.bio = profile.bio
+        mine.avatarUrl = profile.avatarUrl
+        heard(mine)
+    }
+
+    /// Bans someone: they're signed out, can't come back, and their messages are deleted.
+    /// Administrators only. `people` shows them as banned at once.
+    public func ban(_ userID: UserID) async throws {
+        heard(try await client.ban(userID))
+    }
+
+    /// Lets someone banned back in. Their deleted messages stay deleted. Administrators only.
+    public func unban(_ userID: UserID) async throws {
+        heard(try await client.unban(userID))
+    }
+
+    /// Everyone banned, by name, for an administrator to let back in.
+    public var bannedPeople: [DirectoryUser] {
+        people.values.filter { $0.status == .banned }.sorted {
+            let order = $0.name.localizedStandardCompare($1.name)
+            return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
+        }
+    }
+
     /// Marks a room read here; the room's socket tells the server.
     public func markRead(_ roomID: RoomID) {
         state.markRead(roomID)
@@ -373,7 +564,7 @@ import Observation
     ///
     /// Without `messageID`, a session left on a page around a message (a search's jump) goes back
     /// to the newest messages, as opening a room does.
-    public func session(for roomID: RoomID, around messageID: String? = nil) -> RoomSession {
+    public func session(for roomID: RoomID, around messageID: MessageID? = nil) -> RoomSession {
         if let session = sessions[roomID] ?? takeBack(roomID) {
             if let messageID {
                 session.jump(to: messageID)
@@ -396,7 +587,7 @@ import Observation
 
     /// A thread in a room's live session, opening at `replyID` when given. The room's session stays
     /// on whatever page it shows, unlike `session(for:)`.
-    public func thread(_ parentID: String, in roomID: RoomID, at replyID: String? = nil) -> ThreadSession {
+    public func thread(_ parentID: MessageID, in roomID: RoomID, at replyID: MessageID? = nil) -> ThreadSession {
         let room = sessions[roomID] ?? takeBack(roomID) ?? session(for: roomID)
         touch(roomID)
         trimSessions()
@@ -441,8 +632,9 @@ import Observation
             await directoryLoading.value
             return
         }
+        let start = beginDirectoryLoad()
         let task = Task { [weak self] in
-            await self?.loadDirectory()
+            await self?.loadDirectory(since: start)
             if !Task.isCancelled { self?.directoryLoading = nil }
         }
         directoryLoading = task
@@ -477,7 +669,7 @@ import Observation
         return socket
     }
 
-    private func socketChanged(_ status: ReconnectingSocket.Status) {
+    private func socketChanged(_ status: ConnectionStatus) {
         connection = status
         if case .stopped(.signedOut) = status { confirmSignedOut() }
     }
@@ -493,7 +685,7 @@ import Observation
             self.account = account
         case let .userUpdated(user):
             let refetch = state.apply(frame, me: me, directory: directory)
-            people[user.id] = user
+            heard(user)
             if user.id == me.id {
                 me = Me(id: me.id, name: user.name, administrator: user.role == .administrator)
             }
@@ -560,10 +752,11 @@ import Observation
 
     private func loadOnce() async {
         state.willLoad()
-        let withDirectory = directoryWanted
+        let directoryStart = directoryWanted ? beginDirectoryLoad(since: directoryWantedSince) : nil
         directoryWanted = false
+        directoryWantedSince = nil
         async let sidebar = client.sidebar()
-        async let directory: Void = loadDirectory(if: withDirectory)
+        async let directory: Void = loadDirectory(since: directoryStart)
         let answer: Result<Sidebar, any Error>
         do { answer = .success(try await sidebar) } catch { answer = .failure(error) }
         // Nothing lands once shut down: the workspace is done with.
@@ -582,18 +775,42 @@ import Observation
         await directory
     }
 
-    private func loadDirectory(if wanted: Bool) async {
-        if wanted { await loadDirectory() }
+    private func loadDirectory(since start: Int?) async {
+        if let start { await loadDirectory(since: start) }
     }
 
-    private func loadDirectory() async {
+    /// Someone as the socket or the server just had them, kept over any directory answer already
+    /// on its way.
+    private func heard(_ user: DirectoryUser) {
+        people[user.id] = user
+        guard directoryLoads > 0 || directoryWantedSince != nil else { return }
+        heardCount += 1
+        heardDuringLoads.append((heardCount, user))
+    }
+
+    /// Counts a directory load from now until `loadDirectory(since:)` ends, and answers where its
+    /// people heard begin: `since`, when it was asked for earlier, else now.
+    private func beginDirectoryLoad(since: Int? = nil) -> Int {
+        directoryLoads += 1
+        return since ?? heardCount
+    }
+
+    /// Loads the directory, begun with `beginDirectoryLoad(since:)`, and keeps those heard since
+    /// `start` over its answer.
+    private func loadDirectory(since start: Int) async {
         if case .failed = directoryStatus { directoryStatus = .loading }
         let answer: Result<Directory, any Error>
         do { answer = .success(try await client.directory()) } catch { answer = .failure(error) }
+        directoryLoads -= 1
+        // Those heard since it was asked for are as new as its answer, or newer.
+        let since = heardDuringLoads.filter { $0.number > start }.map(\.user)
+        if directoryLoads == 0, directoryWantedSince == nil { heardDuringLoads = [] }
         guard !isShutDown else { return }
         switch answer {
         case let .success(directory):
-            people = Dictionary(directory.users.map { ($0.id, $0) }, uniquingKeysWith: { $1 })
+            var loaded = Dictionary(directory.users.map { ($0.id, $0) }, uniquingKeysWith: { $1 })
+            for user in since { loaded[user.id] = user }
+            people = loaded
             directoryStatus = .loaded
             sinceDirectory = client.timing.stopwatch()
         case let .failure(error):

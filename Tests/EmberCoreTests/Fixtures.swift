@@ -11,7 +11,7 @@ func noon(_ minutes: Int = 0) -> Date {
 }
 
 /// A message in room r1, its client id `c` and its id.
-func message(_ id: String, by creator: User = grace, clientMessageId: String? = nil, text: String? = nil, parentId: String? = nil, alsoSent: Bool? = nil) -> Message {
+func message(_ id: MessageID, by creator: User = grace, clientMessageId: ClientMessageID? = nil, text: String? = nil, parentId: MessageID? = nil, alsoSent: Bool? = nil) -> Message {
     let text = text ?? "Message \(id)"
     return Message(
         id: id, clientMessageId: clientMessageId ?? "c-\(id)", roomId: "r1", creator: creator, body: "<p>\(text)</p>",
@@ -25,7 +25,7 @@ func stored(_ from: Int, _ to: Int) -> [Message] {
     return (from ... to).map { message(id($0)) }
 }
 
-func id(_ n: Int) -> String { String(format: "m%03d", n) }
+func id(_ n: Int) -> MessageID { MessageID(String(format: "m%03d", n)) }
 
 /// `text` parsed as JSON, to compare frames whatever their key order.
 func json(_ text: String) -> JSONValue? {

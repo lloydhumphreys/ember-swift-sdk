@@ -54,7 +54,7 @@ func object(_ data: Data?) -> [String: Any]? {
 extension MockSocketConnection {
     /// The frames the client sent of one `type`.
     func sent(_ type: String) -> [ClientFrame] {
-        sentFrames.filter { $0.type == type }
+        sentClientFrames.filter { $0.type == type }
     }
 }
 

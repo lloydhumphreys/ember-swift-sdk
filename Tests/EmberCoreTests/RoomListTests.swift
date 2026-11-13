@@ -14,7 +14,7 @@ private func direct(_ id: RoomID, _ names: String..., minutes: Int = 0, unread: 
 }
 
 private func directRoom(_ id: RoomID, _ names: [String], minutes: Int = 0) -> Room {
-    Room(id: id, kind: .direct, members: names.map { User(id: $0.lowercased(), name: $0) }, activeAt: noon(minutes))
+    Room(id: id, kind: .direct, members: names.map { User(id: UserID($0.lowercased()), name: $0) }, activeAt: noon(minutes))
 }
 
 private let four = [room("r1", "Design"), room("r2", "general"), room("r3", "Ops"), room("r4", "Zebra")]
@@ -97,13 +97,27 @@ private func sidebarJSON(_ rooms: String, favorites: String = #"{"rooms":[],"ver
     }
 
     @Test func suggestedPeople() {
-        let people = ["Grace", "Linus", "Alan"].map { User(id: $0.lowercased(), name: $0) }
+        let people = ["Grace", "Linus", "Alan"].map { User(id: UserID($0.lowercased()), name: $0) }
         let many = (0 ..< 20).map { User(id: "p\($0)", name: "Person \($0)") }
         #expect(RoomList.suggestedPeople(people, rooms: [room("r1", "Design")]) == people)
         #expect(RoomList.suggestedPeople(people, rooms: [room("r1", "Design"), direct("d1", "Ada", "Linus")]) == [people[0], people[2]])
         #expect(RoomList.suggestedPeople(many, rooms: []).count == 19)
         #expect(RoomList.suggestedPeople(many, rooms: [direct("d1", "Ada")]).count == 18)
         #expect(RoomList.suggestedPeople(many, rooms: [direct("d1", "Ada", "Grace"), direct("d2", "Ada", "Grace", "Linus")]).count == 16)
+    }
+
+    @Test func suggestedPeopleLeaveOutAnyoneTheDirectoryHasAsNotActive() {
+        let people = ["Grace", "Linus", "Alan", "Edsger", "Barbara"].map { User(id: UserID($0.lowercased()), name: $0) }
+        let statuses: [UserStatus] = [.active, .banned, .deactivated, .suspended, .unknown("frozen")]
+        let directory = Dictionary(uniqueKeysWithValues: zip(people, statuses).map { ($0.id, DirectoryUser(id: $0.id, name: $0.name, status: $1, avatarUrl: "")) })
+        #expect(RoomList.suggestedPeople(people, rooms: [], people: directory) == [people[0]])
+        // Someone the directory doesn't have yet counts as active.
+        #expect(RoomList.suggestedPeople(people, rooms: [], people: [:]) == people)
+
+        // Those left out don't take up the places of those suggested.
+        let many = (0 ..< 25).map { User(id: "p\($0)", name: "Person \($0)") }
+        let banned = Dictionary(uniqueKeysWithValues: many.prefix(5).map { ($0.id, DirectoryUser(id: $0.id, name: $0.name, status: .banned, avatarUrl: "")) })
+        #expect(RoomList.suggestedPeople(many, rooms: [], people: banned) == Array(many[5 ..< 24]))
     }
 }
 

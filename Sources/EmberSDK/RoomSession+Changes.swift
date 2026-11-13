@@ -35,9 +35,9 @@ extension RoomSession {
     /// from the one sent, so neither the body nor an echo is waited for: a `message.check` for an id
     /// no message has goes right after the edit, and the room, which handles a socket's frames one
     /// at a time and in order, answers it only once the edit is stored, echoed or refused.
-    public func edit(message messageID: String, body: String) async throws {
+    public func edit(message messageID: MessageID, body: String) async throws {
         if knownMessage(messageID)?.body == body { return }
-        let marker = UUID().uuidString.lowercased()
+        let marker = ClientMessageID(UUID().uuidString.lowercased())
         _ = try await change(.updateMessage(messageId: messageID, body: body), then: .checkMessages(clientMessageIds: [marker])) { frame in
             if case let .messageChecked(stored, missing) = frame { stored.contains(marker) || missing.contains(marker) } else { false }
         }
@@ -45,7 +45,7 @@ extension RoomSession {
 
     /// Deletes one of your messages, returning once the room has shown it gone: deleted, or kept
     /// for its thread's replies. Throws as `edit(message:body:)` does.
-    public func delete(message messageID: String) async throws {
+    public func delete(message messageID: MessageID) async throws {
         _ = try await change(.deleteMessage(messageId: messageID)) { frame in
             switch frame {
             case let .messageDeleted(id, _): id == messageID
@@ -59,7 +59,7 @@ extension RoomSession {
     /// has shown it. Throws `.invalid` for one that doesn't fit (`Limits.boostFits`), and otherwise
     /// as `edit(message:body:)` does. A boost of yours with the same content returns at once.
     @discardableResult
-    public func boost(message messageID: String, content: String) async throws -> Boost {
+    public func boost(message messageID: MessageID, content: String) async throws -> Boost {
         guard Limits.boostFits(content) else {
             throw EmberError(kind: .invalid, message: "Boosts can be up to \(Limits.boost) characters.")
         }
@@ -81,14 +81,14 @@ extension RoomSession {
 
     /// Takes back one of your boosts, returning once the room has shown it gone. Throws as
     /// `edit(message:body:)` does.
-    public func removeBoost(id boostID: String) async throws {
+    public func removeBoost(id boostID: BoostID) async throws {
         _ = try await change(.deleteBoost(boostId: boostID)) { frame in
             if case let .boostDeleted(id, _, _) = frame { id == boostID } else { false }
         }
     }
 
     /// The message `id` as the room or an open thread has it.
-    private func knownMessage(_ id: String) -> Message? {
+    private func knownMessage(_ id: MessageID) -> Message? {
         timeline.message(id) ?? threads.lazy.compactMap { $0.timeline.replies.first { $0.id == id } }.first
     }
 
@@ -155,7 +155,7 @@ extension RoomSession {
 
     /// The socket dropped, to `status`: no answer to what was sent on it will come. What wasn't sent
     /// yet waits for the next connection, unless the room has stopped trying.
-    func changesDisconnected(_ status: ReconnectingSocket.Status) {
+    func changesDisconnected(_ status: ConnectionStatus) {
         let isTrying = status == .connecting || status == .open
         for waiter in changes where waiter.isWritten || !isTrying {
             finishChange(waiter.id, with: .failure(EmberError(kind: .unreachable, message: Self.notConnected)))

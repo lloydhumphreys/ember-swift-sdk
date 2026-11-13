@@ -20,19 +20,47 @@ public struct SearchQuery: Codable, Hashable, Sendable {
     public var from: UserID?
     /// Only messages mentioning me, or in my DMs.
     public var withMe: Bool
+    /// Only messages with a link.
     public var hasLink: Bool
+    /// Only messages with a file.
     public var hasFile: Bool
     /// Only replies in threads.
     public var inThread: Bool
 
-    public init(q: String, roomID: RoomID? = nil, from: UserID? = nil, withMe: Bool = false, hasLink: Bool = false, hasFile: Bool = false, inThread: Bool = false) {
-        self.q = q
-        self.roomID = roomID
-        self.from = from
-        self.withMe = withMe
-        self.hasLink = hasLink
-        self.hasFile = hasFile
-        self.inThread = inThread
+    /// A search for `text`, with no filters. Add them with the modifiers below, each of which
+    /// answers a copy: `SearchQuery("launch").inRoom(roomID).from(userID)`.
+    public init(_ text: String = "") {
+        q = text
+        roomID = nil
+        from = nil
+        withMe = false
+        hasLink = false
+        hasFile = false
+        inThread = false
+    }
+
+    /// Narrowed to messages in the room `roomID`.
+    public func inRoom(_ roomID: RoomID) -> SearchQuery { changed { $0.roomID = roomID } }
+
+    /// Narrowed to messages written by `userID`.
+    public func from(_ userID: UserID) -> SearchQuery { changed { $0.from = userID } }
+
+    /// Narrowed to messages that mention me, or are in my DMs.
+    public func involvingMe() -> SearchQuery { changed { $0.withMe = true } }
+
+    /// Narrowed to messages with a link in them.
+    public func havingLinks() -> SearchQuery { changed { $0.hasLink = true } }
+
+    /// Narrowed to messages with a file attached.
+    public func havingFiles() -> SearchQuery { changed { $0.hasFile = true } }
+
+    /// Narrowed to replies in threads.
+    public func inThreads() -> SearchQuery { changed { $0.inThread = true } }
+
+    private func changed(_ change: (inout SearchQuery) -> Void) -> SearchQuery {
+        var copy = self
+        change(&copy)
+        return copy
     }
 
     /// Whether any filter is set, which makes a search worth running without words.
@@ -59,10 +87,10 @@ public struct SearchQuery: Codable, Hashable, Sendable {
 
     /// The query string of GET /api/searches, as `searchQuery` writes it (no leading `?`). Spaces
     /// are `+`, as a form writes them.
-    public func queryString(sort: SearchSort = .newest, cursor: Int? = nil) -> String {
+    package func queryString(sort: SearchSort = .newest, cursor: Int? = nil) -> String {
         var pairs: [(String, String)] = [("q", q)]
-        if let roomID { pairs.append(("in", roomID)) }
-        if let from { pairs.append(("from", from)) }
+        if let roomID { pairs.append(("in", roomID.rawValue)) }
+        if let from { pairs.append(("from", from.rawValue)) }
         if withMe { pairs.append(("with", "me")) }
         if hasLink { pairs.append(("has", "link")) }
         if hasFile { pairs.append(("has", "file")) }
@@ -79,7 +107,7 @@ public struct SearchQuery: Codable, Hashable, Sendable {
     }
 
     /// The body of POST /api/searches, which saves the search among the recent ones.
-    public func body(sort: SearchSort = .newest) -> SearchBody { SearchBody(self, sort: sort) }
+    package func body(sort: SearchSort = .newest) -> SearchBody { SearchBody(self, sort: sort) }
 
     private enum CodingKeys: String, CodingKey {
         case q, roomID = "in", from, withMe, hasLink, hasFile, inThread
@@ -109,24 +137,32 @@ public struct SearchQuery: Codable, Hashable, Sendable {
     }
 }
 
+/// Whether running a search keeps it among the person's recent searches.
+public enum SearchHistory: Sendable, Hashable {
+    /// Saves the search in the person's recent searches on the server, as one they typed is.
+    case record
+    /// Runs the search without saving it: a further page, a retry, or a search the app made itself.
+    case skip
+}
+
 /// The order of a search's matches.
 public enum SearchSort: String, Codable, Sendable {
     case newest, oldest
 }
 
 /// What POST /api/searches takes: the search, and its order when that isn't newest first.
-public struct SearchBody: Encodable, Hashable, Sendable {
-    public var query: SearchQuery
-    public var sort: SearchSort
+package struct SearchBody: Encodable, Hashable, Sendable {
+    package var query: SearchQuery
+    package var sort: SearchSort
 
-    public init(_ query: SearchQuery, sort: SearchSort = .newest) {
+    package init(_ query: SearchQuery, sort: SearchSort = .newest) {
         self.query = query
         self.sort = sort
     }
 
     private enum CodingKeys: String, CodingKey { case sort }
 
-    public func encode(to encoder: Encoder) throws {
+    package func encode(to encoder: Encoder) throws {
         try query.encode(to: encoder)
         if sort != .newest {
             var container = encoder.container(keyedBy: CodingKeys.self)
@@ -139,7 +175,7 @@ public struct SearchBody: Encodable, Hashable, Sendable {
 public struct SearchMatch: Decodable, Hashable, Identifiable, Sendable {
     public var message: Message
     public var words: [String]
-    public var id: String { message.id }
+    public var id: MessageID { message.id }
 
     public init(message: Message, words: [String] = []) {
         self.message = message

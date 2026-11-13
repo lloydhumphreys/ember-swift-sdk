@@ -34,11 +34,11 @@ public struct EmberBot: Sendable {
     /// A message the bot posted.
     public struct PostedMessage: Equatable, Sendable {
         /// The message's id.
-        public var id: String
+        public var id: MessageID
         /// Where the server shows the message: its permalink, from the answer's `Location`.
         public var url: URL
 
-        public init(id: String, url: URL) {
+        public init(id: MessageID, url: URL) {
             self.id = id
             self.url = url
         }
@@ -47,24 +47,24 @@ public struct EmberBot: Sendable {
     /// A boost the bot added, as the server answers it.
     public struct Boost: Decodable, Equatable, Sendable {
         /// The boost's id.
-        public var id: String
+        public var id: BoostID
         /// What the boost says, trimmed by the server.
         public var content: String
         /// The id of the message it is on.
-        public var messageID: String
+        public var messageID: MessageID
 
-        public init(id: String, content: String, messageID: String) {
+        public init(id: BoostID, content: String, messageID: MessageID) {
             self.id = id
             self.content = content
             self.messageID = messageID
         }
 
         private enum CodingKeys: String, CodingKey { case id, content, message }
-        private struct Target: Decodable { var id: String }
+        private struct Target: Decodable { var id: MessageID }
 
         public init(from decoder: any Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
-            id = try container.decode(String.self, forKey: .id)
+            id = try container.decode(BoostID.self, forKey: .id)
             content = try container.decode(String.self, forKey: .content)
             messageID = try container.decode(Target.self, forKey: .message).id
         }
@@ -93,9 +93,9 @@ public struct EmberBot: Sendable {
     /// don't say what they are.
     @discardableResult
     public func post(file: Data, named name: String, contentType: String = "application/octet-stream") async throws -> PostedMessage {
-        let form = MultipartForm(field: "attachment", filename: name, contentType: contentType, data: file)
+        let form = MultipartForm([.file("attachment", filename: name, contentType: contentType, data: file)])
         var request = try messagesRequest("POST")
-        request.setValue(form.contentType, forHTTPHeaderField: "Content-Type")
+        form.describe(&request)
         let (data, response) = try await send(request, body: form.body)
         return try posted(response, data: data)
     }
@@ -117,8 +117,8 @@ public struct EmberBot: Sendable {
     /// as the bot. The server trims the content, and refuses one that is blank or longer than
     /// `Limits.boost`.
     @discardableResult
-    public func boost(_ messageID: String, with content: String) async throws -> Boost {
-        var request = try request("POST", path: "messages/\(Self.segment(messageID))/boosts")
+    public func boost(_ messageID: MessageID, with content: String) async throws -> Boost {
+        var request = try request("POST", path: "messages/\(Self.segment(messageID.rawValue))/boosts")
         request.setValue("text/plain; charset=utf-8", forHTTPHeaderField: "Content-Type")
         let (data, response) = try await send(request, body: Data(content.utf8))
         do {
@@ -144,7 +144,7 @@ public struct EmberBot: Sendable {
     /// A request to `path` under the bot's address. Its URL is built here from parts, so the key
     /// can't reach another route.
     private func request(_ method: String, path: String) throws -> URLRequest {
-        let address = "/rooms/\(Self.segment(roomID))/\(Self.segment(key))/\(path)"
+        let address = "/rooms/\(Self.segment(roomID.rawValue))/\(Self.segment(key))/\(path)"
         guard let url = URL(string: address, relativeTo: origin)?.absoluteURL else {
             throw EmberError(status: 0, message: "That isn’t an address on this server.")
         }
@@ -179,7 +179,7 @@ public struct EmberBot: Sendable {
         else { throw EmberError.unreadable(status: response.statusCode) }
         let id = String(location[marker.upperBound...]).removingPercentEncoding ?? ""
         guard !id.isEmpty else { throw EmberError.unreadable(status: response.statusCode) }
-        return PostedMessage(id: id, url: url)
+        return PostedMessage(id: MessageID(id), url: url)
     }
 
     /// `EmberClient.segment`, with a segment of only dots escaped too, so it can't be read as `.` or `..`.
@@ -207,30 +207,5 @@ extension EmberBot: CustomStringConvertible, CustomDebugStringConvertible, Custo
 
     public var customMirror: Mirror {
         Mirror(self, children: ["origin": origin, "roomID": roomID], displayStyle: .struct)
-    }
-}
-
-// MARK: - The form a file goes in
-
-/// One `multipart/form-data` field holding a file.
-private struct MultipartForm {
-    let contentType: String
-    let body: Data
-
-    init(field: String, filename: String, contentType fileType: String, data: Data) {
-        let boundary = "ember-\(UUID().uuidString)"
-        contentType = "multipart/form-data; boundary=\(boundary)"
-        let name = filename
-            .replacingOccurrences(of: "\"", with: "%22")
-            .replacingOccurrences(of: "\r", with: "%0D")
-            .replacingOccurrences(of: "\n", with: "%0A")
-        let type = fileType.replacingOccurrences(of: "\r", with: "").replacingOccurrences(of: "\n", with: "")
-        var body = Data()
-        body.append(Data("--\(boundary)\r\n".utf8))
-        body.append(Data("Content-Disposition: form-data; name=\"\(field)\"; filename=\"\(name)\"\r\n".utf8))
-        body.append(Data("Content-Type: \(type)\r\n\r\n".utf8))
-        body.append(data)
-        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
-        self.body = body
     }
 }

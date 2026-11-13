@@ -25,8 +25,14 @@ struct TestFile {
 
     var exists: Bool { FileManager.default.fileExists(atPath: url.path) }
 
-    func source(contentType: String = "text/plain", preview: UploadPreview? = nil, isTemporary: Bool = false) throws -> UploadSource {
-        try UploadSource(fileURL: url, contentType: contentType, preview: preview, isTemporary: isTemporary)
+    /// The file as a source the SDK leaves where it is.
+    func source(contentType: String = "text/plain", preview: UploadPreview? = nil) throws -> UploadSource {
+        try UploadSource(fileURL: url, contentType: contentType, preview: preview)
+    }
+
+    /// The file as a source the SDK deletes once it's done with it.
+    func temporarySource(contentType: String = "text/plain", preview: UploadPreview? = nil) throws -> UploadSource {
+        try UploadSource.temporary(fileURL: url, contentType: contentType, preview: preview)
     }
 
     func remove() {
@@ -351,10 +357,26 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         defer { file.remove() }
         transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: Fixtures.fileMessage("m100", parentID: "m001", alsoSent: true, clientMessageId: "c1"))
 
-        _ = try await client.upload(try file.source(), in: Fixtures.general.id, clientMessageId: "c1", parentId: "m001", alsoSend: true)
+        _ = try await client.upload(try file.source(), in: Fixtures.general.id, clientMessageId: "c1", parentId: "m001", delivery: .threadAndRoom)
         let start = try #require(transport.lastBody("POST", uploads))
         #expect(start["parentId"] as? String == "m001")
         #expect(start["alsoSend"] as? Bool == true)
+    }
+
+    @Test func aFileForTheThreadOnlyOrOutsideAThreadLeavesAlsoSendOut() async throws {
+        let file = try TestFile([1])
+        defer { file.remove() }
+        transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: Fixtures.fileMessage("m100", parentID: "m001", clientMessageId: "c1"))
+        _ = try await client.upload(try file.source(), in: Fixtures.general.id, clientMessageId: "c1", parentId: "m001")
+        let reply = try #require(transport.lastBody("POST", uploads))
+        #expect(reply["parentId"] as? String == "m001")
+        #expect(reply["alsoSend"] == nil)
+
+        transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: Fixtures.fileMessage("m101", clientMessageId: "c2"))
+        _ = try await client.upload(try file.source(), in: Fixtures.general.id, clientMessageId: "c2", delivery: .threadAndRoom)
+        let message = try #require(transport.lastBody("POST", uploads))
+        #expect(message["parentId"] == nil)
+        #expect(message["alsoSend"] == nil)
     }
 }
 
@@ -421,7 +443,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let file = try TestFile([1])
         defer { file.remove() }
         let gate = transport.hold("PUT", partPath(1))
-        let id = try #require(session.send(files: [try file.source(isTemporary: true)]).first)
+        let id = try #require(session.send(files: [try file.temporarySource()]).first)
         let posted = Fixtures.fileMessage("m100", clientMessageId: id)
         transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: posted)
         // The part's answer is a failure that isn't tried again, though the room posted the file.
@@ -446,7 +468,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let file = try TestFile([1])
         defer { file.remove() }
         let gate = transport.hold("PUT", partPath(1))
-        let id = try #require(thread.send(files: [try file.source(isTemporary: true)]).first)
+        let id = try #require(thread.send(files: [try file.temporarySource()]).first)
         let posted = Fixtures.fileMessage("r100", parentID: "m001", clientMessageId: id)
         transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: posted)
         transport.stub("PUT", partPath(1), status: 400, json: Fixtures.errorJSON("Bad request"))
@@ -468,7 +490,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let file = try TestFile([1])
         defer { file.remove() }
         transport.stub("POST", uploads, status: 500, json: Fixtures.errorJSON("Something went wrong"))
-        let id = try #require(session.send(files: [try file.source(isTemporary: true)]).first)
+        let id = try #require(session.send(files: [try file.temporarySource()]).first)
         #expect(await eventually { session.timeline.pending.first?.failure != nil })
         #expect(session.isBusy)
 
@@ -487,7 +509,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let waiting = try TestFile([2], name: "waiting.txt")
         defer { [confirmed, waiting].forEach { $0.remove() } }
         transport.stub("POST", uploads, status: 500, json: Fixtures.errorJSON("Something went wrong"))
-        let ids = session.send(files: [try confirmed.source(isTemporary: true), try waiting.source(isTemporary: true)])
+        let ids = session.send(files: [try confirmed.temporarySource(), try waiting.temporarySource()])
         #expect(await eventually { session.timeline.pending.allSatisfy { $0.failure != nil } && session.failedUploads.count == 2 })
 
         socket.serverSends(Fixtures.RoomFrames.messageCreated(Fixtures.fileMessage("m100", clientMessageId: ids[0]), seq: 11))
@@ -508,7 +530,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let file = try TestFile([1])
         defer { file.remove() }
         transport.stub("POST", uploads, status: 500, json: Fixtures.errorJSON("Something went wrong"))
-        let id = try #require(thread.send(files: [try file.source(isTemporary: true)]).first)
+        let id = try #require(thread.send(files: [try file.temporarySource()]).first)
         #expect(await eventually { session.failedUploads[id] != nil })
 
         socket.serverSends(Fixtures.RoomFrames.messageCreated(Fixtures.fileMessage("r100", parentID: "m001", clientMessageId: id), seq: 11))
@@ -528,8 +550,8 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         defer { [roomFile, threadFile, kept].forEach { $0.remove() } }
         session.shutDown()
 
-        let ids = session.send(files: [try roomFile.source(isTemporary: true), try kept.source()], body: "<p>Hi</p>", plainText: "Hi")
-        let threadIDs = thread.send(files: [try threadFile.source(isTemporary: true)], body: "<p>Hi</p>", plainText: "Hi")
+        let ids = session.send(files: [try roomFile.temporarySource(), try kept.source()], body: "<p>Hi</p>", plainText: "Hi")
+        let threadIDs = thread.send(files: [try threadFile.temporarySource()], body: "<p>Hi</p>", plainText: "Hi")
         // Nothing went, so no id stands for anything.
         #expect(ids.isEmpty && threadIDs.isEmpty)
         #expect(session.timeline.pending.isEmpty && thread.timeline.pending.isEmpty)
@@ -546,11 +568,58 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
 
     // MARK: Temporary files
 
+    @Test func aSourceIsPreservedUnlessItSaysOtherwise() throws {
+        let file = try TestFile([1])
+        defer { file.remove() }
+        let plain = try UploadSource(fileURL: file.url, contentType: "text/plain")
+        #expect(plain.disposition == .preserve)
+        let preserved = try UploadSource(fileURL: file.url, contentType: "text/plain", disposition: .preserve)
+        #expect(preserved == plain)
+        let temporary = try UploadSource.temporary(fileURL: file.url, name: "n.txt", contentType: "text/plain")
+        #expect(temporary.disposition == .deleteWhenFinished)
+        let spelledOut = try UploadSource(fileURL: file.url, name: "n.txt", contentType: "text/plain", disposition: .deleteWhenFinished)
+        #expect(temporary == spelledOut)
+        #expect(temporary.name == "n.txt" && temporary.byteSize == 1 && temporary.fileURL == file.url)
+    }
+
+    @Test func onlyATemporarySourceIsDeleted() throws {
+        let session = RoomSession(client: .mock(transport: transport, connector: connector, timing: timing), roomID: Fixtures.general.id)
+        let file = try TestFile([1])
+        defer { file.remove() }
+        session.removeIfTemporary(try file.source())
+        #expect(file.exists)
+        session.removeIfTemporary(try file.temporarySource())
+        #expect(!file.exists)
+    }
+
+    @Test func aPreservedFileStaysOncePostedOrDiscarded() async throws {
+        let (session, _) = try await opened()
+        let posted = try TestFile([1])
+        let discarded = try TestFile(Array(0 ..< 10))
+        defer { posted.remove(); discarded.remove() }
+        let first = transport.hold("PUT", partPath(1))
+        let id = try #require(session.send(files: [try posted.source()]).first)
+        transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: Fixtures.fileMessage("m100", clientMessageId: id))
+        await first.waitForRequest()
+        first.release()
+        #expect(await eventually { session.timeline.pending.isEmpty && !session.isBusy })
+        #expect(posted.exists)
+
+        transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(partSize: 4, parts: 3), message: Fixtures.fileMessage("m101", clientMessageId: "c1"))
+        let gate = transport.hold("PUT", partPath(1))
+        let held = try #require(session.send(files: [try discarded.source()]).first)
+        await gate.waitForRequest()
+        session.discard(held)
+        gate.release()
+        await settle()
+        #expect(discarded.exists)
+    }
+
     @Test func aTemporaryFileAloneInItsFolderTakesTheFolder() throws {
         let session = RoomSession(client: .mock(transport: transport, connector: connector, timing: timing), roomID: Fixtures.general.id)
         let file = try TestFile([1])
         defer { file.remove() }
-        session.removeIfTemporary(try file.source(isTemporary: true))
+        session.removeIfTemporary(try file.temporarySource())
         #expect(!FileManager.default.fileExists(atPath: file.url.deletingLastPathComponent().path))
     }
 
@@ -560,7 +629,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         defer { file.remove() }
         let other = file.url.deletingLastPathComponent().appendingPathComponent("other.txt")
         try Data([2]).write(to: other)
-        session.removeIfTemporary(try file.source(isTemporary: true))
+        session.removeIfTemporary(try file.temporarySource())
         #expect(!file.exists)
         #expect(FileManager.default.fileExists(atPath: other.path))
     }
@@ -571,7 +640,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let url = temporary.appendingPathComponent("ember-tests-\(UUID().uuidString).txt")
         try Data([1]).write(to: url)
         defer { try? FileManager.default.removeItem(at: url) }
-        session.removeIfTemporary(try UploadSource(fileURL: url, contentType: "text/plain", isTemporary: true))
+        session.removeIfTemporary(try UploadSource.temporary(fileURL: url, contentType: "text/plain"))
         #expect(!FileManager.default.fileExists(atPath: url.path))
         #expect(FileManager.default.fileExists(atPath: temporary.path))
     }
@@ -602,7 +671,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let file = try TestFile([1], name: "photo.jpg")
         defer { file.remove() }
         transport.stub("POST", uploads, status: 500, json: Fixtures.errorJSON("Something went wrong"))
-        let id = try #require(session.send(files: [try file.source(contentType: "image/jpeg", isTemporary: true)]).first)
+        let id = try #require(session.send(files: [try file.temporarySource(contentType: "image/jpeg")]).first)
         #expect(await eventually { session.timeline.pending.first?.failure != nil })
         #expect(file.exists)
 
@@ -613,7 +682,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         #expect(await eventually { session.timeline.pending.isEmpty })
         #expect(session.timeline.messages.last == posted)
         #expect(transport.requests("POST", uploads).count == 2)
-        #expect(object(transport.requests("POST", uploads).last?.httpBody)?["clientMessageId"] as? String == id)
+        #expect(object(transport.requests("POST", uploads).last?.httpBody)?["clientMessageId"] as? String == id.rawValue)
         // A temporary file goes once it's posted, not before.
         #expect(!file.exists)
     }
@@ -693,7 +762,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         defer { file.remove() }
         transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(partSize: 4, parts: 3), message: Fixtures.fileMessage("m100", clientMessageId: "c1"))
         let gate = transport.hold("PUT", partPath(1))
-        let id = try #require(session.send(files: [try file.source(isTemporary: true)]).first)
+        let id = try #require(session.send(files: [try file.temporarySource()]).first)
 
         await gate.waitForRequest()
         session.discard(id)
@@ -730,7 +799,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         #expect(socket.sent("message.create").isEmpty)
         gate.release()
         #expect(await eventually { socket.sent("message.create") == [.createMessage(clientMessageId: ids[2], body: "<p>Both</p>")] })
-        #expect(transport.requests("POST", uploads).compactMap { object($0.httpBody)?["clientMessageId"] as? String } == [ids[0], ids[1]])
+        #expect(transport.requests("POST", uploads).compactMap { object($0.httpBody)?["clientMessageId"] as? String } == [ids[0].rawValue, ids[1].rawValue])
         #expect(session.timeline.messages.suffix(2).map(\.id) == ["m100", "m101"])
     }
 
@@ -760,7 +829,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let (session, socket) = try await opened()
         let file = try TestFile(sparse: Limits.fileBytes + 1)
         defer { file.remove() }
-        let ids = session.send(files: [try file.source(isTemporary: true)], body: "<p>Hi</p>", plainText: "Hi")
+        let ids = session.send(files: [try file.temporarySource()], body: "<p>Hi</p>", plainText: "Hi")
         // The refused file keeps its place among the ids.
         #expect(ids.count == 2)
         #expect(session.notice == "notes.txt is too large. Choose a file that’s 250 MB or smaller.")
@@ -780,7 +849,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let last = try TestFile([2], name: "b.txt")
         defer { [small, huge, vast, last].forEach { $0.remove() } }
         let gate = transport.hold("PUT", partPath(1))
-        let sources = [try small.source(), try huge.source(), try vast.source(isTemporary: true), try last.source()]
+        let sources = [try small.source(), try huge.source(), try vast.temporarySource(), try last.source()]
         let ids = session.send(files: sources)
 
         #expect(ids.count == 4)
@@ -803,7 +872,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let small = try TestFile([1], name: "a.txt")
         defer { [huge, small].forEach { $0.remove() } }
         let gate = transport.hold("POST", uploads)
-        let ids = thread.send(files: [try huge.source(isTemporary: true), try small.source()])
+        let ids = thread.send(files: [try huge.temporarySource(), try small.source()])
 
         #expect(ids.count == 2)
         #expect(thread.timeline.pending.map(\.clientMessageId) == [ids[1]])
@@ -856,7 +925,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         defer { [going, waiting, kept].forEach { $0.remove() } }
         let gate = transport.hold("PUT", partPath(1))
         transport.stubUpload(in: Fixtures.general.id, ticket: Fixtures.uploadTicket(), message: Fixtures.fileMessage("m100", clientMessageId: "c1"))
-        session.send(files: [try going.source(isTemporary: true), try waiting.source(isTemporary: true), try kept.source()])
+        session.send(files: [try going.temporarySource(), try waiting.temporarySource(), try kept.source()])
         await gate.waitForRequest()
 
         session.shutDown()
@@ -874,7 +943,7 @@ func partPath(_ n: Int, of id: String = "upload_1") -> String { "\(uploads)/\(id
         let file = try TestFile([1])
         defer { file.remove() }
         transport.stub("POST", uploads, status: 422, json: Fixtures.errorJSON("No."))
-        session.send(files: [try file.source(isTemporary: true)])
+        session.send(files: [try file.temporarySource()])
         #expect(await eventually { session.timeline.pending.first?.failure == "No." })
         #expect(file.exists)
         session.shutDown()

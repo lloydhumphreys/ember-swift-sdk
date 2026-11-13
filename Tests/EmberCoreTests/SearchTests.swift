@@ -10,44 +10,85 @@ import Testing
         ("", "q="),
     ])
     func wordsAreFormEncoded(_ q: String, _ expected: String) {
-        #expect(SearchQuery(q: q).queryString() == expected)
+        #expect(SearchQuery(q).queryString() == expected)
     }
 
     @Test func filtersFollowInTheirOrder() {
-        let query = SearchQuery(q: "eel", roomID: "room1", from: "ada", withMe: true, hasLink: true, hasFile: true, inThread: true)
+        let query = SearchQuery("eel").inRoom("room1").from("ada").involvingMe().havingLinks().havingFiles().inThreads()
         #expect(query.queryString() == "q=eel&in=room1&from=ada&with=me&has=link&has=file&is=thread")
     }
 
+    @Test func eachModifierSetsItsFilterAndLeavesTheRest() {
+        let base = SearchQuery("eel")
+        #expect(base.q == "eel" && base.roomID == nil && base.from == nil && !base.withMe && !base.hasLink && !base.hasFile && !base.inThread)
+        #expect(SearchQuery().q == "")
+        #expect(base.inRoom("r1").roomID == "r1")
+        #expect(base.from("u1").from == "u1")
+        #expect(base.involvingMe().withMe)
+        #expect(base.havingLinks().hasLink)
+        #expect(base.havingFiles().hasFile)
+        #expect(base.inThreads().inThread)
+        #expect(base.inRoom("r1").queryString() == "q=eel&in=r1")
+        #expect(base.from("u1").queryString() == "q=eel&from=u1")
+        #expect(base.involvingMe().queryString() == "q=eel&with=me")
+        #expect(base.havingLinks().queryString() == "q=eel&has=link")
+        #expect(base.havingFiles().queryString() == "q=eel&has=file")
+        #expect(base.inThreads().queryString() == "q=eel&is=thread")
+        // Each gives a copy: the query it was called on is unchanged.
+        #expect(base == SearchQuery("eel"))
+        // A later call replaces an earlier one's value.
+        #expect(base.inRoom("r1").inRoom("r2").roomID == "r2")
+    }
+
+    @Test func chainingMakesTheSameRequestAsSettingTheProperties() throws {
+        var set = SearchQuery()
+        set.q = "eel"
+        set.roomID = "r1"
+        set.from = "u1"
+        set.withMe = true
+        set.hasLink = true
+        set.hasFile = true
+        set.inThread = true
+        let chained = SearchQuery("eel").inRoom("r1").from("u1").involvingMe().havingLinks().havingFiles().inThreads()
+        #expect(chained == set)
+        #expect(chained.queryString(sort: .oldest, cursor: 9) == set.queryString(sort: .oldest, cursor: 9))
+        #expect(chained.body(sort: .oldest) == set.body(sort: .oldest))
+        let encoder = EmberJSON.encoder()
+        let chainedBody = String(decoding: try encoder.encode(chained.body(sort: .oldest)), as: UTF8.self)
+        let setBody = String(decoding: try encoder.encode(set.body(sort: .oldest)), as: UTF8.self)
+        #expect(json(chainedBody) != nil && json(chainedBody) == json(setBody))
+    }
+
     @Test func sortOnlyWhenOldestAndCursorLast() {
-        #expect(SearchQuery(q: "eel", hasFile: true).queryString(sort: .oldest) == "q=eel&has=file&sort=oldest")
-        #expect(SearchQuery(q: "eel").queryString(sort: .newest, cursor: 42) == "q=eel&cursor=42")
-        #expect(SearchQuery(q: "eel").queryString(sort: .oldest, cursor: 42) == "q=eel&sort=oldest&cursor=42")
+        #expect(SearchQuery("eel").havingFiles().queryString(sort: .oldest) == "q=eel&has=file&sort=oldest")
+        #expect(SearchQuery("eel").queryString(sort: .newest, cursor: 42) == "q=eel&cursor=42")
+        #expect(SearchQuery("eel").queryString(sort: .oldest, cursor: 42) == "q=eel&sort=oldest&cursor=42")
     }
 
     @Test(arguments: ["", "   ", "!!!", "😀 ❤", "\0"])
     func nothingToFind(_ q: String) {
-        #expect(!SearchQuery(q: q).isSearchable)
+        #expect(!SearchQuery(q).isSearchable)
     }
 
     @Test(arguments: ["eels", "日本", "42", "_", "e\u{301}"])
     func wordsToFind(_ q: String) {
-        #expect(SearchQuery(q: q).isSearchable)
+        #expect(SearchQuery(q).isSearchable)
     }
 
     @Test func anyFilterIsEnough() {
-        #expect(SearchQuery(q: "!!!", roomID: "r1").isSearchable)
-        #expect(SearchQuery(q: "!!!", from: "u1").isSearchable)
-        #expect(SearchQuery(q: "!!!", withMe: true).isSearchable)
-        #expect(SearchQuery(q: "!!!", hasLink: true).isSearchable)
-        #expect(SearchQuery(q: "!!!", hasFile: true).isSearchable)
-        #expect(SearchQuery(q: "!!!", inThread: true).isSearchable)
+        #expect(SearchQuery("!!!").inRoom("r1").isSearchable)
+        #expect(SearchQuery("!!!").from("u1").isSearchable)
+        #expect(SearchQuery("!!!").involvingMe().isSearchable)
+        #expect(SearchQuery("!!!").havingLinks().isSearchable)
+        #expect(SearchQuery("!!!").havingFiles().isSearchable)
+        #expect(SearchQuery("!!!").inThreads().isSearchable)
     }
 
     @Test func bodyHasFlagsOnlyWhenSetAndSortOnlyWhenOldest() throws {
         let encoder = EmberJSON.encoder()
-        let plain = try encoder.encode(SearchQuery(q: "eel").body())
+        let plain = try encoder.encode(SearchQuery("eel").body())
         #expect(json(String(decoding: plain, as: UTF8.self)) == json(#"{"q":"eel"}"#))
-        let full = try encoder.encode(SearchQuery(q: "eel", roomID: "r1", from: "u1", withMe: true, hasLink: true, hasFile: true, inThread: true).body(sort: .oldest))
+        let full = try encoder.encode(SearchQuery("eel").inRoom("r1").from("u1").involvingMe().havingLinks().havingFiles().inThreads().body(sort: .oldest))
         #expect(json(String(decoding: full, as: UTF8.self))
             == json(#"{"q":"eel","in":"r1","from":"u1","withMe":true,"hasLink":true,"hasFile":true,"inThread":true,"sort":"oldest"}"#))
     }
@@ -61,12 +102,12 @@ import Testing
          "recent":[{"q":"hi"},{"q":"","from":"u2"}]}
         """#
         let results = try EmberJSON.decoder().decode(SearchResults.self, from: Data(text.utf8))
-        #expect(results.search == SearchQuery(q: "hi", roomID: "r1", hasLink: true))
+        #expect(results.search == SearchQuery("hi").inRoom("r1").havingLinks())
         #expect(results.matches.map(\.id) == ["m001"])
         #expect(results.matches.first?.words == ["hi"])
         #expect(results.next == 100)
         #expect(results.rooms.map(\.id) == ["r1"])
-        #expect(results.recent == [SearchQuery(q: "hi"), SearchQuery(q: "", from: "u2")])
+        #expect(results.recent == [SearchQuery("hi"), SearchQuery().from("u2")])
     }
 
     @Test func decodesNoSearch() throws {
@@ -124,7 +165,7 @@ import Testing
         ("127326141", "#736356"), ("773523956", "#5D618F"),
     ])
     func colours(_ id: String, _ hex: String) {
-        #expect(AvatarStyle.hex(for: id) == hex)
+        #expect(AvatarStyle.hex(for: UserID(id)) == hex)
     }
 
     @Test func colourComponents() {

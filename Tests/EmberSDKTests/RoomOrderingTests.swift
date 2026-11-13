@@ -32,7 +32,7 @@ import Testing
 
     /// The paging and message frames `socket` sent, in order.
     func pagesAndMessages(_ socket: MockSocketConnection) -> [ClientFrame] {
-        socket.sentFrames.filter {
+        socket.sentClientFrames.filter {
             switch $0 {
             case .historyAround, .createMessage: true
             default: false
@@ -156,48 +156,64 @@ import Testing
 
     // MARK: Actions that can't wait
 
-    @Test func actionsBeforeTheRoomLetsTheSocketInAreRefused() async throws {
+    @Test func changesAskedForBeforeTheRoomLetsTheSocketInGoOnceItsIn() async throws {
         connector.onConnect { _ in }
         let session = session()
         session.start()
         #expect(await eventually { session.status == .open })
         let socket = try #require(connector.latest)
 
-        #expect(!session.edit("m001", body: "Changed"))
-        #expect(session.notice == RoomSession.notConnected)
-        session.notice = nil
-        #expect(!session.delete("m001"))
-        #expect(session.notice == RoomSession.notConnected)
-        #expect(!session.boost("m001", content: "👍"))
-        #expect(!session.removeBoost("b001"))
+        let edit = Task { try await session.edit(message: "m001", body: "Changed") }
+        let deletion = Task { try await session.delete(message: "m002") }
+        let boost = Task { try await session.boost(message: "m003", content: "👍") }
+        let removal = Task { try await session.removeBoost(id: "b001") }
+        await settle()
         #expect(socket.sent.isEmpty)
+        #expect(session.notice == nil)
 
-        // Nothing was kept to send once it's in.
         socket.serverSends(Fixtures.RoomFrames.welcome())
-        #expect(await eventually { session.timeline.isLoaded })
-        #expect(session.edit("m001", body: "Changed"))
-        #expect(await eventually { socket.sent("message.update").count == 1 })
-        #expect(socket.sent("message.delete").isEmpty)
-        #expect(socket.sent("boost.create").isEmpty)
-        #expect(socket.sent("boost.delete").isEmpty)
+        #expect(await eventually { socket.sent.count == 5 })
+        #expect(socket.sentClientFrames.filter { $0.type != "message.check" } == [
+            .updateMessage(messageId: "m001", body: "Changed"),
+            .deleteMessage(messageId: "m002"),
+            .createBoost(messageId: "m003", content: "👍"),
+            .deleteBoost(boostId: "b001"),
+        ])
+
+        // A drop after they went leaves each with the same error, and nothing in `notice`.
+        socket.serverCloses(code: 1006)
+        let unreachable = EmberError(kind: .unreachable, message: RoomSession.notConnected)
+        await #expect(throws: unreachable) { try await edit.value }
+        await #expect(throws: unreachable) { try await deletion.value }
+        await #expect(throws: unreachable) { _ = try await boost.value }
+        await #expect(throws: unreachable) { try await removal.value }
+        #expect(session.notice == nil)
     }
 
-    @Test func actionsWithNoSocketAreRefused() {
+    @Test func changesWithNoSocketAreUnreachable() async {
         let session = session()
-        #expect(!session.boost("m001", content: "👍"))
-        #expect(session.notice == RoomSession.notConnected)
+        let unreachable = EmberError(kind: .unreachable, message: RoomSession.notConnected)
+        await #expect(throws: unreachable) { try await session.boost(message: "m001", content: "👍") }
+        await #expect(throws: unreachable) { try await session.edit(message: "m001", body: "Changed") }
+        await #expect(throws: unreachable) { try await session.removeBoost(id: "b001") }
+        #expect(session.notice == nil)
         #expect(connector.connections.isEmpty)
     }
 
-    @Test func aBoostIsTrimmedAndOneTooLongIsntSent() async throws {
+    @Test func aBoostIsTrimmedAndOneThatDoesntFitIsntSent() async throws {
         let session = session()
         let socket = try await opened(session)
-        #expect(!session.boost("m001", content: String(repeating: "🔥", count: 9)))
-        #expect(!session.boost("m001", content: "   "))
+        let invalid = EmberError(kind: .invalid, message: "Boosts can be up to \(Limits.boost) characters.")
+        await #expect(throws: invalid) { try await session.boost(message: "m001", content: String(repeating: "🔥", count: 9)) }
+        await #expect(throws: invalid) { try await session.boost(message: "m001", content: "   ") }
         #expect(session.notice == nil)
-        #expect(session.boost("m002", content: "  so good \n"))
-        #expect(session.removeBoost("b001"))
+        let boost = Task { try await session.boost(message: "m002", content: "  so good \n") }
+        let removal = Task { try await session.removeBoost(id: "b001") }
         #expect(await eventually { socket.sent("boost.delete").count == 1 })
         #expect(socket.sent("boost.create") == [.createBoost(messageId: "m002", content: "so good")])
+        socket.serverCloses(code: 1006)
+        _ = await boost.result
+        _ = await removal.result
     }
 }
+

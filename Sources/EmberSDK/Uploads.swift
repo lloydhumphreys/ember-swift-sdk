@@ -13,9 +13,23 @@ public struct UploadSource: Sendable, Hashable {
     public let byteSize: Int
     /// A picture of the file for the timeline, made by the app. Optional.
     public let preview: UploadPreview?
-    /// Whether the SDK deletes `fileURL` once the file is posted or discarded, and the folder it's in
-    /// if that's left empty (unless it's the temporary directory itself).
-    public let isTemporary: Bool
+    /// What the SDK does with `fileURL` once it's done with it.
+    public let disposition: Disposition
+
+    /// What the SDK does with the file once it's done with it.
+    public enum Disposition: Sendable, Hashable {
+        /// Leaves it where it is. The SDK only reads it.
+        case preserve
+        /// Deletes it once the SDK is done with it. That's when it's posted (or when one that failed
+        /// turns out to have been posted after all); when its pending message is discarded; when
+        /// `send(files:…)` refuses it for being over `Limits.fileBytes`; when the session is shut
+        /// down (signed out) while it's waiting, going up or failed, or it's handed over after that;
+        /// and when it failed and its thread was let go of, as it can't be retried then. One that
+        /// failed and can still be retried is kept for the retry. Once the file is deleted, the
+        /// folder it was in is removed too if that's now empty, unless it's the temporary directory
+        /// itself; nothing further up is touched.
+        case deleteWhenFinished
+    }
 
     /// Whether it's over `Limits.fileBytes`, so `send(files:…)` refuses it rather than sending it.
     public var isTooLarge: Bool { byteSize > Limits.fileBytes }
@@ -23,7 +37,9 @@ public struct UploadSource: Sendable, Hashable {
     /// Reads the size from disk; throws when the file can't be read, or when the server would
     /// refuse its name or type (`Uploads.refusal(name:contentType:)`): a blank name, or either
     /// over 255 UTF-16 code units. `name` is the file's own unless given.
-    public init(fileURL: URL, name: String? = nil, contentType: String, preview: UploadPreview? = nil, isTemporary: Bool = false) throws {
+    public init(
+        fileURL: URL, name: String? = nil, contentType: String, preview: UploadPreview? = nil, disposition: Disposition = .preserve
+    ) throws {
         let name = name ?? fileURL.lastPathComponent
         if let refusal = Uploads.refusal(name: name, contentType: contentType) {
             throw EmberError(kind: .invalid, status: 422, message: refusal)
@@ -43,7 +59,16 @@ public struct UploadSource: Sendable, Hashable {
         self.contentType = contentType
         self.byteSize = size
         self.preview = preview
-        self.isTemporary = isTemporary
+        self.disposition = disposition
+    }
+
+    /// A file the app made for sending, such as a photo it copied out: the SDK deletes it once it's
+    /// done with it, as `Disposition.deleteWhenFinished` says, and removes the folder it was in if
+    /// that's then empty (never the temporary directory itself). Throws as `init` does.
+    public static func temporary(
+        fileURL: URL, name: String? = nil, contentType: String, preview: UploadPreview? = nil
+    ) throws -> UploadSource {
+        try UploadSource(fileURL: fileURL, name: name, contentType: contentType, preview: preview, disposition: .deleteWhenFinished)
     }
 }
 
@@ -77,7 +102,7 @@ extension EmberClient {
     /// again at once within the same budget, and if the 409 lasts, it fails as `Uploads.failed`
     /// rather than with the server's words.
     public func uploadPart(
-        in roomID: RoomID, upload uploadID: String, part: Int, data: Data,
+        in roomID: RoomID, upload uploadID: UploadID, part: Int, data: Data,
         progress: @escaping @Sendable (Int) -> Void = { _ in }
     ) async throws -> Message? {
         let path = "\(Self.uploadsPath(roomID))/\(Self.segment(uploadID))/parts/\(part)"
@@ -102,7 +127,7 @@ extension EmberClient {
 
     /// PUTs the picture the timeline shows for the file. It has to come before the last part, since
     /// a posted file takes no more.
-    public func uploadPreview(in roomID: RoomID, upload uploadID: String, _ preview: UploadPreview) async throws {
+    public func uploadPreview(in roomID: RoomID, upload uploadID: UploadID, _ preview: UploadPreview) async throws {
         var request = try bytes("\(Self.uploadsPath(roomID))/\(Self.segment(uploadID))/preview", preview.data.count)
         request.setValue(preview.contentType, forHTTPHeaderField: "Content-Type")
         _ = try await perform(request, uploading: preview.data, progress: { _ in })
@@ -115,23 +140,23 @@ extension EmberClient {
     /// A file over `Limits.fileBytes` throws before anything is sent. Cancelling the task stops the
     /// upload; the server clears what it was sent by itself.
     public func upload(
-        _ source: UploadSource, in roomID: RoomID, clientMessageId: String,
-        parentId: String? = nil, alsoSend: Bool = false,
+        _ source: UploadSource, in roomID: RoomID, clientMessageId: ClientMessageID,
+        parentId: MessageID? = nil, delivery: ReplyDelivery = .threadOnly,
         progress: @escaping @Sendable (Int) -> Void = { _ in }
     ) async throws -> Message {
         try await upload(
-            source, in: roomID, clientMessageId: clientMessageId, parentId: parentId, alsoSend: alsoSend,
+            source, in: roomID, clientMessageId: clientMessageId, parentId: parentId, delivery: delivery,
             resuming: nil, checkpoint: { _ in }, progress: progress
         )
     }
 
-    /// `upload(_:in:clientMessageId:parentId:alsoSend:progress:)`, going on from `resuming`, an
+    /// `upload(_:in:clientMessageId:parentId:delivery:progress:)`, going on from `resuming`, an
     /// earlier try's last `checkpoint`: its ticket, without the parts the server took. The server
     /// can't say which parts it has, so the checkpoint is what does; one it no longer knows (404)
     /// starts again from the start. `checkpoint` hears each part the server takes.
     func upload(
-        _ source: UploadSource, in roomID: RoomID, clientMessageId: String,
-        parentId: String?, alsoSend: Bool, resuming: UploadCheckpoint?,
+        _ source: UploadSource, in roomID: RoomID, clientMessageId: ClientMessageID,
+        parentId: MessageID?, delivery: ReplyDelivery, resuming: UploadCheckpoint?,
         checkpoint: @escaping @Sendable (UploadCheckpoint) async -> Void,
         progress: @escaping @Sendable (Int) -> Void
     ) async throws -> Message {
@@ -152,7 +177,7 @@ extension EmberClient {
             } else {
                 ticket = try await startUpload(in: roomID, NewUpload(
                     name: source.name, type: source.contentType, size: source.byteSize,
-                    clientMessageId: clientMessageId, parentId: parentId, alsoSend: alsoSend
+                    clientMessageId: clientMessageId, parentId: parentId, delivery: delivery
                 ))
                 // Checked before any part goes: a ticket that doesn't fit the file would trap reading it,
                 // or send parts for a very long time.

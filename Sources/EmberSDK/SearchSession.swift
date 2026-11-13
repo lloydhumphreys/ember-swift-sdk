@@ -4,7 +4,7 @@ import Observation
 /// A search as a screen holds it: the query being edited, the results of the one last run, and the
 /// pages after them. Observable, so SwiftUI redraws as it changes.
 ///
-/// Searching runs when `run(record:)` is called, never as `query` changes. A newer search cancels the
+/// Searching runs when `run(history:)` is called, never as `query` changes. A newer search cancels the
 /// one before it, and an answer that arrives after that is dropped, so the results shown are always
 /// for the latest search run. A further page continues the query the shown results are for, even if
 /// `query` has been edited since.
@@ -50,7 +50,7 @@ public final class SearchSession {
     private var shown: (query: SearchQuery, sort: SearchSort)?
 
     /// An empty session that searches through `client`.
-    public init(client: EmberClient, query: SearchQuery = SearchQuery(q: ""), sort: SearchSort = .newest) {
+    public init(client: EmberClient, query: SearchQuery = SearchQuery(), sort: SearchSort = .newest) {
         self.client = client
         self.query = query
         self.sort = sort
@@ -72,15 +72,15 @@ public final class SearchSession {
     /// once a search has been run.
     public func loadRecent() async {
         guard phase == .idle else { return }
-        if let results = try? await client.search(SearchQuery(q: "")), phase == .idle {
+        if let results = try? await client.search(SearchQuery()), phase == .idle {
             recent = results.recent
         }
     }
 
-    /// Runs the search `query` describes, and cancels any before it. `record` is true when someone
-    /// typed it, which adds it to their recent searches. A query with no words and no filters runs
-    /// nothing: it resets the session.
-    public func run(record: Bool) {
+    /// Runs the search `query` describes, and cancels any before it. `.record` is for one someone
+    /// typed, which saves it in their recent searches on the server; `.skip` saves nothing. A query
+    /// with no words and no filters runs nothing: it resets the session.
+    public func run(history: SearchHistory) {
         task?.cancel()
         generation += 1
         let generation = generation
@@ -96,7 +96,7 @@ public final class SearchSession {
         let client = client
         task = Task { [weak self] in
             do {
-                let results = try await client.search(query, sort: sort, record: record)
+                let results = try await client.search(query, sort: sort, history: history)
                 guard let self, generation == self.generation, !Task.isCancelled else { return }
                 self.matches = results.matches
                 self.rooms = Dictionary(results.rooms.map { ($0.id, $0) }, uniquingKeysWith: { $1 })
@@ -114,7 +114,7 @@ public final class SearchSession {
     /// Runs a recent search again, as if it had been typed.
     public func run(_ recent: SearchQuery) {
         query = recent
-        run(record: true)
+        run(history: .record)
     }
 
     /// Loads the page after the last one, when there is one. A page already on its way is not asked for twice.
@@ -126,7 +126,7 @@ public final class SearchSession {
         let client = client
         task = Task { [weak self] in
             do {
-                let results = try await client.search(shown.query, sort: shown.sort, cursor: cursor, record: false)
+                let results = try await client.search(shown.query, sort: shown.sort, cursor: cursor, history: .skip)
                 guard let self, generation == self.generation, !Task.isCancelled else { return }
                 let known = Set(self.matches.map(\.id))
                 self.matches += results.matches.filter { !known.contains($0.id) }
@@ -143,7 +143,7 @@ public final class SearchSession {
 
     /// Runs `query`, as it stands now, without recording it: after a failure.
     public func retry() {
-        run(record: false)
+        run(history: .skip)
     }
 
     /// Clears the filters, keeping the words.

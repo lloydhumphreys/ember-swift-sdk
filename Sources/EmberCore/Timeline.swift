@@ -5,7 +5,7 @@ import Foundation
 
 /// A message sent from here that the room hasn't confirmed yet.
 public struct PendingMessage: Hashable, Identifiable, Sendable {
-    public var clientMessageId: String
+    public var clientMessageId: ClientMessageID
     /// Markup, as sent.
     public var body: String
     public var plainText: String
@@ -13,16 +13,16 @@ public struct PendingMessage: Hashable, Identifiable, Sendable {
     /// Why the room refused it; nil while it's on its way.
     public var failure: String?
     /// The thread it replies in; nil for a room message.
-    public var parentId: String?
-    /// Whether a reply also goes to the room. Always false without `parentId`.
-    public var alsoSend: Bool
+    public var parentId: MessageID?
+    /// Where a reply goes. Always `.threadOnly` without `parentId`.
+    public var delivery: ReplyDelivery
     /// Set for a file on its way up: `body` is "" and `plainText` the file's name.
     public var upload: PendingUpload?
-    public var id: String { clientMessageId }
+    public var id: ClientMessageID { clientMessageId }
 
     public init(
-        clientMessageId: String, body: String, plainText: String, createdAt: Date, failure: String? = nil,
-        parentId: String? = nil, alsoSend: Bool = false, upload: PendingUpload? = nil
+        clientMessageId: ClientMessageID, body: String, plainText: String, createdAt: Date, failure: String? = nil,
+        parentId: MessageID? = nil, delivery: ReplyDelivery = .threadOnly, upload: PendingUpload? = nil
     ) {
         self.clientMessageId = clientMessageId
         self.body = body
@@ -30,13 +30,13 @@ public struct PendingMessage: Hashable, Identifiable, Sendable {
         self.createdAt = createdAt
         self.failure = failure
         self.parentId = parentId
-        self.alsoSend = parentId != nil && alsoSend
+        self.delivery = parentId == nil ? .threadOnly : delivery
         self.upload = upload
     }
 
     /// The frame that sends it, again or for the first time.
     var createFrame: ClientFrame {
-        .createMessage(clientMessageId: clientMessageId, body: body, parentId: parentId, alsoSend: parentId == nil ? nil : alsoSend)
+        .createMessage(clientMessageId: clientMessageId, body: body, parentId: parentId, alsoSend: parentId == nil ? nil : delivery == .threadAndRoom)
     }
 
     /// Whether a reconnect asks the room about it: any text, on its way or failed, and a file that
@@ -101,10 +101,10 @@ public struct Timeline: Equatable, Sendable {
     public private(set) var isLoaded = false
     public private(set) var isLoadingOlder = false
     public private(set) var isLoadingNewer = false
-    /// Whether a page asked for with `pageAround` is on its way.
+    /// Whether a page asked for by a jump (`RoomSession.jump(to:)` or `jumpToLatest()`) is on its way.
     public private(set) var isLoadingPage = false
     /// The message the latest page was centred on, to scroll to.
-    public private(set) var anchor: String?
+    public private(set) var anchor: MessageID?
     /// The latest change the room has told us of, for `since=` when reconnecting.
     public private(set) var seq: Int?
     public private(set) var present: [User] = []
@@ -112,12 +112,12 @@ public struct Timeline: Equatable, Sendable {
     public private(set) var typing: [User] = []
     /// How many messages came in while `hasNewer` held them back, for a "new messages" button.
     public private(set) var arrivals = 0
-    /// Why the page before the oldest message didn't load, or nil. Until `retryOlderPage()`, a page
-    /// that loads, or the next connection, `olderPage()` asks for nothing, so a page that fails isn't
-    /// asked for again and again.
+    /// Why the page before the oldest message didn't load, or nil. Until a retry
+    /// (`RoomSession.retryOlder()`), a page that loads, or the next connection, no older page is asked
+    /// for, so a page that fails isn't asked for again and again.
     public private(set) var olderPageFailure: String?
-    /// Why the page after the newest message didn't load, or nil, as `olderPageFailure` for
-    /// `newerPage()` and `retryNewerPage()`.
+    /// Why the page after the newest message didn't load, or nil, as `olderPageFailure` for the
+    /// page before (`RoomSession.retryNewer()` asks again).
     public private(set) var newerPageFailure: String?
     /// Whether a change the room numbered has gone missing, as the `seq` of the changes after it
     /// shows: connecting again with `since` (`seq`, which stays at the change before it) brings it.
@@ -125,22 +125,22 @@ public struct Timeline: Equatable, Sendable {
     /// at once can arrive a little out of order. A welcome or resumed clears it.
     public private(set) var needsCatchUp = false
     /// Whether the reader has scrolled away from the newest messages, as the view says with
-    /// `setAwayFromLatest`. A reconnect that can't catch up then keeps the messages they're reading
+    /// `RoomSession.setAwayFromLatest`. A reconnect that can't catch up then keeps the messages they're reading
     /// and treats the newer ones as not loaded yet (`hasNewer`), rather than showing the newest page.
     public private(set) var isAwayFromLatest = false
 
     // The page bounds the room's history requests go from. They stay put when the messages at the
     // ends are deleted, since the room pages from ids, not from what's shown.
-    private var oldestId: String?
-    private var newestId: String?
+    private var oldestId: MessageID?
+    private var newestId: MessageID?
     /// The numbered changes heard after a gap in `seq`, which move `seq` on once the gap fills.
     private var ahead: Set<Int> = []
 
-    public init() {}
+    package init() {}
 
     /// Applies a frame. Returns what to send back: `message.check` for anything pending after a
     /// (re)connect, and the pending messages a `message.checked` says the room never got.
-    public mutating func apply(_ frame: ServerFrame) -> [ClientFrame] {
+    package mutating func apply(_ frame: ServerFrame) -> [ClientFrame] {
         switch frame {
         case let .welcome(you, present, seq, page):
             me = you
@@ -183,7 +183,7 @@ public struct Timeline: Equatable, Sendable {
 
         case let .messageCreated(message, seq):
             guard see(seq) else { return [] }
-            let isMine = !message.clientMessageId.isEmpty && pending.contains { $0.clientMessageId == message.clientMessageId }
+            let isMine = !message.clientMessageId.rawValue.isEmpty && pending.contains { $0.clientMessageId == message.clientMessageId }
             dropConfirmed(by: [message])
             typing.removeAll { $0.id == message.creator.id }
             guard message.isInRoom else { return [] }
@@ -315,7 +315,7 @@ public struct Timeline: Equatable, Sendable {
     }
 
     /// Queues a message and returns the frame that sends it.
-    public mutating func send(body: String, plainText: String, clientMessageId: String = UUID().uuidString.lowercased(), now: Date = .now) -> ClientFrame {
+    package mutating func send(body: String, plainText: String, clientMessageId: ClientMessageID = ClientMessageID(UUID().uuidString.lowercased()), now: Date = .now) -> ClientFrame {
         pending.append(PendingMessage(clientMessageId: clientMessageId, body: body, plainText: plainText, createdAt: now))
         return .createMessage(clientMessageId: clientMessageId, body: body)
     }
@@ -324,7 +324,7 @@ public struct Timeline: Equatable, Sendable {
     /// it. nil when it isn't pending, and for a file, which the session uploads again. The room
     /// doesn't de-duplicate a create, so `RoomSession` asks it with `message.check` first and sends
     /// this only for a message the room says is missing.
-    public mutating func retry(_ clientMessageId: String) -> ClientFrame? {
+    package mutating func retry(_ clientMessageId: ClientMessageID) -> ClientFrame? {
         guard let index = pending.firstIndex(where: { $0.clientMessageId == clientMessageId }) else { return nil }
         pending[index].failure = nil
         if pending[index].upload != nil {
@@ -335,25 +335,25 @@ public struct Timeline: Equatable, Sendable {
     }
 
     /// Shows a file on its way up as pending. Nothing to send: the file goes over HTTP.
-    public mutating func attach(_ upload: PendingUpload, clientMessageId: String, now: Date) {
+    package mutating func attach(_ upload: PendingUpload, clientMessageId: ClientMessageID, now: Date) {
         pending.append(PendingMessage(clientMessageId: clientMessageId, body: "", plainText: upload.name, createdAt: now, upload: upload))
     }
 
     /// Moves a pending upload's progress on. Nothing for an unknown id.
-    public mutating func uploadProgress(_ clientMessageId: String, sentBytes: Int) {
+    package mutating func uploadProgress(_ clientMessageId: ClientMessageID, sentBytes: Int) {
         pending.progress(clientMessageId, sentBytes: sentBytes)
     }
 
     /// Marks a pending as failed. For an upload, answers the `message.check` to send, since the
     /// file may have been posted anyway.
-    public mutating func fail(_ clientMessageId: String, reason: String) -> ClientFrame? {
+    package mutating func fail(_ clientMessageId: ClientMessageID, reason: String) -> ClientFrame? {
         pending.fail(clientMessageId, reason: reason)
     }
 
     /// The message an upload's last part answered with. The pending with its `clientMessageId`
     /// goes, and the message is shown as `message.created` would show it, but with no seq, and
     /// nothing changes if it's shown already. Out of range (`hasNewer`), only the pending goes.
-    public mutating func posted(_ message: Message) {
+    package mutating func posted(_ message: Message) {
         pending.removeAll { $0.clientMessageId == message.clientMessageId }
         guard message.isInRoom, !hasNewer, !messages.contains(where: { $0.id == message.id }) else { return }
         messages.append(message)
@@ -363,13 +363,13 @@ public struct Timeline: Equatable, Sendable {
         cutFromStart()
     }
 
-    public mutating func discard(_ clientMessageId: String) {
+    package mutating func discard(_ clientMessageId: ClientMessageID) {
         pending.removeAll { $0.clientMessageId == clientMessageId }
     }
 
     /// `history.before` the oldest message, when there's more, none is on its way, and the last one
     /// didn't fail (`olderPageFailure`).
-    public mutating func olderPage() -> ClientFrame? {
+    package mutating func olderPage() -> ClientFrame? {
         guard isLoaded, hasMore, !isLoadingOlder, olderPageFailure == nil, let oldestId else { return nil }
         isLoadingOlder = true
         return .historyBefore(messageId: oldestId)
@@ -377,7 +377,7 @@ public struct Timeline: Equatable, Sendable {
 
     /// `history.after` the newest message, when there's newer, none is on its way, and the last one
     /// didn't fail (`newerPageFailure`).
-    public mutating func newerPage() -> ClientFrame? {
+    package mutating func newerPage() -> ClientFrame? {
         guard isLoaded, hasNewer, !isLoadingNewer, newerPageFailure == nil, let newestId else { return nil }
         isLoadingNewer = true
         return .historyAfter(messageId: newestId)
@@ -385,37 +385,37 @@ public struct Timeline: Equatable, Sendable {
 
     /// Asks again for the page before the oldest message after it failed: `olderPageFailure` is
     /// forgotten and `olderPage()` answers.
-    public mutating func retryOlderPage() -> ClientFrame? {
+    package mutating func retryOlderPage() -> ClientFrame? {
         olderPageFailure = nil
         return olderPage()
     }
 
     /// Asks again for the page after the newest message after it failed, as `retryOlderPage()`.
-    public mutating func retryNewerPage() -> ClientFrame? {
+    package mutating func retryNewerPage() -> ClientFrame? {
         newerPageFailure = nil
         return newerPage()
     }
 
     /// `history.around` a message, to jump to it, or the newest page for nil, to jump back.
-    public mutating func pageAround(_ messageID: String?) -> ClientFrame {
+    package mutating func pageAround(_ messageID: MessageID?) -> ClientFrame {
         isLoadingPage = true
         return .historyAround(messageId: messageID)
     }
 
     /// The reader has scrolled away from the newest messages, or back to them (`isAwayFromLatest`).
-    public mutating func setAwayFromLatest(_ away: Bool) {
+    package mutating func setAwayFromLatest(_ away: Bool) {
         isAwayFromLatest = away
     }
 
     /// The view has scrolled to `anchor`: forget it, so it isn't scrolled to again.
-    public mutating func clearAnchor() {
+    package mutating func clearAnchor() {
         anchor = nil
     }
 
     /// The socket dropped: nobody's typing as far as we know, and no page is on its way. An older
     /// or newer page that was on its way fails (`pageNotLoaded`), as a refused one does, so it's
     /// asked for again with a retry.
-    public mutating func disconnected() {
+    package mutating func disconnected() {
         typing = []
         olderPageFailed()
         newerPageFailed()
@@ -428,20 +428,20 @@ public struct Timeline: Equatable, Sendable {
 
     /// The page before the oldest message didn't come: it fails with `reason`, as one the room
     /// refused does, and `retryOlderPage()` asks again. Nothing when none is on its way.
-    public mutating func olderPageFailed(_ reason: String = Self.pageNotLoaded) {
+    package mutating func olderPageFailed(_ reason: String = Self.pageNotLoaded) {
         guard isLoadingOlder else { return }
         isLoadingOlder = false
         olderPageFailure = reason
     }
 
     /// The page after the newest message didn't come, as `olderPageFailed(_:)`.
-    public mutating func newerPageFailed(_ reason: String = Self.pageNotLoaded) {
+    package mutating func newerPageFailed(_ reason: String = Self.pageNotLoaded) {
         guard isLoadingNewer else { return }
         isLoadingNewer = false
         newerPageFailure = reason
     }
 
-    public func message(_ id: String) -> Message? {
+    public func message(_ id: MessageID) -> Message? {
         messages.first { $0.id == id }
     }
 
@@ -533,7 +533,7 @@ public struct Timeline: Equatable, Sendable {
     static let emptyPage = "The room sent an empty page."
 
     /// Whether a message changed while we were away belongs between the page's bounds.
-    private func inRange(_ id: String) -> Bool {
+    private func inRange(_ id: MessageID) -> Bool {
         if let oldestId, !jsLess(oldestId, id) { return false }
         if hasNewer, let newestId, !jsLess(id, newestId) { return false }
         return true
@@ -584,18 +584,18 @@ extension [PendingMessage] {
     func checks() -> [ClientFrame] {
         let ids = filter(\.isChecked).map(\.clientMessageId)
         return stride(from: 0, to: ids.count, by: Limits.checkedMessages).map {
-            .checkMessages(clientMessageIds: [String](ids[$0 ..< Swift.min($0 + Limits.checkedMessages, ids.count)]))
+            .checkMessages(clientMessageIds: [ClientMessageID](ids[$0 ..< Swift.min($0 + Limits.checkedMessages, ids.count)]))
         }
     }
 
-    mutating func progress(_ clientMessageId: String, sentBytes: Int) {
+    mutating func progress(_ clientMessageId: ClientMessageID, sentBytes: Int) {
         guard let index = firstIndex(where: { $0.clientMessageId == clientMessageId }), let upload = self[index].upload else { return }
         // Only forward: a part sent again counts from its start, and the bar shouldn't jump back for
         // it. A whole upload retried starts from 0 in `retry`, not here.
         self[index].upload?.sentBytes = Swift.max(upload.sentBytes, Swift.min(Swift.max(0, sentBytes), upload.byteSize))
     }
 
-    mutating func fail(_ clientMessageId: String, reason: String) -> ClientFrame? {
+    mutating func fail(_ clientMessageId: ClientMessageID, reason: String) -> ClientFrame? {
         guard let index = firstIndex(where: { $0.clientMessageId == clientMessageId }) else { return nil }
         self[index].failure = reason
         return self[index].upload == nil ? nil : .checkMessages(clientMessageIds: [clientMessageId])

@@ -39,7 +39,7 @@ extension Fixtures {
 
     /// A bot's message: no body, its plain text, and `cards` under it.
     public static func cardMessage(
-        _ id: String,
+        _ id: MessageID,
         cards: [Card] = [deployCard],
         plainText: String = "Deployed web 2.4.0",
         by creator: User = deployBot,

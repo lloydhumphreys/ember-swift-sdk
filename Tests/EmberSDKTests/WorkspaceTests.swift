@@ -134,10 +134,11 @@ import Testing
         #expect(workspace.room(alan.id) != nil)
     }
 
-    @Test func aMessageSentBeforeTheRoomsFirstWelcomeIsSavedAtOnce() throws {
+    @Test func aMessageSentBeforeTheRoomsFirstWelcomeIsSavedAtOnce() async throws {
         let session = workspace.session(for: Fixtures.general.id)
         let store = try #require(session.unsentStore as? MemoryUnsentMessageStore)
         let id = session.send(body: "<p>Early</p>", plainText: "Early")
+        try await session.flushUnsent()
         #expect(store.saved.values.flatMap { $0 }.map(\.clientMessageId) == [id])
         #expect(store.saved.keys.map(\.userID) == [Fixtures.me.id])
     }

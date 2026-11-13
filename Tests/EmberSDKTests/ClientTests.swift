@@ -231,37 +231,47 @@ import Testing
         let room = try await client.startDirect(with: [Fixtures.grace.id])
         #expect(room.id == Fixtures.directWithGrace.id)
         expectWriteHeaders(transport.requests.last)
-        #expect(transport.lastBody("POST", "/api/directs")?["userIds"] as? [String] == [Fixtures.grace.id])
+        #expect(transport.lastBody("POST", "/api/directs")?["userIds"] as? [String] == [Fixtures.grace.id.rawValue])
     }
 
     // MARK: Search
 
     @Test func aTypedSearchIsPostedAndRemembered() async throws {
-        let query = SearchQuery(q: "engine", roomID: Fixtures.general.id)
+        let query = SearchQuery("engine").inRoom(Fixtures.general.id)
         transport.stub("POST", "/api/searches", json: Fixtures.searchJSON(search: query, matches: Fixtures.messages(2), next: 2))
-        let results = try await client.search(query, sort: .oldest, record: true)
+        let results = try await client.search(query, sort: .oldest, history: .record)
         #expect(results.search == query)
         #expect(results.matches.map(\.id) == ["m001", "m002"])
         #expect(results.next == 2)
         expectWriteHeaders(transport.requests.last)
         let body = transport.lastBody("POST", "/api/searches")
         #expect(body?["q"] as? String == "engine")
-        #expect(body?["in"] as? String == Fixtures.general.id)
+        #expect(body?["in"] as? String == Fixtures.general.id.rawValue)
         #expect(body?["sort"] as? String == "oldest")
     }
 
     @Test func aFurtherPageIsRead() async throws {
-        let query = SearchQuery(q: "analytical engine", roomID: Fixtures.general.id)
+        let query = SearchQuery("analytical engine").inRoom(Fixtures.general.id)
         transport.stub("GET", "/api/searches?q=analytical+engine&in=room-general&cursor=40", json: Fixtures.searchJSON(search: query))
-        _ = try await client.search(query, cursor: 40, record: true)
+        _ = try await client.search(query, cursor: 40, history: .record)
         #expect(transport.requests.last?.httpMethod == "GET")
         #expect(transport.requests.last?.query == "q=analytical+engine&in=room-general&cursor=40")
     }
 
+    @Test func aSearchSkippedFromHistoryIsReadNotPosted() async throws {
+        let query = SearchQuery("engine")
+        transport.stub("GET", "/api/searches?q=engine", json: Fixtures.searchJSON(search: query))
+        _ = try await client.search(query)
+        _ = try await client.search(query, history: .skip)
+        #expect(transport.requests.map(\.httpMethod) == ["GET", "GET"])
+        #expect(transport.requests.map(\.query) == ["q=engine", "q=engine"])
+        #expect(transport.lastBody("POST", "/api/searches") == nil)
+    }
+
     @Test func anEmptySearchReadsTheRecentOnes() async throws {
-        let recent = [SearchQuery(q: "engine"), SearchQuery(q: "", from: Fixtures.grace.id)]
+        let recent = [SearchQuery("engine"), SearchQuery().from(Fixtures.grace.id)]
         transport.stub("GET", "/api/searches", json: Fixtures.searchJSON(recent: recent))
-        let results = try await client.search(SearchQuery(q: ""), record: false)
+        let results = try await client.search(SearchQuery(), history: .skip)
         #expect(results.search == nil)
         #expect(results.matches.isEmpty)
         #expect(results.recent == recent)

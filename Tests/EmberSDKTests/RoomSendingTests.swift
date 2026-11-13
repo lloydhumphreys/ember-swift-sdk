@@ -31,7 +31,7 @@ import Testing
         return try #require((connector ?? self.connector).latest)
     }
 
-    func created(_ id: String, clientMessageId: String, seq: Int) -> String {
+    func created(_ id: MessageID, clientMessageId: ClientMessageID, seq: Int) -> String {
         Fixtures.RoomFrames.messageCreated(Fixtures.message(id, "Hello", by: Fixtures.ada, minute: 9, clientMessageId: clientMessageId), seq: seq)
     }
 
@@ -155,6 +155,7 @@ import Testing
         _ = try await opened(first)
         let id = first.send(body: "<p>Hello</p>", plainText: "Hello")
         let key = UnsentMessageKey(server: URL(string: "https://ember.test")!, userID: Fixtures.ada.id, roomID: Fixtures.general.id)
+        try await first.flushUnsent()
         #expect(store.saved[key]?.map(\.clientMessageId) == [id])
 
         let relaunched = MockSocketConnector()
@@ -170,6 +171,7 @@ import Testing
         socket.serverSends(created("m009", clientMessageId: id, seq: 11))
         #expect(await eventually { second.timeline.pending.isEmpty })
         #expect(second.timeline.messages.filter { $0.clientMessageId == id }.count == 1)
+        try await second.flushUnsent()
         #expect(store.saved[key] == nil)
     }
 
@@ -210,7 +212,7 @@ import Testing
     }
 
     /// Sends a message the room never answers, and waits until it shows as not sent.
-    func notSent(_ session: RoomSession) async throws -> String {
+    func notSent(_ session: RoomSession) async throws -> ClientMessageID {
         session.sendTimeout = .seconds(5)
         let id = session.send(body: "<p>Hello</p>", plainText: "Hello")
         try #require(await clock.pass(.seconds(5)))
@@ -353,7 +355,7 @@ import Testing
     // MARK: Async changes
 
     /// The id of the `message.check` an async edit sent after its `message.update`.
-    func editMarker(_ socket: MockSocketConnection) async throws -> String {
+    func editMarker(_ socket: MockSocketConnection) async throws -> ClientMessageID {
         try #require(await eventually { socket.sent("message.update").count == 1 && !socket.sent("message.check").isEmpty })
         guard case let .checkMessages(ids)? = socket.sent("message.check").last, let marker = ids.first else {
             throw EmberError(kind: .invalid, message: "No marker.")
@@ -558,7 +560,7 @@ import Testing
         #expect(throws: EmberError.self) { try session.send(text: " \n ") }
         #expect(throws: EmberError.self) { try session.send(files: [], text: String(repeating: "a", count: Limits.message + 1)) }
         #expect(session.timeline.pending.isEmpty)
-        #expect(try session.send(text: String(repeating: "a", count: Limits.message)).isEmpty == false)
+        #expect(try session.send(text: String(repeating: "a", count: Limits.message)).rawValue.isEmpty == false)
     }
 
     @Test func aCaptionAndAReplyInPlainTextAreEscaped() async throws {

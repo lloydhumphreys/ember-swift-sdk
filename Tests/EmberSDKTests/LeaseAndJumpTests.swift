@@ -12,7 +12,7 @@ import Testing
         (timing, clock) = manualTiming()
     }
 
-    func session(around: String? = nil) -> RoomSession {
+    func session(around: MessageID? = nil) -> RoomSession {
         connector.welcomeEverySocket(messages: Fixtures.messages(3))
         return RoomSession(client: .mock(connector: connector, timing: timing), roomID: Fixtures.general.id, around: around)
     }

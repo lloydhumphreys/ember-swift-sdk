@@ -7,11 +7,11 @@ import Testing
 private let parent = message("m001", by: ada, text: "The plan")
 
 /// A reply in m001's thread, `grace`'s unless it says.
-private func reply(_ id: String, by creator: User = grace, clientMessageId: String? = nil, text: String? = nil, alsoSent: Bool = false) -> Message {
+private func reply(_ id: MessageID, by creator: User = grace, clientMessageId: ClientMessageID? = nil, text: String? = nil, alsoSent: Bool = false) -> Message {
     message(id, by: creator, clientMessageId: clientMessageId, text: text, parentId: "m001", alsoSent: alsoSent)
 }
 
-private func thread(at replyId: String? = nil) -> ThreadTimeline {
+private func thread(at replyId: MessageID? = nil) -> ThreadTimeline {
     ThreadTimeline(parentId: "m001", me: ada, at: replyId)
 }
 
@@ -22,11 +22,11 @@ private func open(_ thread: inout ThreadTimeline, _ replies: [Message], hasMore:
 }
 
 @discardableResult
-private func page(_ thread: inout ThreadTimeline, before: String, _ replies: [Message], hasMore: Bool) -> [ClientFrame] {
+private func page(_ thread: inout ThreadTimeline, before: MessageID, _ replies: [Message], hasMore: Bool) -> [ClientFrame] {
     thread.apply(.threadHistory(parentId: "m001", before: before, messages: replies, hasMore: hasMore))
 }
 
-private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id) }
+private func ids(_ thread: ThreadTimeline) -> [MessageID] { thread.replies.map(\.id) }
 
 @Suite struct ThreadOpeningTests {
     @Test func firstOpenShowsTheParentAndNewestReplies() {
@@ -133,7 +133,7 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
     }
 
     @Test func pagesBackThroughOlderRepliesAndKeepsThemAll() {
-        let replies = (0 ..< 400).map { reply(String(format: "r%03d", $0)) }
+        let replies = (0 ..< 400).map { reply(MessageID(String(format: "r%03d", $0))) }
         var state = thread()
         open(&state, Array(replies.suffix(40)), hasMore: true)
         for end in stride(from: 360, to: 0, by: -40) {
@@ -162,7 +162,7 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
     @Test func startsAfreshOnceTheRepliesShownGoBackFurther() {
         var state = thread()
         open(&state, [reply("r1"), reply("r2")])
-        _ = state.reply(body: "<p>Three</p>", plainText: "Three", alsoSend: false, clientMessageId: "c3", now: noon())
+        _ = state.reply(body: "<p>Three</p>", plainText: "Three", delivery: .threadOnly, clientMessageId: "c3", now: noon())
         state.disconnected()
         let checks = open(&state, [reply("r5"), reply("r6")], hasMore: true)
         #expect(checks == [.checkMessages(clientMessageIds: ["c3"])])
@@ -279,11 +279,11 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
     @Test func aReplyIsPendingUntilTheRoomHasIt() {
         var state = thread()
         open(&state, [reply("r1")])
-        let frame = state.reply(body: "<p>Hi</p>", plainText: "Hi", alsoSend: true, clientMessageId: "c2", now: noon())
+        let frame = state.reply(body: "<p>Hi</p>", plainText: "Hi", delivery: .threadAndRoom, clientMessageId: "c2", now: noon())
         #expect(frame == .createMessage(clientMessageId: "c2", body: "<p>Hi</p>", parentId: "m001", alsoSend: true))
         #expect(json(frame.text) == json(#"{"type":"message.create","clientMessageId":"c2","body":"<p>Hi</p>","parentId":"m001","alsoSend":true}"#))
-        #expect(state.pending == [PendingMessage(clientMessageId: "c2", body: "<p>Hi</p>", plainText: "Hi", createdAt: noon(), parentId: "m001", alsoSend: true)])
-        let threadOnly = state.reply(body: "B", plainText: "B", alsoSend: false, clientMessageId: "c3", now: noon())
+        #expect(state.pending == [PendingMessage(clientMessageId: "c2", body: "<p>Hi</p>", plainText: "Hi", createdAt: noon(), parentId: "m001", delivery: .threadAndRoom)])
+        let threadOnly = state.reply(body: "B", plainText: "B", delivery: .threadOnly, clientMessageId: "c3", now: noon())
         #expect(threadOnly == .createMessage(clientMessageId: "c3", body: "B", parentId: "m001", alsoSend: false))
 
         // Someone else reusing my id doesn't confirm it.
@@ -297,11 +297,11 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
     @Test func aReconnectChecksAndResendsWithTheThread() {
         var state = thread()
         open(&state, [])
-        _ = state.reply(body: "Two", plainText: "Two", alsoSend: true, clientMessageId: "c2", now: noon())
-        _ = state.reply(body: "Three", plainText: "Three", alsoSend: false, clientMessageId: "c3", now: noon())
+        _ = state.reply(body: "Two", plainText: "Two", delivery: .threadAndRoom, clientMessageId: "c2", now: noon())
+        _ = state.reply(body: "Three", plainText: "Three", delivery: .threadOnly, clientMessageId: "c3", now: noon())
         _ = state.apply(.error(message: "Too long", clientMessageId: "c3", clientMessageIds: nil, failed: "message.create"))
-        state.attach(PendingUpload(name: "a.pdf", contentType: "application/pdf", byteSize: 10), alsoSend: false, clientMessageId: "c4", now: noon())
-        state.attach(PendingUpload(name: "b.pdf", contentType: "application/pdf", byteSize: 10), alsoSend: true, clientMessageId: "c5", now: noon())
+        state.attach(PendingUpload(name: "a.pdf", contentType: "application/pdf", byteSize: 10), delivery: .threadOnly, clientMessageId: "c4", now: noon())
+        state.attach(PendingUpload(name: "b.pdf", contentType: "application/pdf", byteSize: 10), delivery: .threadAndRoom, clientMessageId: "c5", now: noon())
         _ = state.fail("c5", reason: Uploads.failed)
         state.disconnected()
 
@@ -316,14 +316,14 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
 
     @Test func checksGoInChunks() {
         var state = thread()
-        for n in 0 ..< 51 { _ = state.reply(body: "\(n)", plainText: "\(n)", alsoSend: false, clientMessageId: "c\(n)", now: noon()) }
+        for n in 0 ..< 51 { _ = state.reply(body: "\(n)", plainText: "\(n)", delivery: .threadOnly, clientMessageId: "c\(n)", now: noon()) }
         let checks = open(&state, [])
         #expect(checks == [.checkMessages(clientMessageIds: (0 ..< 50).map { "c\($0)" }), .checkMessages(clientMessageIds: ["c50"])])
     }
 
     @Test func aPageThatHoldsAPendingReplyConfirmsIt() {
         var state = thread()
-        _ = state.reply(body: "Hi", plainText: "Hi", alsoSend: false, clientMessageId: "c2", now: noon())
+        _ = state.reply(body: "Hi", plainText: "Hi", delivery: .threadOnly, clientMessageId: "c2", now: noon())
         let checks = open(&state, [reply("r1", by: ada, clientMessageId: "c2")])
         #expect(checks.isEmpty && state.pending.isEmpty)
     }
@@ -331,8 +331,8 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
     @Test func errorsByIdFailTheThreadsReplies() {
         var state = thread()
         open(&state, [reply("r1")])
-        _ = state.reply(body: "A", plainText: "A", alsoSend: false, clientMessageId: "c2", now: noon())
-        _ = state.reply(body: "B", plainText: "B", alsoSend: false, clientMessageId: "c3", now: noon())
+        _ = state.reply(body: "A", plainText: "A", delivery: .threadOnly, clientMessageId: "c2", now: noon())
+        _ = state.reply(body: "B", plainText: "B", delivery: .threadOnly, clientMessageId: "c3", now: noon())
         _ = state.apply(.error(message: "That message no longer exists", clientMessageId: "c2", clientMessageIds: nil, failed: "message.create"))
         _ = state.apply(.error(message: "Slow down", clientMessageId: nil, clientMessageIds: ["c3", "c9"], failed: "message.create"))
         #expect(state.pending.map(\.failure) == ["That message no longer exists", "Slow down"])
@@ -376,7 +376,7 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
         open(&state, [reply("r3")], hasMore: true)
         _ = state.olderPage()
         _ = state.apply(.typing(user: User(id: "ember", name: "Ember"), typing: true, threadId: "m001"), now: noon())
-        _ = state.reply(body: "Hi", plainText: "Hi", alsoSend: false, clientMessageId: "c1", now: noon())
+        _ = state.reply(body: "Hi", plainText: "Hi", delivery: .threadOnly, clientMessageId: "c1", now: noon())
         state.disconnected()
         #expect(!state.isLoadingOlder && state.typing.isEmpty)
         #expect(ids(state) == ["r3"] && state.pending.map(\.id) == ["c1"])
@@ -421,9 +421,9 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
     @Test func aFileGoesUpAsAPendingReply() {
         var state = thread()
         open(&state, [reply("r1")])
-        state.attach(PendingUpload(name: "plan.pdf", contentType: "application/pdf", byteSize: 100), alsoSend: true, clientMessageId: "c2", now: noon())
+        state.attach(PendingUpload(name: "plan.pdf", contentType: "application/pdf", byteSize: 100), delivery: .threadAndRoom, clientMessageId: "c2", now: noon())
         #expect(state.pending == [PendingMessage(
-            clientMessageId: "c2", body: "", plainText: "plan.pdf", createdAt: noon(), parentId: "m001", alsoSend: true,
+            clientMessageId: "c2", body: "", plainText: "plan.pdf", createdAt: noon(), parentId: "m001", delivery: .threadAndRoom,
             upload: PendingUpload(name: "plan.pdf", contentType: "application/pdf", byteSize: 100)
         )])
         state.uploadProgress("c2", sentBytes: 40)
@@ -445,7 +445,7 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
     @Test func aBroadcastFirstThenTheAnswerShowsOnce() {
         var state = thread()
         open(&state, [])
-        state.attach(PendingUpload(name: "a.png", contentType: "image/png", byteSize: 1), alsoSend: false, clientMessageId: "c1", now: noon())
+        state.attach(PendingUpload(name: "a.png", contentType: "image/png", byteSize: 1), delivery: .threadOnly, clientMessageId: "c1", now: noon())
         let file = reply("r1", by: ada, clientMessageId: "c1")
         _ = state.apply(.messageCreated(file, seq: 1))
         state.posted(file)
@@ -455,7 +455,7 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
     @Test func aFileIsntSentAgainWhenTheRoomNeverGotIt() {
         var state = thread()
         open(&state, [])
-        state.attach(PendingUpload(name: "a.png", contentType: "image/png", byteSize: 1), alsoSend: false, clientMessageId: "c1", now: noon())
+        state.attach(PendingUpload(name: "a.png", contentType: "image/png", byteSize: 1), delivery: .threadOnly, clientMessageId: "c1", now: noon())
         _ = state.fail("c1", reason: "Upload failed")
         let resent = state.apply(.messageChecked(stored: [], missing: ["c1"]))
         #expect(resent.isEmpty && state.pending.first?.failure == "Upload failed")
@@ -467,7 +467,7 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
     @Test func aLoadedReplyIsFocusedAtOnce() {
         var state = thread()
         open(&state, [reply("r1"), reply("r2"), reply("r3")])
-        _ = state.reply(body: "<p>Hi</p>", plainText: "Hi", alsoSend: false, clientMessageId: "c1", now: Date())
+        _ = state.reply(body: "<p>Hi</p>", plainText: "Hi", delivery: .threadOnly, clientMessageId: "c1", now: Date())
         #expect(state.go(to: "r2").isEmpty)
         #expect(state.focus == "r2")
         #expect(ids(state) == ["r1", "r2", "r3"])
@@ -484,7 +484,7 @@ private func ids(_ thread: ThreadTimeline) -> [String] { thread.replies.map(\.id
     @Test func anOlderReplyIsPagedBackTo() {
         var state = thread()
         open(&state, [reply("r3"), reply("r4")], hasMore: true)
-        _ = state.reply(body: "<p>Hi</p>", plainText: "Hi", alsoSend: false, clientMessageId: "c1", now: Date())
+        _ = state.reply(body: "<p>Hi</p>", plainText: "Hi", delivery: .threadOnly, clientMessageId: "c1", now: Date())
         #expect(state.go(to: "r1") == [.threadBefore(parentId: "m001", before: "r3")])
         #expect(state.focus == nil && state.isLoadingOlder)
         page(&state, before: "r3", [reply("r1"), reply("r2")], hasMore: false)

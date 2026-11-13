@@ -85,9 +85,9 @@ func eventually(within timeout: Duration = .seconds(10), _ condition: @MainActor
 
     @Test func searches() async throws {
         let client = try await signedIn()
-        let recorded = try await client.search(SearchQuery(q: "the"), record: true)
+        let recorded = try await client.search(SearchQuery("the"), history: .record)
         #expect(recorded.search?.q == "the")
-        let recent = try await client.search(SearchQuery(q: ""), record: false)
+        let recent = try await client.search(SearchQuery(), history: .skip)
         #expect(recent.search == nil)
         #expect(recent.matches.isEmpty)
         #expect(recent.recent.contains { $0.q == "the" })

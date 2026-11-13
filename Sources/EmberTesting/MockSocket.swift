@@ -75,8 +75,14 @@ public final class MockSocketConnection: SocketConnection, @unchecked Sendable {
         lock.withLock { outbox }
     }
 
+    /// What the client sent, read as frames, pings included; anything that isn't a JSON object
+    /// with a `type` is left out.
+    public var sentFrames: [SentFrame] {
+        sent.compactMap(SentFrame.init(text:))
+    }
+
     /// What the client sent, read as room frames; anything a room wouldn't take is left out.
-    public var sentFrames: [ClientFrame] {
+    package var sentClientFrames: [ClientFrame] {
         sent.compactMap(ClientFrame.init(text:))
     }
 
@@ -192,5 +198,35 @@ public final class MockSocketConnection: SocketConnection, @unchecked Sendable {
         }
         for receiver in receivers { receiver.resume(throwing: closed) }
         for waiter in openWaiters { waiter.resume(throwing: closed) }
+    }
+}
+
+/// One frame a client sent on a socket, as its JSON fields: `type` says which, and the rest are
+/// as the protocol names them (the `body` of a `message.create`, the `before` of a `history.before`).
+public struct SentFrame: Hashable, Sendable {
+    /// The protocol's name for the frame, such as `message.create`.
+    public let type: String
+    /// The frame's fields, `type` among them.
+    public let fields: [String: JSONValue]
+    /// The frame as sent.
+    public let text: String
+
+    /// Reads a frame as sent; nil when it isn't a JSON object with a `type`.
+    public init?(text: String) {
+        guard let value = try? JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)),
+              case let .object(fields) = value, case let .string(type)? = fields["type"] else { return nil }
+        self.type = type
+        self.fields = fields
+        self.text = text
+    }
+
+    /// The field named `key`, or nil when the frame doesn't have it.
+    public subscript(key: String) -> JSONValue? {
+        fields[key]
+    }
+
+    /// The field named `key` when it's a string, such as a `message.create`'s `body`.
+    public func string(_ key: String) -> String? {
+        if case let .string(value)? = fields[key] { value } else { nil }
     }
 }

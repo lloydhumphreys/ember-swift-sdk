@@ -17,12 +17,13 @@ import Observation
     /// What the room's frames add up to.
     public internal(set) var timeline = Timeline()
     /// `.stopped(.notFound)` when the room is gone or you're no longer in it.
-    public private(set) var status: ReconnectingSocket.Status = .idle
+    public private(set) var status: ConnectionStatus = .idle
     /// Where the room's connection is, as a screen shows it: `status`, and whether the room has let
     /// the socket in.
     public private(set) var phase: Phase = .idle
-    /// The latest thing the room refused that isn't a pending message's failure (an edit, a boost…).
-    /// The view shows it and sets it back to nil.
+    /// The latest thing the room refused that nothing else answers for: not a pending message's
+    /// failure, and not an edit, deletion or boost, which throw instead. It also names the files
+    /// `send(files:…)` refused as too large. The view shows it and sets it back to nil.
     public var notice: String?
     /// Whether the app is in front, which the room shows others as presence.
     public private(set) var isVisible = true
@@ -44,14 +45,14 @@ import Observation
     /// Whether the open connection said the app was in front.
     @ObservationIgnored private var askedVisible = true
     /// The message being jumped to, asked for again should the socket drop before its page comes.
-    @ObservationIgnored private var jumpTarget: String?
+    @ObservationIgnored private var jumpTarget: MessageID?
     /// How many `history.around` requests the open connection has sent and not had answered.
     @ObservationIgnored private var aroundsAsked = 0
     /// The first message shown when an older page was asked for while the room hadn't let the socket
     /// in, so the page goes once it has, should that message still be first.
-    @ObservationIgnored private var olderWanted: String?
+    @ObservationIgnored private var olderWanted: MessageID?
     /// The same for a newer page, by the last message shown.
-    @ObservationIgnored private var newerWanted: String?
+    @ObservationIgnored private var newerWanted: MessageID?
 
     /// How many leases are open, `start()`'s included.
     @ObservationIgnored private(set) var leases = 0
@@ -66,20 +67,34 @@ import Observation
     /// those let go of with a reply or file still unsettled.
     @ObservationIgnored var threads: [ThreadSession] = []
     /// The thread the server has open for this connection: the last `thread.open` sent on it.
-    @ObservationIgnored var openThread: String?
+    @ObservationIgnored var openThread: MessageID?
     /// Files waiting to go up, and texts waiting on the files ahead of them, in the order sent.
     @ObservationIgnored var outgoing: [Outgoing] = []
     /// The file going up now. One at a time, as on the web.
     @ObservationIgnored var running: RunningUpload?
     /// Files that failed, kept so `retry` can send them again.
-    @ObservationIgnored var failedUploads: [String: UploadJob] = [:]
+    @ObservationIgnored var failedUploads: [ClientMessageID: UploadJob] = [:]
 
     /// Where unsent text messages are kept across launches.
     @ObservationIgnored public let unsentStore: any UnsentMessageStore
     /// Whose they are, once `Workspace` or the room's first welcome has said.
     @ObservationIgnored private var unsentKey: UnsentMessageKey?
-    /// What `unsentStore` was last given, so an unchanged list isn't written again.
+    /// What `unsentStore` is known to hold for `unsentKey`, so an unchanged list isn't written again.
     @ObservationIgnored private var savedUnsent: [UnsentMessage] = []
+    /// Writes `unsentStore` off the main actor, shared with every session on it.
+    @ObservationIgnored private let unsentWriter: UnsentWriter
+    /// Why what `unsentStore` kept couldn't be read, while it's still to be: nothing is written
+    /// over it meanwhile, and messages sent meanwhile are kept with it once it reads.
+    @ObservationIgnored private var unsentReadFailure: UnsentStoreError?
+    /// Whether what was read is to be written even unchanged: some of it couldn't be read.
+    @ObservationIgnored private var unsentRewriteOwed = false
+    /// Whether the unsent messages are on disk as they are now. The session goes on working when
+    /// they can't be: it tries again on its next change, as it starts or comes to the front, and on
+    /// `flushUnsent()`.
+    public private(set) var unsentState: UnsentState = .saved
+    /// What was lost of the unsent messages kept from before: a file that couldn't be read, in whole
+    /// or in part (`.corrupt`, with `lost` and `recovered`), and was kept in the store's quarantine.
+    public private(set) var unsentLoss: UnsentStoreError?
     /// Failed replies in threads no screen holds, kept until their thread is asked for again.
     @ObservationIgnored var parkedReplies: [UnsentMessage] = []
     /// How long a message may go unconfirmed before it shows as failed (`notSent`), counted from
@@ -92,22 +107,22 @@ import Observation
     /// Counts connections, so a timer started on one does nothing on the next.
     @ObservationIgnored private var connection = 0
     /// The timers of messages sent or retried and not yet confirmed or failed.
-    @ObservationIgnored private var sendTimers: [String: Task<Void, Never>] = [:]
+    @ObservationIgnored private var sendTimers: [ClientMessageID: Task<Void, Never>] = [:]
     /// The timers of the older and newer pages on their way.
     @ObservationIgnored private var olderTimer: Task<Void, Never>?
     @ObservationIgnored private var newerTimer: Task<Void, Never>?
     /// The messages and replies created on this connection, since their last retry. The room answers
     /// a socket's frames in order, so a check's `missing` for one of them comes from a check sent
     /// before the create, and sending it again would store it twice.
-    @ObservationIgnored private var created: Set<String> = []
+    @ObservationIgnored private var created: Set<ClientMessageID> = []
     /// Whether the socket was kept open after the last lease closed, for unsent messages.
     @ObservationIgnored private var lingering = false
     /// Changes sent with the `async` forms of edit, delete and boost, waiting to be shown made.
     @ObservationIgnored var changes: [ChangeWaiter] = []
     /// How far each file got before it failed, so a retry goes on from there.
-    @ObservationIgnored var uploadCheckpoints: [String: UploadCheckpoint] = [:]
-    /// What keeps a file going up when the app leaves the foreground: `.system` when the client is
-    /// on the network, `.none` for any other transport.
+    @ObservationIgnored var uploadCheckpoints: [ClientMessageID: UploadCheckpoint] = [:]
+    /// What keeps a file going up when the app leaves the foreground: the client's `backgroundTime`
+    /// unless changed.
     @ObservationIgnored public var backgroundTime: BackgroundTime
 
     @ObservationIgnored private var typingSent = false
@@ -116,19 +131,19 @@ import Observation
     @ObservationIgnored private var pause: Task<Void, Never>?
 
     /// A session for a room on `client`. With `messageID`, it opens on the page around that message.
-    /// Unsent messages are kept in a `FileUnsentMessageStore` when the client is on the network,
-    /// and in memory for any other transport.
-    public convenience init(client: EmberClient, roomID: RoomID, around messageID: String? = nil) {
-        let store: any UnsentMessageStore = client.transport is URLSessionHTTPTransport ? FileUnsentMessageStore() : MemoryUnsentMessageStore()
-        self.init(client: client, roomID: roomID, around: messageID, unsentStore: store)
+    /// Unsent messages are kept in the client's `unsentStore`.
+    public convenience init(client: EmberClient, roomID: RoomID, around messageID: MessageID? = nil) {
+        self.init(client: client, roomID: roomID, around: messageID, unsentStore: client.unsentStore)
     }
 
-    /// A session for a room on `client` that keeps its unsent messages in `unsentStore`.
-    public init(client: EmberClient, roomID: RoomID, around messageID: String? = nil, unsentStore: any UnsentMessageStore) {
+    /// A session for a room on `client` that keeps its unsent messages in `unsentStore` rather than
+    /// the client's.
+    public init(client: EmberClient, roomID: RoomID, around messageID: MessageID? = nil, unsentStore: any UnsentMessageStore) {
         self.client = client
         self.roomID = roomID
         self.unsentStore = unsentStore
-        backgroundTime = client.transport is URLSessionHTTPTransport ? .system : .none
+        unsentWriter = UnsentWriter.writer(for: unsentStore)
+        backgroundTime = client.backgroundTime
         aroundOnConnect = messageID.map(Opening.message) ?? .catchUp
         jumpTarget = messageID
         isJumping = messageID != nil
@@ -157,7 +172,10 @@ import Observation
     /// the lease (or let go of it) when the room is no longer shown.
     public func open() -> RoomLease {
         leases += 1
-        if leases == 1 { connect() }
+        if leases == 1 {
+            retryUnsent()
+            connect()
+        }
         onLeasesChanged?()
         return RoomLease(self)
     }
@@ -212,6 +230,7 @@ import Observation
     /// Opens the socket again after `holdBack()`, if anything holds a lease.
     func resume() {
         isHeldBack = false
+        retryUnsent()
         connect()
     }
 
@@ -231,6 +250,8 @@ import Observation
 
     /// Done with, as the workspace is shut down: closed for good, typing timers and all.
     func shutDown() {
+        // What's unsent now is handed over before anything else can be.
+        saveUnsent()
         isShutDown = true
         onLeasesChanged = nil
         detach()
@@ -290,10 +311,11 @@ import Observation
     // MARK: Messages
 
     /// Sends a message: pending at once, sent now or when the socket is next open. Answers its
-    /// `clientMessageId`, a lowercase UUID as the web makes them.
+    /// `clientMessageId`, a lowercase UUID as the web makes them. `previews` go after the body.
     @discardableResult
-    public func send(body: String, plainText: String) -> String {
-        let clientMessageId = UUID().uuidString.lowercased()
+    public func send(body: String, plainText: String, previews: [LinkPreview] = []) -> ClientMessageID {
+        let clientMessageId = ClientMessageID(UUID().uuidString.lowercased())
+        let body = withPreviews(body, previews)
         let frame = timeline.send(body: body, plainText: plainText, clientMessageId: clientMessageId)
         // While the room hasn't let the socket in, the message waits, timed from now: the welcome's
         // `message.check` finds it missing, and the room's answer sends it.
@@ -306,7 +328,7 @@ import Observation
     /// message, as one that failed for want of an answer may have been stored, and it's created only
     /// if the room says it's missing. A file that failed goes on from the part after the last the
     /// server took (from the start if the server forgot the upload), after any still waiting.
-    public func retry(_ clientMessageId: String) {
+    public func retry(_ clientMessageId: ClientMessageID) {
         if timeline.pending.first(where: { $0.clientMessageId == clientMessageId })?.upload != nil {
             _ = timeline.retry(clientMessageId)
             retryUpload(clientMessageId)
@@ -319,7 +341,7 @@ import Observation
 
     /// Asks the room whether it has `id`, a message or reply sent again, and times it from now. The
     /// answer creates it if the room says it's missing.
-    func checkAgain(_ id: String) {
+    func checkAgain(_ id: ClientMessageID) {
         created.remove(id)
         transmit(.checkMessages(clientMessageIds: [id]))
         watchSend(id, again: true)
@@ -348,7 +370,7 @@ import Observation
     }
 
     /// Forgets a pending message. A file on its way up stops.
-    public func discard(_ clientMessageId: String) {
+    public func discard(_ clientMessageId: ClientMessageID) {
         discardUpload(clientMessageId)
         timeline.discard(clientMessageId)
         saveUnsent()
@@ -361,7 +383,7 @@ import Observation
     /// Fails `id`, a room message or a thread's reply, should it still be unconfirmed `sendTimeout`
     /// after it was asked for. A timer already running for it goes on, unless `again`, as a retry
     /// is timed from the retry.
-    func watchSend(_ id: String, again: Bool = false) {
+    func watchSend(_ id: ClientMessageID, again: Bool = false) {
         if !again, sendTimers[id] != nil { return }
         sendTimers[id]?.cancel()
         let timing = client.timing
@@ -372,7 +394,7 @@ import Observation
         }
     }
 
-    private func sendTimedOut(_ id: String) {
+    private func sendTimedOut(_ id: ClientMessageID) {
         sendTimers[id] = nil
         let isUnsent: (PendingMessage) -> Bool = { $0.clientMessageId == id && $0.upload == nil && $0.failure == nil }
         if timeline.pending.contains(where: isUnsent) {
@@ -387,16 +409,61 @@ import Observation
         releaseIfIdle()
     }
 
-    /// Gives `unsentStore` the room's unsent and failed texts and thread replies, when they've
-    /// changed. Nothing until the session knows who you are.
+    /// Hands `unsentStore`'s writer the room's unsent and failed texts and thread replies, when
+    /// they differ from what it was last handed (or, with nothing of it still to write, from what's
+    /// known written). Nothing until the session knows who you are, nor while what was kept is still
+    /// to be read, nor once shut down.
     func saveUnsent() {
-        guard let unsentKey else { return }
+        guard let unsentKey, !isShutDown, unsentReadFailure == nil else {
+            updateUnsentState()
+            return
+        }
         let messages = timeline.pending.filter { $0.upload == nil && $0.parentId == nil }
         let replies = threads.flatMap { $0.timeline.pending.filter { $0.upload == nil } }
         let unsent = (messages + replies).map(UnsentMessage.init) + parkedReplies
-        guard unsent != savedUnsent else { return }
-        savedUnsent = unsent
-        unsentStore.save(unsent, for: unsentKey)
+        if unsent != (unsentWriter.handed(for: unsentKey) ?? savedUnsent) || unsentRewriteOwed {
+            unsentRewriteOwed = false
+            unsentWriter.save(unsent, for: unsentKey)
+        }
+        updateUnsentState()
+    }
+
+    /// Waits for the room's unsent messages to be written, as they are now. What couldn't be read
+    /// before is read again first, and a write that failed is tried again. Throws the store's
+    /// error should either fail; the session goes on working, and tries again later.
+    public func flushUnsent() async throws {
+        if unsentReadFailure != nil, !isShutDown { readUnsent() }
+        if let unsentReadFailure { throw unsentReadFailure }
+        guard let unsentKey else { return }
+        saveUnsent()
+        try await unsentWriter.flush(unsentKey)
+    }
+
+    /// Reads again what couldn't be read, or hands over again what couldn't be written.
+    private func retryUnsent() {
+        guard let unsentKey, !isShutDown else { return }
+        if unsentReadFailure != nil {
+            readUnsent()
+        } else {
+            unsentWriter.retry(unsentKey)
+            saveUnsent()
+        }
+    }
+
+    /// How a write of the session's key went, from its writer.
+    func unsentWritten(_ outcome: UnsentWriter.Outcome) {
+        switch outcome {
+        case let .saved(messages): savedUnsent = messages
+        case .removed: savedUnsent = []
+        case .failed: break
+        }
+        updateUnsentState()
+    }
+
+    private func updateUnsentState() {
+        let state: UnsentState =
+            if let unsentReadFailure { .failed(unsentReadFailure) } else if let unsentKey { unsentWriter.state(for: unsentKey) } else { .saved }
+        if unsentState != state { unsentState = state }
     }
 
     /// Says who's signed in before the room's first welcome does, so what's unsent is read and kept
@@ -406,80 +473,90 @@ import Observation
     }
 
     /// Once the session knows who you are: what `unsentStore` kept for you here comes back as
-    /// pending, under the same ids, so the welcome's check (a thread's, for a reply) asks about them
-    /// and the room's answer sends the missing. A thread with a reply still on its way is kept to
-    /// send it; one whose replies all failed waits until it's asked for. What was sent before now is
-    /// saved now.
+    /// pending (`readUnsent()`).
     private func restoreUnsent(for userID: UserID) {
         guard unsentKey == nil else { return }
         let key = UnsentMessageKey(server: client.origin, userID: userID, roomID: roomID)
         unsentKey = key
-        let saved = unsentStore.messages(for: key)
-        savedUnsent = saved
+        unsentWriter.listen(self, to: key)
+        readUnsent()
+    }
+
+    /// What's kept for the session's key, from what its writer was last handed when that's still
+    /// to be written, else from `unsentStore`, comes back as pending, under the same ids, joining
+    /// what's pending already. Then what's unsent now is saved.
+    ///
+    /// A file that couldn't be read in part brings back what could, and is written again, once.
+    /// One that couldn't be read at all, and was moved aside, brings back nothing, and saving goes
+    /// on as for none (`unsentLoss` says which). Any other failure leaves the file as it is: nothing
+    /// is written over it until it reads, at the next retry.
+    private func readUnsent() {
+        guard let unsentKey else { return }
+        let saved: [UnsentMessage]
+        if let handed = unsentWriter.handed(for: unsentKey) {
+            saved = handed
+        } else {
+            do {
+                saved = try unsentStore.messages(for: unsentKey)
+                savedUnsent = saved
+            } catch {
+                let error = UnsentStoreError(error, as: .unreadable)
+                guard error.kind == .corrupt else {
+                    unsentReadFailure = error
+                    updateUnsentState()
+                    return
+                }
+                unsentLoss = error
+                saved = error.recovered ?? []
+                savedUnsent = saved
+                unsentRewriteOwed = error.recovered != nil
+            }
+        }
+        unsentReadFailure = nil
+        restoreUnsent(saved)
+        saveUnsent()
+    }
+
+    /// `saved`, those not pending already, as pending: a room message for the welcome's check, or
+    /// for its own once the room has let the socket in. A thread with a reply still on its way is
+    /// kept to send it; one whose replies all failed waits until it's asked for.
+    private func restoreUnsent(_ saved: [UnsentMessage]) {
         let known = Set((timeline.pending + threads.flatMap(\.timeline.pending)).map(\.clientMessageId))
         let unknown = saved.filter { !known.contains($0.clientMessageId) }
         for message in unknown where message.parentId == nil {
             _ = timeline.send(body: message.body, plainText: message.plainText, clientMessageId: message.clientMessageId, now: message.createdAt)
-            if let failure = message.failure { _ = timeline.fail(message.clientMessageId, reason: failure) }
+            if let failure = message.failure {
+                _ = timeline.fail(message.clientMessageId, reason: failure)
+            } else if admitted {
+                checkAgain(message.clientMessageId)
+            }
         }
-        var replies: [String: [UnsentMessage]] = [:]
-        var parents: [String] = []
+        var replies: [MessageID: [UnsentMessage]] = [:]
+        var parents: [MessageID] = []
         for message in unknown {
             guard let parent = message.parentId else { continue }
             if replies[parent] == nil { parents.append(parent) }
             replies[parent, default: []].append(message)
         }
+        var kept = false
         for parent in parents {
             let group = replies[parent] ?? []
-            if group.contains(where: { $0.failure == nil }) {
+            if group.contains(where: { $0.failure == nil }), !isShutDown {
                 let thread = thread(parent)
                 thread.restore(group)
                 keep(thread)
+                kept = true
             } else {
                 parkedReplies += group
             }
         }
-        saveUnsent()
+        // Each thread's opening checks its replies, as the welcome would have.
+        if kept, admitted { reopenThreads() }
     }
 
-    /// What `notice` says when an edit, deletion or boost can't go because the room hasn't let the
-    /// socket in.
+    /// The message an edit, deletion or boost throws (`kind` `.unreachable`) when it can't go
+    /// because the room isn't connected.
     public static let notConnected = "Not connected. Try again once you’re reconnected."
-
-    /// Edits one of your messages. Unlike a new message, it isn't kept to send later: false, with
-    /// `notice` saying so, when the socket isn't open.
-    @discardableResult
-    public func edit(_ messageID: String, body: String) -> Bool {
-        sendOrWarn(.updateMessage(messageId: messageID, body: body))
-    }
-
-    /// Deletes one of your messages. False, with `notice` saying so, when the socket isn't open.
-    @discardableResult
-    public func delete(_ messageID: String) -> Bool {
-        sendOrWarn(.deleteMessage(messageId: messageID))
-    }
-
-    /// Boosts a message with an emoji or a few words, trimmed. False, sending nothing, when it doesn't
-    /// fit (`Limits.boostFits`), or, with `notice` saying so, when the socket isn't open.
-    @discardableResult
-    public func boost(_ messageID: String, content: String) -> Bool {
-        guard Limits.boostFits(content) else { return false }
-        return sendOrWarn(.createBoost(messageId: messageID, content: Limits.trimmedBoost(content)))
-    }
-
-    /// Takes back one of your boosts. False, with `notice` saying so, when the socket isn't open.
-    @discardableResult
-    public func removeBoost(_ boostID: String) -> Bool {
-        sendOrWarn(.deleteBoost(boostId: boostID))
-    }
-
-    private func sendOrWarn(_ frame: ClientFrame) -> Bool {
-        guard admitted, socket?.send(frame.text) == true else {
-            notice = Self.notConnected
-            return false
-        }
-        return true
-    }
 
     // MARK: Typing
 
@@ -597,7 +674,7 @@ import Observation
     }
 
     /// Shows the page around a message (`history.around`); `timeline.anchor` says where to scroll.
-    public func jump(to messageID: String) {
+    public func jump(to messageID: MessageID) {
         forgetWantedPages()
         jumpTarget = messageID
         isJumping = true
@@ -625,7 +702,7 @@ import Observation
         timeline.clearAnchor()
     }
 
-    private func askAround(_ messageID: String?) {
+    private func askAround(_ messageID: MessageID?) {
         aroundsAsked += 1
         transmit(timeline.pageAround(messageID))
     }
@@ -664,7 +741,7 @@ import Observation
         /// What changed since the timeline's `seq`, or the newest page for a timeline not loaded yet.
         case catchUp
         /// The page around a message.
-        case message(String)
+        case message(MessageID)
         /// The newest page, whatever the timeline shows.
         case latest
     }
@@ -694,7 +771,7 @@ import Observation
         }
     }
 
-    private func socketChanged(_ status: ReconnectingSocket.Status) {
+    private func socketChanged(_ status: ConnectionStatus) {
         self.status = status
         let phase: Phase = switch status {
         case .idle: .idle
@@ -732,7 +809,9 @@ import Observation
     func handle(_ frame: ServerFrame) {
         switch frame {
         case let .welcome(you, _, _, _):
-            restoreUnsent(for: you.id)
+            // Read (or read again, after a failure) before the welcome's check, which asks about
+            // what's pending.
+            if unsentKey == nil { restoreUnsent(for: you.id) } else if unsentReadFailure != nil { readUnsent() }
             admitted = true
             if phase != .admitted { phase = .admitted }
         case .resumed:
@@ -847,6 +926,6 @@ extension RoomSession {
         /// The connection dropped after the room had let it in, and is being made again.
         case reconnecting
         /// The server said not to come back.
-        case stopped(ReconnectingSocket.StopReason)
+        case stopped(ConnectionStatus.StopReason)
     }
 }

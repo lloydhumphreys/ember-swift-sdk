@@ -10,7 +10,7 @@ private func welcomed(_ messages: [Message] = [], hasNewer: Bool = false) -> Tim
 
 private let pdf = PendingUpload(name: "Q3 report.pdf", contentType: "application/pdf", byteSize: 1000)
 
-private func file(_ id: String, _ clientMessageId: String) -> Message {
+private func file(_ id: MessageID, _ clientMessageId: ClientMessageID) -> Message {
     message(id, by: ada, clientMessageId: clientMessageId, text: "Q3 report.pdf")
 }
 
@@ -23,9 +23,9 @@ private func file(_ id: String, _ clientMessageId: String) -> Message {
         #expect(PendingUpload(name: "a", contentType: "", byteSize: 200, sentBytes: 200).isProcessing)
     }
 
-    @Test func alsoSendOnlyWithAThread() {
-        #expect(!PendingMessage(clientMessageId: "c", body: "", plainText: "", createdAt: noon(), alsoSend: true).alsoSend)
-        #expect(PendingMessage(clientMessageId: "c", body: "", plainText: "", createdAt: noon(), parentId: "m1", alsoSend: true).alsoSend)
+    @Test func threadAndRoomOnlyWithAThread() {
+        #expect(PendingMessage(clientMessageId: "c", body: "", plainText: "", createdAt: noon(), delivery: .threadAndRoom).delivery == .threadOnly)
+        #expect(PendingMessage(clientMessageId: "c", body: "", plainText: "", createdAt: noon(), parentId: "m1", delivery: .threadAndRoom).delivery == .threadAndRoom)
         let old = PendingMessage(clientMessageId: "c", body: "b", plainText: "p", createdAt: noon(), failure: "No")
         #expect(old.parentId == nil && old.upload == nil && old.failure == "No")
     }
@@ -69,7 +69,7 @@ private func file(_ id: String, _ clientMessageId: String) -> Message {
 
     @Test func aThreadsProgressNeverGoesBackUntilTheFileIsRetried() {
         var thread = ThreadTimeline(parentId: "m001", me: ada)
-        thread.attach(pdf, alsoSend: false, clientMessageId: "c1", now: noon())
+        thread.attach(pdf, delivery: .threadOnly, clientMessageId: "c1", now: noon())
         thread.uploadProgress("c1", sentBytes: 600)
         thread.uploadProgress("c1", sentBytes: 400)
         #expect(thread.pending[0].upload?.sentBytes == 600)
@@ -148,11 +148,11 @@ private func file(_ id: String, _ clientMessageId: String) -> Message {
         func text(_ upload: NewUpload) throws -> JSONValue? { json(String(decoding: try encoder.encode(upload), as: UTF8.self)) }
         #expect(try text(NewUpload(name: "a.png", type: "image/png", size: 3, clientMessageId: "c1"))
             == json(#"{"name":"a.png","type":"image/png","size":3,"clientMessageId":"c1"}"#))
-        #expect(try text(NewUpload(name: "a.png", type: "", size: 0, clientMessageId: "c1", alsoSend: true))
+        #expect(try text(NewUpload(name: "a.png", type: "", size: 0, clientMessageId: "c1", delivery: .threadAndRoom))
             == json(#"{"name":"a.png","type":"","size":0,"clientMessageId":"c1"}"#))
         #expect(try text(NewUpload(name: "a.png", type: "image/png", size: 3, clientMessageId: "c1", parentId: "m1"))
             == json(#"{"name":"a.png","type":"image/png","size":3,"clientMessageId":"c1","parentId":"m1"}"#))
-        #expect(try text(NewUpload(name: "a.png", type: "image/png", size: 3, clientMessageId: "c1", parentId: "m1", alsoSend: true))
+        #expect(try text(NewUpload(name: "a.png", type: "image/png", size: 3, clientMessageId: "c1", parentId: "m1", delivery: .threadAndRoom))
             == json(#"{"name":"a.png","type":"image/png","size":3,"clientMessageId":"c1","parentId":"m1","alsoSend":true}"#))
         let decoded = try EmberJSON.decoder().decode(NewUpload.self, from: Data(#"{"name":"a","type":"","size":1,"clientMessageId":"c"}"#.utf8))
         #expect(decoded == NewUpload(name: "a", type: "", size: 1, clientMessageId: "c"))

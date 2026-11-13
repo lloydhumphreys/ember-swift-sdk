@@ -1474,6 +1474,567 @@ await check("an unknown key is 401, a bot that isn't in the room is an empty 404
   expectStatus(unknownRoom, 404);
 });
 
+// Rooms, sidebar order, profiles, people, transfers, resets, invitations and link previews
+
+const workspaceSocket = async (cookie) => {
+  const client = await tracked("/api/socket", { cookie });
+  await client.nextOfType("welcome");
+  return client;
+};
+const cookieOf = (res) => (res.headers["set-cookie"] ?? []).map((line) => line.split(";")[0]).find((pair) => pair.startsWith("session_token="));
+const signInWith = (email, secret) => request("POST", "/api/session", { body: { emailAddress: email, password: secret } });
+const directory = async () => Object.fromEntries((await request("GET", "/api/users", { cookie: state.maya })).json.users.map((person) => [person.name.split(" ")[0].normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase(), person]));
+const outbox = async () => (await request("GET", "/mock/outbox")).json;
+const noFrame = (type) => (frame) => frame.type === type;
+
+await check("an administrator has the invitation card, a member hasn't, and dismissing it is told to that person alone", async () => {
+  const card = (await request("GET", "/api/sidebar", { cookie: state.maya })).json.invitation;
+  expect(card && card.roomId && /^[a-z0-9]{12}$/.test(card.joinCode), "Maya has the card, with a room and a join code");
+  expect((await request("GET", "/api/sidebar", { cookie: state.sam })).json.invitation === null, "Sam has none");
+  const maya = await workspaceSocket(state.maya);
+  const sam = await workspaceSocket(state.sam);
+  expectStatus(await request("DELETE", "/api/sidebar/invitation"), 401);
+  expectStatus(await request("DELETE", "/api/sidebar/invitation", { cookie: state.maya }), 204);
+  await maya.nextOfType("invitation.dismissed");
+  expect(await sam.quiet(noFrame("invitation.dismissed")), "only the person who dismissed it hears");
+  expect((await request("GET", "/api/sidebar", { cookie: state.maya })).json.invitation === null, "it is gone for Maya");
+});
+
+await check("making a room: its shape, who hears of it, and what is refused", async () => {
+  const maya = await workspaceSocket(state.maya);
+  const sam = await workspaceSocket(state.sam);
+  const leo = await workspaceSocket(state.leo);
+  const people = await directory();
+  expectStatus(await request("POST", "/api/rooms", { body: { kind: "open", name: "x" } }), 401);
+  const open = await request("POST", "/api/rooms", { cookie: state.sam, body: { kind: "open", name: "  Check Open  ", icon: "rocket" } });
+  expectStatus(open, 201);
+  expect(/^[0-9a-z]{16}$/.test(open.json.room.id) && open.json.room.kind === "open" && open.json.room.name === "Check Open" && open.json.room.icon === "rocket", "the room as saved");
+  for (const client of [maya, sam, leo]) expect((await client.nextOfType("room.saved")).room.id === open.json.room.id, "everyone hears of an open room");
+  const plain = await request("POST", "/api/rooms", { cookie: state.sam, body: { kind: "open", name: "No icon", icon: "" } });
+  expect(plain.json.room.icon === null, "an empty icon is none");
+  const closed = await request("POST", "/api/rooms", { cookie: state.maya, body: { kind: "closed", name: "Check Closed", memberIds: [people.sam.id, people.leo.id, "nobody-has-this-id"] } });
+  expectStatus(closed, 201);
+  state.closedRoom = closed.json.room.id;
+  for (const client of [sam, leo]) expect((await client.next((frame) => frame.type === "room.saved" && frame.room.id === state.closedRoom, "the closed room")).room.kind === "closed", "its members hear");
+  expect(await maya.quiet((frame) => frame.type === "room.saved" && frame.room.id === state.closedRoom), "the creator isn't added, so doesn't hear");
+  expect((await request("GET", "/api/sidebar", { cookie: state.sam })).json.rooms.some((room) => room.id === state.closedRoom), "Sam has it in the sidebar");
+  const refused = async (body, message) => {
+    const res = await request("POST", "/api/rooms", { cookie: state.sam, body });
+    expect(res.status === 422 && res.json.error === message, `${JSON.stringify(body)} gave ${res.status} ${res.json?.error}`);
+  };
+  await refused({ kind: "secret", name: "x" }, 'Kind must be "open" or "closed"');
+  await refused({ kind: "open", name: "   " }, "Name must be 1 to 100 characters");
+  await refused({ kind: "open", name: "x".repeat(101) }, "Name must be 1 to 100 characters");
+  await refused({ kind: "open", name: "ok", icon: "Not An Icon!" }, 'Icon must be one of the room icons, or "" for the default');
+  await refused({ kind: "closed", name: "ok", memberIds: "everyone" }, "Members must be a list of at most 1000 user ids");
+  expect((await request("POST", "/api/rooms", { cookie: state.sam, headers: { "Content-Type": "text/plain" } })).status === 422, "no body is refused");
+  state.openRoom = open.json.room.id;
+});
+
+await check("the new room form lists everyone active, and the room's settings its people and who can change it", async () => {
+  expectStatus(await request("GET", "/api/rooms/new"), 401);
+  const form = await request("GET", "/api/rooms/new", { cookie: state.sam });
+  expectStatus(form, 200);
+  expect(form.json.people.length >= 7 && form.json.people.every((person) => person.id && person.name && Object.keys(person).length === 2), "people with an id and a name");
+  expect(form.json.people.some((person) => person.name === "Maya Chen" || person.name.startsWith("Maya")), "Maya is there");
+  const settings = await request("GET", `/api/rooms/${state.closedRoom}/settings`, { cookie: state.sam });
+  expectStatus(settings, 200);
+  expect(settings.json.room.id === state.closedRoom && settings.json.room.kind === "closed" && settings.json.room.name === "Check Closed" && settings.json.room.icon === null, "the room");
+  expect(settings.json.canAdminister === false, "Sam is neither an administrator nor its creator");
+  const members = settings.json.people.filter((person) => person.member).map((person) => person.name.split(" ")[0]).sort();
+  expect(members.join() === "Leo,Sam", `members were ${members}`);
+  const own = await request("GET", `/api/rooms/${state.openRoom}/settings`, { cookie: state.sam });
+  expect(own.json.canAdminister === true, "the creator can");
+  expect((await request("GET", `/api/rooms/${state.openRoom}/settings`, { cookie: state.maya })).json.canAdminister === true, "an administrator can");
+  for (const [who, id] of [[state.maya, state.closedRoom], [state.sam, state.samDm], [state.sam, "no-such-room"], [state.sam, "Bad Id"]]) {
+    const res = await request("GET", `/api/rooms/${encodeURIComponent(id)}/settings`, { cookie: who });
+    expect(res.status === 404 && res.json.error === "Room not found or inaccessible", `${id} gave ${res.status}`);
+  }
+  expectStatus(await request("GET", `/api/rooms/${state.openRoom}/settings`), 401);
+});
+
+await check("changing a room: who may, what is refused, and who hears", async () => {
+  const room = state.openRoom;
+  const path = `/api/rooms/${room}`;
+  const people = await directory();
+  const maya = await workspaceSocket(state.maya);
+  const sam = await workspaceSocket(state.sam);
+  const leo = await workspaceSocket(state.leo);
+  expectStatus(await request("PATCH", path, { body: { name: "Nope" } }), 401);
+  const forbidden = await request("PATCH", path, { cookie: state.leo, body: { name: "Nope" } });
+  expect(forbidden.status === 403 && forbidden.json.error === "Only administrators and the room's creator can change it", "a member who isn't the creator is refused");
+  expectStatus(await request("PATCH", `/api/rooms/${state.closedRoom}`, { cookie: state.maya, body: { name: "Nope" } }), 404);
+  expectStatus(await request("PATCH", `/api/rooms/${state.samDm}`, { cookie: state.sam, body: { name: "Nope" } }), 404);
+  for (const [body, message] of [
+    [{ name: "" }, "Name must be 1 to 100 characters"],
+    [{ icon: "Bad Icon" }, 'Icon must be one of the room icons, or "" for the default'],
+    [{ kind: "closed" }, "Members must be a list of at most 1000 user ids"],
+    [{ kind: "closed", memberIds: [5] }, "Members must be a list of at most 1000 user ids"],
+    [{ kind: "secret" }, 'Kind must be "open" or "closed"'],
+  ]) {
+    const res = await request("PATCH", path, { cookie: state.sam, body });
+    expect(res.status === 422 && res.json.error === message, `${JSON.stringify(body)} gave ${res.status} ${res.json?.error}`);
+  }
+  const same = await request("PATCH", path, { cookie: state.sam, body: {} });
+  expect(same.status === 200 && same.json.room.name === "Check Open", "nothing asked changes nothing");
+  expect(await sam.quiet(noFrame("room.saved")), "and says nothing");
+  const renamed = await request("PATCH", path, { cookie: state.sam, body: { name: "Renamed", icon: "star" } });
+  expect(renamed.status === 200 && renamed.json.room.name === "Renamed" && renamed.json.room.icon === "star" && renamed.json.room.kind === "open", "the room as it is now");
+  for (const client of [maya, sam, leo]) {
+    const saved = await client.next((frame) => frame.type === "room.saved" && frame.room.id === room, "room.saved");
+    expect(saved.room.name === "Renamed", "everyone in it hears its new name");
+  }
+  // Closing keeps exactly the people named: the others are told it is gone and their sockets for it close.
+  const watcher = await roomSocket(room, state.maya);
+  await watcher.nextOfType("welcome");
+  const closed = await request("PATCH", path, { cookie: state.sam, body: { kind: "closed", memberIds: [people.sam.id, people.leo.id] } });
+  expect(closed.status === 200 && closed.json.room.kind === "closed", "closed");
+  expect((await maya.next((frame) => frame.type === "room.gone" && frame.roomId === room, "room.gone")).roomId === room, "Maya is told it is gone");
+  expect((await watcher.whenClosed()).code === 4004, "her socket for it closes as for a room that isn't there");
+  for (const client of [sam, leo]) expect((await client.next((frame) => frame.type === "room.saved" && frame.room.id === room, "room.saved")).room.kind === "closed", "those who stay see it closed");
+  expect((await request("GET", "/api/sidebar", { cookie: state.maya })).json.rooms.every((candidate) => candidate.id !== room), "it left Maya's sidebar");
+  expectStatus(await request("GET", `/api/rooms/${room}/settings`, { cookie: state.maya }), 404);
+  // Only who is in it changed: just the people it adds hear.
+  const added = await request("PATCH", path, { cookie: state.sam, body: { kind: "closed", memberIds: [people.sam.id, people.leo.id, people.jordan.id] } });
+  expectStatus(added, 200);
+  expect(await leo.quiet((frame) => frame.type === "room.saved" && frame.room.id === room), "those already in it aren't told again");
+  // Opening it puts everyone back, and they all hear.
+  expectStatus(await request("PATCH", path, { cookie: state.sam, body: { kind: "open" } }), 200);
+  for (const client of [maya, sam, leo]) expect((await client.next((frame) => frame.type === "room.saved" && frame.room.id === room, "room.saved")).room.kind === "open", "everyone hears it open");
+  expectStatus(await request("GET", `/api/rooms/${room}/settings`, { cookie: state.maya }), 200);
+  // An administrator who is in a room changes it, though they didn't make it.
+  expectStatus(await request("PATCH", path, { cookie: state.maya, body: { name: "By Maya" } }), 200);
+});
+
+await check("deleting a room: its creator or an administrator, 404 to a stranger, and everyone in it is told", async () => {
+  const room = state.openRoom;
+  const maya = await workspaceSocket(state.maya);
+  const leo = await workspaceSocket(state.leo);
+  const watcher = await roomSocket(room, state.leo);
+  await watcher.nextOfType("welcome");
+  expectStatus(await request("DELETE", `/api/rooms/${room}`), 401);
+  const forbidden = await request("DELETE", `/api/rooms/${room}`, { cookie: state.leo });
+  expect(forbidden.status === 403 && forbidden.json.error === "Only administrators and the room's creator can delete it", "a plain member is refused");
+  expectStatus(await request("DELETE", `/api/rooms/${state.closedRoom}`, { cookie: state.maya }), 404);
+  expectStatus(await request("DELETE", "/api/rooms/no-such-room", { cookie: state.maya }), 404);
+  expectStatus(await request("DELETE", `/api/rooms/${room}`, { cookie: state.sam }), 204);
+  for (const client of [maya, leo]) expect((await client.next((frame) => frame.type === "room.gone" && frame.roomId === room, "room.gone")).roomId === room, "members are told");
+  expect((await watcher.whenClosed()).code === 4004, "its sockets close");
+  expectStatus(await request("GET", `/api/rooms/${room}/settings`, { cookie: state.sam }), 404);
+  expect((await request("GET", "/api/sidebar", { cookie: state.leo })).json.rooms.every((candidate) => candidate.id !== room), "it is gone from the sidebar");
+  // The closed room's creator isn't in it, but an administrator who is may delete it; here nobody is, so make it theirs.
+  expectStatus(await request("DELETE", `/api/rooms/${state.closedRoom}`, { cookie: state.sam }), 403);
+  const dm = (await request("POST", "/api/directs", { cookie: state.leo, body: { userIds: [(await directory()).jordan.id] } })).json.room;
+  expectStatus(await request("DELETE", `/api/rooms/${dm.id}`, { cookie: state.maya }), 404);
+  expectStatus(await request("DELETE", `/api/rooms/${dm.id}`, { cookie: state.leo }), 204);
+  expect((await leo.next((frame) => frame.type === "room.gone" && frame.roomId === dm.id, "room.gone for the DM")).roomId === dm.id, "a member may delete a DM");
+});
+
+await check("the order of starred rooms is kept, refused for any other list, and told to that person", async () => {
+  const maya = await workspaceSocket(state.maya);
+  const sam = await workspaceSocket(state.sam);
+  expectStatus(await request("PUT", `/api/rooms/${state.rooms.Design}/favorite`, { cookie: state.maya, body: { favorite: true } }), 200);
+  await maya.nextOfType("favorites.changed");
+  const order = (roomIds) => request("PUT", "/api/sidebar/order", { cookie: state.maya, body: { roomIds } });
+  expectStatus(await request("PUT", "/api/sidebar/order", { body: { roomIds: [] } }), 401);
+  const before = (await request("GET", "/api/sidebar", { cookie: state.maya })).json.favorites;
+  const wanted = [state.rooms.Design, state.rooms.Launch];
+  const done = await order(wanted);
+  expectStatus(done, 200);
+  expect(done.json.favorites.rooms.join() === wanted.join() && done.json.favorites.version === before.version + 1, "the new order and version");
+  const frame = await maya.nextOfType("favorites.changed");
+  expect(frame.favorites.rooms.join() === wanted.join() && frame.favorites.version === done.json.favorites.version, "she is told");
+  expect(await sam.quiet(noFrame("favorites.changed")), "nobody else is");
+  expect((await request("GET", "/api/sidebar", { cookie: state.maya })).json.favorites.rooms.join() === wanted.join(), "the sidebar has it");
+  for (const roomIds of [[state.rooms.Design], [state.rooms.Design, state.rooms.Launch, state.rooms.Support], [state.rooms.Design, state.rooms.Support]]) {
+    const res = await order(roomIds);
+    expect(res.status === 403 && res.json.error === "Those aren't the rooms you've starred", "not exactly the starred rooms");
+  }
+  for (const [roomIds, message] of [[undefined, "roomIds must be an array"], ["Design", "roomIds must be an array"], [[state.rooms.Design, state.rooms.Design], "room IDs must be unique and valid"], [["Bad Id"], "room IDs must be unique and valid"], [[5], "room IDs must be unique and valid"], [Array.from({ length: 4097 }, (_, i) => `r${i}`), "too many rooms"]]) {
+    const res = await order(roomIds);
+    expect(res.status === 400 && res.json.error === message, `${JSON.stringify(roomIds)?.slice(0, 30)} gave ${res.status} ${res.json?.error}`);
+  }
+});
+
+await check("an administrator puts rooms in order for everyone, and everyone is told without a list", async () => {
+  const maya = await workspaceSocket(state.maya);
+  const sam = await workspaceSocket(state.sam);
+  const put = (cookie, roomIds) => request("PUT", "/api/account/room_order", { cookie, body: { roomIds } });
+  expectStatus(await request("PUT", "/api/account/room_order", { body: { roomIds: [] } }), 401);
+  const message = "Only administrators can put rooms in order for everyone, and only the rooms in their sidebar";
+  const member = await put(state.sam, [state.rooms.Design]);
+  expect(member.status === 403 && member.json.error === message, "a member is refused");
+  const wanted = [state.rooms.Support, state.rooms.Design, state.rooms.Launch];
+  const done = await put(state.maya, wanted);
+  expectStatus(done, 200);
+  expect(done.json.sharedOrder.join() === wanted.join(), "the order comes back");
+  for (const client of [maya, sam]) {
+    const frame = await client.nextOfType("rooms.reordered");
+    expect(Object.keys(frame).join() === "type", "a frame with no payload");
+  }
+  expect((await request("GET", "/api/sidebar", { cookie: state.sam })).json.sharedOrder.join() === wanted.join(), "Sam's sidebar has it");
+  for (const roomIds of [[state.samDm], [state.closedRoom], ["no-such-room"]]) {
+    const res = await put(state.maya, roomIds);
+    expect(res.status === 403 && res.json.error === message, "a DM, or a room outside her sidebar, is refused");
+  }
+  for (const [roomIds, error] of [[undefined, "roomIds must be an array"], [[state.rooms.Design, state.rooms.Design], "room IDs must be unique and valid"], [["Bad Id"], "room IDs must be unique and valid"]]) {
+    const res = await put(state.maya, roomIds);
+    expect(res.status === 400 && res.json.error === error, `${JSON.stringify(roomIds)} gave ${res.status}`);
+  }
+  const cleared = await put(state.maya, []);
+  expect(cleared.status === 200 && cleared.json.sharedOrder.length === 0, "an empty list clears the order");
+  await maya.nextOfType("rooms.reordered");
+  expect((await request("GET", "/api/sidebar", { cookie: state.sam })).json.sharedOrder.length === 0, "and Sam sees none");
+});
+
+await check("your profile: its shape, a changed bio and name told to everyone, and what is refused", async () => {
+  expectStatus(await request("GET", "/api/users/me/profile"), 401);
+  const cookie = await signIn("jordan@example.com");
+  const shown = await request("GET", "/api/users/me/profile", { cookie });
+  expectStatus(shown, 200);
+  const { profile } = shown.json;
+  expect(profile.emailAddress === "jordan@example.com" && profile.password === true && profile.avatar === false && profile.membershipNeeded === false && profile.memberful === null && profile.assistant === null, "the profile");
+  expect(/^\/users\/[^/]+\/avatar\?v=\d+$/.test(profile.avatarUrl) && typeof profile.bio !== "undefined", "an avatar address and a bio");
+  expect(/^[^.]+\.[^.]+\.[0-9a-z]+\.[A-Za-z0-9_-]+$/.test(shown.json.transferId), "a transfer id");
+  expect(shown.headers["cache-control"] === "no-store", "never cached");
+  const maya = await workspaceSocket(state.maya);
+  const patch = (body, who = cookie) => request("PATCH", "/api/users/me/profile", { cookie: who, body });
+  const changed = await patch({ name: "Jordan Changed", bio: "  Likes plants  " });
+  expectStatus(changed, 200);
+  expect(changed.json.profile.name === "Jordan Changed" && changed.json.profile.bio === "  Likes plants  ", "the name and bio are saved as typed");
+  const frame = await maya.nextOfType("user.updated");
+  expect(frame.user.name === "Jordan Changed" && frame.user.bio === "  Likes plants  " && frame.user.status === "active" && Object.keys(frame.user).sort().join() === "avatarUrl,bio,id,name,role,status", "everyone hears the directory entry");
+  expect((await patch({ bio: "" })).json.profile.bio === null, "a blank bio is none");
+  await maya.nextOfType("user.updated");
+  expectStatus(await patch({}), 200);
+  expect(await maya.quiet(noFrame("user.updated")), "no change, no frame");
+  for (const [body, message] of [
+    [[], "Expected a JSON object"],
+    [{ name: 5 }, "Name must be text"],
+    [{ emailAddress: false }, "Email address must be text"],
+    [{ password: 1 }, "Password must be text"],
+    [{ bio: {} }, "Bio must be text"],
+    [{ currentPassword: 1 }, "Current password must be text"],
+    [{ pushSubscriptionEndpoint: 1 }, "Push subscription endpoint must be text"],
+    [{ name: "x".repeat(101) }, "Name must be at most 100 characters"],
+    [{ emailAddress: `${"x".repeat(250)}@example.com` }, "Email address must be at most 254 characters"],
+    [{ password: "short" }, "Password must be at least 8 characters."],
+    [{ password: "x".repeat(73) }, "Password must be at most 72 characters."],
+    [{ bio: "x".repeat(201) }, "Bio must be at most 200 characters"],
+    [{ emailAddress: "someone.else@example.com" }, "Enter your current password to change your email address or password."],
+    [{ password: "a new password", currentPassword: "not it" }, "That isn't your current password."],
+    [{ emailAddress: "someone.else@example.com", currentPassword: "" }, "Enter your current password to change your email address or password."],
+    [{ name: "Ember" }, "Ember is the AI assistant's name. Choose another."],
+    [{ name: " @EMBER " }, "Ember is the AI assistant's name. Choose another."],
+    [{ emailAddress: "sam@example.com", currentPassword: password }, "That email address has an account already"],
+  ]) {
+    const res = await patch(body);
+    expect(res.status === 422 && res.json.error === message, `${JSON.stringify(body).slice(0, 40)} gave ${res.status} ${res.json?.error}`);
+  }
+  expectStatus(await patch({ name: "x" }, null), 401);
+});
+
+await check("a new password ends the other sessions, and a new email address signs in", async () => {
+  const first = await signIn("jordan@example.com");
+  const second = await signIn("jordan@example.com");
+  const other = await workspaceSocket(first);
+  const here = await workspaceSocket(second);
+  const changed = await request("PATCH", "/api/users/me/profile", { cookie: second, body: { password: "a brand new secret", emailAddress: "Jordan.New@Example.com", currentPassword: password } });
+  expectStatus(changed, 200);
+  expect(changed.json.profile.emailAddress === "jordan.new@example.com", "the address is kept lower case");
+  expect((await other.whenClosed()).code === 4001, "the other session's socket is told to reconnect");
+  expectStatus(await request("GET", "/api/me", { cookie: first }), 401);
+  expectStatus(await request("GET", "/api/me", { cookie: second }), 200);
+  expect(await here.quiet(() => false, 200) && !here.closed, "this session's socket stays open");
+  expectStatus(await signInWith("jordan@example.com", "a brand new secret"), 401);
+  expectStatus(await signInWith("jordan.new@example.com", password), 401);
+  expectStatus(await signInWith("jordan.new@example.com", "a brand new secret"), 201);
+  const again = await request("PATCH", "/api/users/me/profile", { cookie: second, body: { password: "another secret one", currentPassword: "a brand new secret" } });
+  expectStatus(again, 200);
+  const noChange = await request("PATCH", "/api/users/me/profile", { cookie: second, body: { password: "", emailAddress: "jordan.new@example.com" } });
+  expectStatus(noChange, 200);
+});
+
+await check("an avatar: its form is checked, the variant is served, the version moves, and everyone is told", async () => {
+  const cookie = await signIn("priya@example.com");
+  const maya = await workspaceSocket(state.maya);
+  const before = (await request("GET", "/api/users/me/profile", { cookie })).json.profile;
+  const form = (parts) => multipart(parts);
+  const put = (parts, extra = {}) => {
+    const { headers, body } = form(parts);
+    return raw("PUT", "/api/users/me/avatar", { cookie, headers, body, ...extra });
+  };
+  const good = png(300, 300, 400);
+  const variant = png(64, 64, 200);
+  expectStatus(await raw("PUT", "/api/users/me/avatar", { body: Buffer.from("x") }), 401);
+  const chunked = await put([{ name: "avatar", filename: "me.png", type: "image/png", bytes: good }], { chunked: true });
+  expect(chunked.status === 411 && chunked.json.error === "A picture needs its Content-Length", "no Content-Length");
+  const notForm = await raw("PUT", "/api/users/me/avatar", { cookie, headers: { "Content-Type": "application/json" }, body: Buffer.from("{}") });
+  expect(notForm.status === 400 && notForm.json.error === "Expected a form", "not a form");
+  const none = await put([{ name: "variant", filename: "v.png", type: "image/png", bytes: variant }]);
+  expect(none.status === 400 && none.json.error === "Choose a picture", "no avatar part");
+  const text = await put([{ name: "avatar", bytes: Buffer.from("not a file") }]);
+  expect(text.status === 400 && text.json.error === "Choose a picture", "an avatar that isn't a file");
+  const textVariant = await put([{ name: "avatar", filename: "me.png", type: "image/png", bytes: good }, { name: "variant", bytes: Buffer.from("text") }]);
+  expect(textVariant.status === 400 && textVariant.json.error === "A variant is a picture", "a variant that isn't a file");
+  const wrongType = await put([{ name: "avatar", filename: "me.png", type: "image/png", bytes: good }, { name: "variant", filename: "v.txt", type: "text/plain", bytes: Buffer.from("hello there") }]);
+  expect(wrongType.status === 415 && wrongType.json.error === "A variant is a WebP, PNG or JPEG image", "a variant that isn't a picture");
+  const big = await put([{ name: "avatar", filename: "me.png", type: "image/png", bytes: good }, { name: "variant", filename: "v.png", type: "image/png", bytes: png(600, 600, 200) }]);
+  expect(big.status === 422 && big.json.error === "A variant fits within 512×512", "a variant that is too big");
+  const huge = await put([{ name: "avatar", filename: "me.png", type: "image/png", bytes: Buffer.alloc(16_000_001, 1) }]);
+  expect(huge.status === 413 && huge.json.error === "Photos must be 16 MB or smaller.", "an avatar over 16 MB");
+  expect(await maya.quiet(noFrame("user.updated")), "nothing refused is told");
+  const done = await put([{ name: "avatar", filename: "me.png", type: "image/png", bytes: good }, { name: "variant", filename: "v.png", type: "image/png", bytes: variant }]);
+  expectStatus(done, 200);
+  expect(done.json.profile.avatar === true && done.json.profile.avatarUrl !== before.avatarUrl, "the profile has an avatar at a new address");
+  const frame = await maya.nextOfType("user.updated");
+  expect(frame.user.avatarUrl === done.json.profile.avatarUrl, "everyone hears the address");
+  const served = await raw("GET", done.json.profile.avatarUrl);
+  expect(served.status === 200 && served.headers["content-type"] === "image/png" && served.bytes.equals(variant), "the variant is what is served");
+  const again = await put([{ name: "avatar", filename: "me.png", type: "image/png", bytes: good }, { name: "variant", filename: "v.png", type: "image/png", bytes: png(32, 32, 100) }]);
+  expect(again.json.profile.avatarUrl !== done.json.profile.avatarUrl, "a second change in the same second still moves the version");
+  await maya.nextOfType("user.updated");
+  const svg = await put([{ name: "avatar", filename: "me.svg", type: "image/svg+xml", bytes: Buffer.from("<svg xmlns='http://www.w3.org/2000/svg'/>") }]);
+  expect(svg.status === 200 && svg.json.profile.avatar === true, "a type that isn't resized is kept");
+  expect((await raw("GET", svg.json.profile.avatarUrl)).headers["content-type"] === "image/svg+xml", "and is served as initials");
+  await maya.nextOfType("user.updated");
+  expectStatus(await request("DELETE", "/api/users/me/avatar"), 401);
+  const removed = await request("DELETE", "/api/users/me/avatar", { cookie });
+  expect(removed.status === 200 && removed.json.profile.avatar === false, "removed");
+  expect((await maya.nextOfType("user.updated")).user.avatarUrl === removed.json.profile.avatarUrl, "and told");
+  const nothing = await request("DELETE", "/api/users/me/avatar", { cookie });
+  expect(nothing.status === 200 && nothing.json.profile.avatar === false && nothing.json.profile.avatarUrl === removed.json.profile.avatarUrl, "removing none changes nothing");
+  expect(await maya.quiet(noFrame("user.updated")), "and says nothing");
+});
+
+await check("a person's page shows their email address and a transfer id to administrators alone", async () => {
+  const people = await directory();
+  expectStatus(await request("GET", `/api/users/${people.sam.id}`), 401);
+  const plain = await request("GET", `/api/users/${people.amara.id}`, { cookie: state.leo });
+  expectStatus(plain, 200);
+  expect(plain.json.person.name === people.amara.name && !("emailAddress" in plain.json.person) && !("transferId" in plain.json), "a member gets neither");
+  expect(plain.headers["cache-control"] === "no-store", "never cached");
+  const admin = await request("GET", `/api/users/${people.amara.id}`, { cookie: state.maya });
+  expect(admin.json.person.emailAddress === "amara@example.com" && /\./.test(admin.json.transferId), "an administrator gets both");
+  const bot = await request("GET", "/api/users/ember", { cookie: state.maya });
+  expect(bot.status === 200 && bot.json.person.role === "bot" && bot.json.person.emailAddress === null && !("transferId" in bot.json), "a bot has no address and no transfer");
+  const missing = await request("GET", "/api/users/nobody", { cookie: state.maya });
+  expect(missing.status === 404 && missing.json.error === "Not found", "nobody is 404");
+});
+
+await check("a transfer signs in as the person it names, only from a live session that may show it", async () => {
+  const people = await directory();
+  const transfer = (transferId) => request("POST", "/api/session/transfers", { body: { transferId } });
+  const maya = await signIn(emails.maya);
+  const id = (await request("GET", `/api/users/${people.tomas.id}`, { cookie: maya })).json.transferId;
+  const done = await transfer(id);
+  expectStatus(done, 201);
+  expect(done.json.user.name === people.tomas.name && done.json.user.administrator === false, "signed in as Tomas");
+  const cookie = cookieOf(done);
+  expectStatus(await request("GET", "/api/me", { cookie }), 200);
+  const own = (await request("GET", "/api/users/me/profile", { cookie })).json.transferId;
+  expectStatus(await transfer(own), 201);
+  for (const bad of [id.slice(0, -2) + "xx", id.replace(/^[^.]+/, people.sam.id), "nonsense", "", `${people.tomas.id}.a.b.c`]) {
+    const res = await transfer(bad);
+    expect(res.status === 400 && res.text === "", `a bad id gave ${res.status} ${res.text}`);
+  }
+  for (const body of [{}, { transferId: 5 }, undefined]) {
+    const res = await request("POST", "/api/session/transfers", { body });
+    expect(res.status === 400 && res.text === "", "a missing or odd id gives an empty 400");
+  }
+  // Only a person or an administrator shows it, and only while the session that did is signed in.
+  const shownByMember = (await request("GET", `/api/users/me/profile`, { cookie: state.leo })).json.transferId;
+  expectStatus(await transfer(shownByMember), 201);
+  await request("DELETE", "/api/session", { cookie: maya });
+  expectStatus(await transfer(id), 400);
+  const noBody = await request("POST", "/api/session/transfers", { headers: { Origin: "http://evil.example" }, body: { transferId: id } });
+  expectStatus(noBody, 422);
+});
+
+await check("banning: refused to members and to oneself, ends sessions, deletes messages, and lifting it lets them back", async () => {
+  const people = await directory();
+  const amara = await signIn("amara@example.com");
+  const amaraSocket = await workspaceSocket(amara);
+  const posting = await roomSocket(state.rooms.general, amara);
+  await posting.nextOfType("welcome");
+  const clientMessageId = `check-${randomBytes(4).toString("hex")}`;
+  posting.send({ type: "message.create", clientMessageId, body: "<p>I am about to be banned</p>" });
+  const posted = await posting.next((frame) => frame.type === "message.created" && frame.message.clientMessageId === clientMessageId, "her message");
+  const maya = await workspaceSocket(state.maya);
+  const sam = await workspaceSocket(state.sam);
+  const watcher = await roomSocket(state.rooms.general, state.sam);
+  await watcher.nextOfType("welcome");
+  const ban = (cookie, id) => request("POST", `/api/users/${id}/ban`, { cookie });
+  expectStatus(await ban(undefined, people.amara.id), 401);
+  const refused = await ban(state.sam, people.amara.id);
+  expect(refused.status === 403 && refused.json.error === "Only administrators can ban people", "a member can't");
+  const self = await ban(state.maya, people.maya.id);
+  expect(self.status === 403 && self.json.error === "Administrators can't ban themselves", "nor oneself");
+  for (const id of ["nobody", "ember"]) expect((await ban(state.maya, id)).status === 404, `${id} is 404`);
+  const done = await ban(state.maya, people.amara.id);
+  expectStatus(done, 200);
+  expect(done.json.user.id === people.amara.id && done.json.user.status === "banned" && done.json.user.role === "member", "the person, banned");
+  expect((await amaraSocket.whenClosed()).code === 4003, "her sockets are revoked");
+  expectStatus(await request("GET", "/api/me", { cookie: amara }), 401);
+  for (const client of [maya, sam]) expect((await client.next((frame) => frame.type === "user.updated" && frame.user.id === people.amara.id, "user.updated")).user.status === "banned", "everyone hears");
+  expect((await watcher.next((frame) => frame.type === "message.deleted" && frame.messageId === posted.message.id, "message.deleted")).messageId === posted.message.id, "her messages are deleted from every room");
+  const signedIn = await signInWith("amara@example.com", password);
+  expect(signedIn.status === 401 && signedIn.json.error === "Incorrect email or password. Please try again.", "she can't sign in");
+  expect((await request("GET", "/api/users", { cookie: state.maya })).json.users.find((person) => person.id === people.amara.id).status === "banned", "the directory lists her as banned");
+  expect((await request("GET", `/api/users/${people.amara.id}`, { cookie: state.maya })).json.transferId === undefined, "and offers no transfer");
+  await ban(state.maya, people.amara.id);
+  expect(await maya.quiet((frame) => frame.type === "user.updated" && frame.user.id === people.amara.id), "banning again says nothing");
+  await maya.quiet(() => false, 200);
+  const lift = (cookie, id) => request("DELETE", `/api/users/${id}/ban`, { cookie });
+  expectStatus(await lift(undefined, people.amara.id), 401);
+  const noLift = await lift(state.sam, people.amara.id);
+  expect(noLift.status === 403 && noLift.json.error === "Only administrators can lift bans", "a member can't lift one");
+  expect((await lift(state.maya, "ember")).status === 404 && (await lift(state.maya, "nobody")).status === 404, "nobody to lift is 404");
+  const lifted = await lift(state.maya, people.amara.id);
+  expect(lifted.status === 200 && lifted.json.user.status === "active", "lifted");
+  expect((await sam.next((frame) => frame.type === "user.updated" && frame.user.id === people.amara.id && frame.user.status === "active", "user.updated")).user.status === "active", "everyone hears");
+  expectStatus(await signInWith("amara@example.com", password), 201);
+  await maya.next((frame) => frame.type === "user.updated" && frame.user.status === "active", "user.updated");
+  await lift(state.maya, people.amara.id);
+  expect(await maya.quiet((frame) => frame.type === "user.updated" && frame.user.status === "active"), "lifting again says nothing");
+});
+
+await check("invitations: an administrator invites, a member can't, and a resend replaces the link", async () => {
+  const invite = (cookie, body) => request("POST", "/api/invitations", { cookie, body });
+  expectStatus(await invite(undefined, { emailAddresses: ["a@example.com"] }), 401);
+  const member = await invite(state.sam, "garbage");
+  expect(member.status === 403 && member.json.error === "Only administrators can invite people", "a member is refused before the body is read");
+  for (const [body, message] of [
+    [[], "Expected a JSON object"],
+    [{}, "Give an email address to invite"],
+    [{ emailAddresses: [] }, "Give an email address to invite"],
+    [{ emailAddresses: Array.from({ length: 21 }, (_, i) => `p${i}@example.com`) }, "Invite at most 20 email addresses at once"],
+    [{ emailAddresses: ["fine@example.com", "not an address"] }, "Each must be an email address, such as ann@example.com"],
+    [{ emailAddresses: [5] }, "Each must be an email address, such as ann@example.com"],
+  ]) {
+    const res = await invite(state.maya, body);
+    expect(res.status === 422 && res.json.error === message, `${JSON.stringify(body).slice(0, 40)} gave ${res.status} ${res.json?.error}`);
+  }
+  const before = (await request("GET", "/api/account", { cookie: state.maya })).json.invitations;
+  expect(before.length >= 2 && before.some((entry) => entry.emailAddress === "first.guest@example.com") && before.some((entry) => entry.emailAddress === "second.guest@example.com"), "two are pending from the seed");
+  const done = await invite(state.maya, { emailAddresses: [" New.Person@Example.com ", "MAYA@example.com", "new.person@example.COM", "other.person@example.com"] });
+  expectStatus(done, 200);
+  expect(done.headers["cache-control"] === "no-store", "never cached");
+  const [first, member1, second] = done.json.outcomes;
+  expect(done.json.outcomes.length === 3 && first.emailAddress === "New.Person@Example.com" && second.emailAddress === "other.person@example.com", "in the order given, once each");
+  expect(member1.member === true && member1.emailAddress === "MAYA@example.com" && !("invitation" in member1), "an address with an account is a member");
+  expect(first.invitation.invitedBy === "Maya Chen" && first.invitation.delivery === null && Date.parse(first.invitation.expiresAt) - Date.parse(first.invitation.createdAt) === 7 * 24 * 60 * 60 * 1000, "the invitation");
+  expect(/^http:\/\/[^/]+\/join\/invitation#token=[A-Za-z0-9_-]{43}$/.test(first.link), "a link with a 43-character token");
+  const listed = (await request("GET", "/api/account", { cookie: state.maya })).json.invitations;
+  expect(listed.length === before.length + 2 && listed[0].emailAddress === "other.person@example.com" && listed[1].emailAddress === "New.Person@Example.com", "listed newest first");
+  const looked = (token) => request("POST", "/api/email_links/lookup", { body: { token } });
+  const token = (link) => link.split("#token=")[1];
+  const found = await looked(token(first.link));
+  expect(found.status === 200 && found.json.kind === "invitation" && found.json.emailAddress === "New.Person@Example.com", "the link looks up");
+  const again = (await invite(state.maya, { emailAddresses: ["new.person@example.com"] })).json.outcomes[0];
+  expect(again.invitation.id === first.invitation.id && again.link !== first.link, "inviting again is the same invitation with a new link");
+  expectStatus(await looked(token(first.link)), 404);
+  const resend = (cookie, id) => request("POST", `/api/invitations/${id}/resend`, { cookie });
+  expectStatus(await resend(undefined, first.invitation.id), 401);
+  expect((await resend(state.sam, first.invitation.id)).status === 403, "a member can't resend");
+  const resent = await resend(state.maya, first.invitation.id);
+  expectStatus(resent, 200);
+  expect(resent.json.invitation.id === first.invitation.id && resent.json.link !== again.link, "a new link");
+  expectStatus(await looked(token(again.link)), 404);
+  expectStatus(await looked(token(resent.json.link)), 200);
+  const missing = await resend(state.maya, "nobody");
+  expect(missing.status === 404 && missing.json.error === "Not found", "an unknown invitation is 404");
+  const mailed = (await outbox()).invitationLinks.find((entry) => entry.emailAddress === "New.Person@Example.com");
+  expect(mailed?.link === resent.json.link, "the outbox has the newest link");
+  const drop = (cookie, id) => request("DELETE", `/api/invitations/${id}`, { cookie });
+  expectStatus(await drop(undefined, second.invitation.id), 401);
+  expect((await drop(state.sam, second.invitation.id)).status === 403, "a member can't revoke");
+  expectStatus(await drop(state.maya, second.invitation.id), 204);
+  expectStatus(await drop(state.maya, second.invitation.id), 404);
+  expectStatus(await resend(state.maya, second.invitation.id), 404);
+  const member2 = await request("GET", "/api/account", { cookie: state.sam });
+  expect(member2.status === 200 && member2.json.invitations.length === 0 && member2.json.canAdminister === false && member2.json.joinCode === null, "a member sees none");
+  expect((await request("GET", "/api/account", { cookie: state.maya })).json.canAdminister === true, "an administrator can administer");
+  expectStatus(await request("GET", "/api/account"), 401);
+});
+
+await check("a password reset: a code is asked for and used once, wrong tries are counted, and every session ends", async () => {
+  const ask = (emailAddress) => request("POST", "/api/password_resets", { body: { emailAddress } });
+  const reset = (body) => request("PUT", "/api/password_resets", { body });
+  expect((await request("GET", "/api/bootstrap")).json.passwordResetCodes === true, "the bootstrap says codes work");
+  for (const [body, message] of [[[], "Expected a JSON object"], [{}, "Enter your email address, such as ann@example.com"], [{ emailAddress: "  " }, "Enter your email address, such as ann@example.com"]]) {
+    const res = await request("POST", "/api/password_resets", { body });
+    expect(res.status === 422 && res.json.error === message && res.json.field === "emailAddress", `${JSON.stringify(body)} gave ${res.status}`);
+  }
+  const stranger = await ask("nobody.at.all@example.com");
+  expect(stranger.status === 202 && JSON.stringify(stranger.json) === "{}", "a stranger's address is answered the same");
+  expect((await outbox()).resetCodes.every((entry) => entry.emailAddress !== "nobody.at.all@example.com"), "and nothing is sent");
+  const person = "leo@example.com";
+  const session = await signIn(person);
+  const socket = await workspaceSocket(session);
+  const asked = await ask("  LEO@example.com ");
+  expect(asked.status === 202 && JSON.stringify(asked.json) === "{}", "asked");
+  const code = (await outbox()).resetCodes.find((entry) => entry.emailAddress === person)?.code;
+  expect(/^[0-9]{8}$/.test(code ?? ""), "an 8-digit code");
+  const wrong = code === "00000000" ? "11111111" : "00000000";
+  const bad = (res, field, message) => expect(res.status === 422 && res.json.field === field && res.json.error === message, `gave ${res.status} ${res.json?.error}`);
+  const missing = await reset({ emailAddress: person });
+  expect(missing.status === 400 && missing.json.error === "Email address, code and password are required" && !("field" in missing.json), "fields are required");
+  expectStatus(await request("PUT", "/api/password_resets", { body: [] }), 400);
+  bad(await reset({ emailAddress: person, code: "123", password: "a new password" }), "code", "Enter the 8-digit code from the email.");
+  bad(await reset({ emailAddress: "x".repeat(255), code, password: "a new password" }), "emailAddress", "Email address must be at most 254 characters");
+  bad(await reset({ emailAddress: person, code, password: "short" }), "password", "Password must be at least 8 characters.");
+  bad(await reset({ emailAddress: person, code, password: "x".repeat(73) }), "password", "Password must be at most 72 characters.");
+  const wrongMessage = "That code is wrong or no longer works. Check the newest email from Ember, or send another code.";
+  bad(await reset({ emailAddress: person, code: wrong, password: "a new password" }), "code", wrongMessage);
+  bad(await reset({ emailAddress: "nobody.at.all@example.com", code, password: "a new password" }), "code", wrongMessage);
+  expectStatus(await request("GET", "/api/me", { cookie: session }), 200);
+  const done = await reset({ emailAddress: person, code: `${code.slice(0, 4)} ${code.slice(4)}`, password: "a reset password" });
+  expectStatus(done, 201);
+  expect(done.json.user.name.startsWith("Leo") && cookieOf(done), "signed in with a new session");
+  expect((await socket.whenClosed()).code === 4001, "every old session's socket is told to reconnect");
+  expectStatus(await request("GET", "/api/me", { cookie: session }), 401);
+  expectStatus(await request("GET", "/api/me", { cookie: cookieOf(done) }), 200);
+  expectStatus(await signInWith(person, password), 401);
+  expectStatus(await signInWith(person, "a reset password"), 201);
+  bad(await reset({ emailAddress: person, code, password: "a second password" }), "code", wrongMessage);
+  // Five wrong tries spend a code, so even the right one then fails.
+  await ask(person);
+  const fresh = (await outbox()).resetCodes.find((entry) => entry.emailAddress === person).code;
+  const other = fresh === "00000000" ? "11111111" : "00000000";
+  for (let i = 0; i < 5; i++) bad(await reset({ emailAddress: person, code: other, password: "a third password" }), "code", wrongMessage);
+  bad(await reset({ emailAddress: person, code: fresh, password: "a third password" }), "code", wrongMessage);
+  expectStatus(await signInWith(person, "a reset password"), 201);
+  // A banned person gets no code.
+  const people = await directory();
+  await request("POST", `/api/users/${people.tomas.id}/ban`, { cookie: state.maya });
+  await ask("tomas@example.com");
+  expect((await outbox()).resetCodes.every((entry) => entry.emailAddress !== "tomas@example.com"), "none for a banned person");
+  await request("DELETE", `/api/users/${people.tomas.id}/ban`, { cookie: state.maya });
+});
+
+await check("a link preview: canned for example.com, none elsewhere, 400 for nothing, and limited", async () => {
+  const cookie = await signIn("tomas@example.com");
+  const unfurl = (url, who = cookie) => request("POST", "/api/unfurl", { cookie: who, body: url === undefined ? {} : { url } });
+  expectStatus(await unfurl("https://example.com/a", null), 401);
+  const found = await unfurl("https://example.com/docs/page?x=1");
+  expectStatus(found, 200);
+  expect(found.json.title === "Example Domain" && found.json.url === "https://example.com/docs/page?x=1" && found.json.image === null && typeof found.json.description === "string", "a canned preview");
+  expectStatus(await unfurl("https://www.example.com/"), 200);
+  for (const url of ["https://example.org/", "https://not-example.com/", "ftp://example.com/", "not a url", `${origin}/api/me`, 5, { a: 1 }, true]) expectStatus(await unfurl(url), 204);
+  for (const url of [undefined, null, "   ", [], {}]) {
+    const res = await request("POST", "/api/unfurl", { cookie, body: url === undefined ? {} : { url } });
+    expect(res.status === 400 && res.json.error === "param is missing or the value is empty: url", `${JSON.stringify(url)} gave ${res.status}`);
+  }
+  let limited = null;
+  for (let i = 0; i < 40 && !limited; i++) {
+    const res = await unfurl("https://example.com/");
+    if (res.status === 429) limited = res;
+  }
+  expect(limited && limited.json.error === "Too many link previews. Try again in a minute.", "past 30 a minute it is 429");
+  expectStatus(await unfurl("https://example.com/", state.maya), 200);
+});
+
 await check("signing out answers 204, forgets the session and revokes its sockets", async () => {
   const cookie = await signIn(emails.tomas);
   const socket = await tracked("/api/socket", { cookie });

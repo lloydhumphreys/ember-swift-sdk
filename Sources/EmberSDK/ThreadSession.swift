@@ -9,7 +9,7 @@ import Observation
 /// `room.boost(…)`.
 @MainActor @Observable public final class ThreadSession {
     /// The message the thread is under.
-    public let parentID: String
+    public let parentID: MessageID
     /// The room the thread is in, whose socket it's on.
     public let room: RoomSession
     /// The parent, the replies and what's pending, as the room's frames have them.
@@ -28,7 +28,7 @@ import Observation
     /// Fails the older page on its way after `RoomSession.pageTimeout`.
     @ObservationIgnored private var pageTimer: Task<Void, Never>?
 
-    init(room: RoomSession, parentID: String, at replyID: String?) {
+    init(room: RoomSession, parentID: MessageID, at replyID: MessageID?) {
         self.room = room
         self.parentID = parentID
         timeline = ThreadTimeline(parentId: parentID, me: room.timeline.me, at: replyID)
@@ -80,12 +80,14 @@ import Observation
 
     // MARK: Replies
 
-    /// Sends a reply, or with `alsoSend` a reply that's in the room too. It goes now when the
-    /// socket is admitted, and otherwise once the thread opens again. Answers its client message id.
+    /// Sends a reply, into the thread only or, with `.threadAndRoom`, into the room too. It goes now
+    /// when the socket is admitted, and otherwise once the thread opens again. Answers its client
+    /// message id. `previews` go after the body.
     @discardableResult
-    public func reply(body: String, plainText: String, alsoSend: Bool = false) -> String {
-        let id = UUID().uuidString.lowercased()
-        let frame = timeline.reply(body: body, plainText: plainText, alsoSend: alsoSend, clientMessageId: id, now: now())
+    public func reply(body: String, plainText: String, delivery: ReplyDelivery = .threadOnly, previews: [LinkPreview] = []) -> ClientMessageID {
+        let id = ClientMessageID(UUID().uuidString.lowercased())
+        let body = withPreviews(body, previews)
+        let frame = timeline.reply(body: body, plainText: plainText, delivery: delivery, clientMessageId: id, now: now())
         guard !room.isShutDown else { return id }
         room.keep(self)
         // A reply never waits on the room's newest page, as a room message does.
@@ -98,14 +100,14 @@ import Observation
     /// Files then text, as `RoomSession.send(files:…)`, into the thread. A refused file's notice is
     /// the thread's `notice`.
     @discardableResult
-    public func send(files: [UploadSource], body: String? = nil, plainText: String? = nil, alsoSend: Bool = false) -> [String] {
-        room.enqueue(files: files, body: body, plainText: plainText, thread: self, alsoSend: alsoSend)
+    public func send(files: [UploadSource], body: String? = nil, plainText: String? = nil, delivery: ReplyDelivery = .threadOnly) -> [ClientMessageID] {
+        room.enqueue(files: files, body: body, plainText: plainText, thread: self, delivery: delivery)
     }
 
     /// Sends a failed reply again, under the same id, as `RoomSession.retry(_:)` does: the room is
     /// asked first whether it has the reply, and it's created only if the room says it's missing. A
     /// file that failed goes on from the part after the last the server took, after any still waiting.
-    public func retry(_ clientMessageId: String) {
+    public func retry(_ clientMessageId: ClientMessageID) {
         if timeline.pending.first(where: { $0.clientMessageId == clientMessageId })?.upload != nil {
             _ = timeline.retry(clientMessageId)
             room.retryUpload(clientMessageId)
@@ -125,7 +127,7 @@ import Observation
     }
 
     /// Forgets a pending reply. A file on its way up stops.
-    public func discard(_ clientMessageId: String) {
+    public func discard(_ clientMessageId: ClientMessageID) {
         room.discardUpload(clientMessageId)
         timeline.discard(clientMessageId)
         room.settle(self)
@@ -137,7 +139,7 @@ import Observation
     /// pending again under the same ids: a failed one as failed, the rest for the next check to send.
     func restore(_ replies: [UnsentMessage]) {
         for reply in replies where !timeline.pending.contains(where: { $0.clientMessageId == reply.clientMessageId }) {
-            _ = timeline.reply(body: reply.body, plainText: reply.plainText, alsoSend: reply.alsoSend, clientMessageId: reply.clientMessageId, now: reply.createdAt)
+            _ = timeline.reply(body: reply.body, plainText: reply.plainText, delivery: reply.delivery, clientMessageId: reply.clientMessageId, now: reply.createdAt)
             if let failure = reply.failure { _ = timeline.fail(reply.clientMessageId, reason: failure) }
         }
     }
@@ -150,7 +152,7 @@ import Observation
     }
 
     /// Brings `replyID` into focus, as a second link into the thread asks.
-    func go(to replyID: String) {
+    func go(to replyID: MessageID) {
         let frames = timeline.go(to: replyID, isOpen: room.isAdmitted)
         for frame in frames { room.transmit(frame) }
         watchPage(frames)
@@ -212,23 +214,23 @@ import Observation
     }
 
     /// A reply held behind files: shown as pending now, with the frame that sends it answered.
-    func hold(body: String, plainText: String, alsoSend: Bool, clientMessageId: String) -> ClientFrame {
-        timeline.reply(body: body, plainText: plainText, alsoSend: alsoSend, clientMessageId: clientMessageId, now: now())
+    func hold(body: String, plainText: String, delivery: ReplyDelivery, clientMessageId: ClientMessageID) -> ClientFrame {
+        timeline.reply(body: body, plainText: plainText, delivery: delivery, clientMessageId: clientMessageId, now: now())
     }
 
     /// A held reply's turn has come. One discarded meanwhile doesn't go, and one that can't go yet
     /// waits for the check that follows the thread opening again.
-    func release(_ frame: ClientFrame, clientMessageId: String) {
+    func release(_ frame: ClientFrame, clientMessageId: ClientMessageID) {
         guard timeline.pending.contains(where: { $0.clientMessageId == clientMessageId && $0.failure == nil }) else { return }
         if room.isAdmitted { room.transmitReply(frame) }
         room.watchSend(clientMessageId)
     }
 
-    func attach(_ upload: PendingUpload, alsoSend: Bool, clientMessageId: String) {
-        timeline.attach(upload, alsoSend: alsoSend, clientMessageId: clientMessageId, now: now())
+    func attach(_ upload: PendingUpload, delivery: ReplyDelivery, clientMessageId: ClientMessageID) {
+        timeline.attach(upload, delivery: delivery, clientMessageId: clientMessageId, now: now())
     }
 
-    func uploadProgress(_ clientMessageId: String, sentBytes: Int) {
+    func uploadProgress(_ clientMessageId: ClientMessageID, sentBytes: Int) {
         timeline.uploadProgress(clientMessageId, sentBytes: sentBytes)
     }
 
@@ -236,7 +238,7 @@ import Observation
         timeline.posted(message)
     }
 
-    func fail(_ clientMessageId: String, reason: String) -> ClientFrame? {
+    func fail(_ clientMessageId: ClientMessageID, reason: String) -> ClientFrame? {
         timeline.fail(clientMessageId, reason: reason)
     }
 

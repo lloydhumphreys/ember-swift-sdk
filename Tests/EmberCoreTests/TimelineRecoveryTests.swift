@@ -3,7 +3,7 @@ import Testing
 @testable import EmberCore
 
 /// A timeline welcomed, as `ada`, with `messages` and the page's flags.
-private func opened(_ messages: [Message], hasMore: Bool = false, hasNewer: Bool = false, around: String? = nil, seq: Int = 1) -> Timeline {
+private func opened(_ messages: [Message], hasMore: Bool = false, hasNewer: Bool = false, around: MessageID? = nil, seq: Int = 1) -> Timeline {
     var timeline = Timeline()
     _ = timeline.apply(.welcome(you: ada, present: [ada], seq: seq, page: TimelinePage(messages: messages, hasMore: hasMore, hasNewer: hasNewer, around: around)))
     return timeline

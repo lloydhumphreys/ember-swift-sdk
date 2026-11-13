@@ -33,18 +33,18 @@ struct PlainTextMessage {
 extension RoomSession {
     /// Sends text typed in plain: escaped, so `<b>` shows as typed, with each line on its own.
     /// Throws `.invalid`, sending nothing, for text that's blank or over `Limits.message`
-    /// characters. Answers its client message id, as `send(body:plainText:)` does.
+    /// characters. Answers its client message id, as `send(body:plainText:previews:)` does.
     @discardableResult
-    public func send(text: String) throws(EmberError) -> String {
+    public func send(text: String, previews: [LinkPreview] = []) throws(EmberError) -> ClientMessageID {
         let message = try PlainTextMessage(text)
-        return send(body: message.body, plainText: message.plainText)
+        return send(body: message.body, plainText: message.plainText, previews: previews)
     }
 
     /// Posts `files` with a caption typed in plain, as `send(files:body:plainText:)` does. Throws
     /// `.invalid`, sending nothing, for a caption over `Limits.message` characters; a blank one
     /// sends the files alone.
     @discardableResult
-    public func send(files: [UploadSource], text: String?) throws(EmberError) -> [String] {
+    public func send(files: [UploadSource], text: String?) throws(EmberError) -> [ClientMessageID] {
         let caption = try PlainTextMessage.caption(text)
         return send(files: files, body: caption?.body, plainText: caption?.plainText)
     }
@@ -52,19 +52,19 @@ extension RoomSession {
 
 extension ThreadSession {
     /// Replies with text typed in plain, as `RoomSession.send(text:)` escapes it, and with
-    /// `alsoSend` in the room too. Throws `.invalid`, sending nothing, for text that's blank or
+    /// with `.threadAndRoom` in the room too. Throws `.invalid`, sending nothing, for text that's blank or
     /// over `Limits.message` characters.
     @discardableResult
-    public func reply(text: String, alsoSend: Bool = false) throws(EmberError) -> String {
+    public func reply(text: String, delivery: ReplyDelivery = .threadOnly, previews: [LinkPreview] = []) throws(EmberError) -> ClientMessageID {
         let message = try PlainTextMessage(text)
-        return reply(body: message.body, plainText: message.plainText, alsoSend: alsoSend)
+        return reply(body: message.body, plainText: message.plainText, delivery: delivery, previews: previews)
     }
 
     /// Posts `files` into the thread with a caption typed in plain, as
     /// `RoomSession.send(files:text:)` does.
     @discardableResult
-    public func send(files: [UploadSource], text: String?, alsoSend: Bool = false) throws(EmberError) -> [String] {
+    public func send(files: [UploadSource], text: String?, delivery: ReplyDelivery = .threadOnly) throws(EmberError) -> [ClientMessageID] {
         let caption = try PlainTextMessage.caption(text)
-        return send(files: files, body: caption?.body, plainText: caption?.plainText, alsoSend: alsoSend)
+        return send(files: files, body: caption?.body, plainText: caption?.plainText, delivery: delivery)
     }
 }

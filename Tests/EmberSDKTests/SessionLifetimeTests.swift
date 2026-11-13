@@ -71,7 +71,7 @@ import Testing
         let threadLease = thread.open()
         thread.reply(body: "<p>Yes</p>", plainText: "Yes")
         let gate = transport.hold("POST", uploads)
-        thread.send(files: [try file.source(isTemporary: true)])
+        thread.send(files: [try file.temporarySource()])
         await gate.waitForRequest()
 
         workspace.shutdown()
@@ -161,10 +161,10 @@ import Testing
         let going = try TestFile([2], name: "going.txt")
         defer { [failed, going].forEach { $0.remove() } }
         transport.stub("POST", uploads, status: 422, json: Fixtures.errorJSON("No."))
-        session.send(files: [try failed.source(isTemporary: true)])
+        session.send(files: [try failed.temporarySource()])
         #expect(await eventually { session.timeline.pending.first?.failure == "No." })
         let gate = transport.hold("POST", uploads)
-        session.thread("m001").send(files: [try going.source(isTemporary: true)])
+        session.thread("m001").send(files: [try going.temporarySource()])
         await gate.waitForRequest()
 
         session.detach()
@@ -181,7 +181,7 @@ import Testing
         let file = try TestFile([1])
         defer { file.remove() }
         transport.stub("POST", uploads, status: 422, json: Fixtures.errorJSON("No."))
-        let id = try #require(session.send(files: [try file.source(isTemporary: true)]).first)
+        let id = try #require(session.send(files: [try file.temporarySource()]).first)
         #expect(await eventually { session.timeline.pending.first?.failure == "No." })
         // The room has it after all, so nothing is left to retry and the session counts as idle.
         // The failed job goes as the confirmation lands, so trimming finds nothing left behind.

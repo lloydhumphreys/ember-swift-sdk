@@ -67,7 +67,7 @@ extension LiveTests {
         #expect(!session.timeline.messages.contains { $0.clientMessageId == onlyID })
 
         let also = "Also sent \(tag)"
-        let alsoID = thread.reply(body: "<p>\(also)</p>", plainText: also, alsoSend: true)
+        let alsoID = thread.reply(body: "<p>\(also)</p>", plainText: also, delivery: .threadAndRoom)
         #expect(await eventually {
             thread.timeline.pending.isEmpty && thread.timeline.replies.contains { $0.clientMessageId == alsoID && $0.alsoSent == true }
         })

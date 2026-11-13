@@ -13,7 +13,7 @@ extension EmberClient {
     /// in its thread's page, not the room's. A message the room doesn't have, or has deleted, fails with
     /// status 404. A refused socket fails with the status the server refused it with, and a 401 is
     /// thrown as it is without calling `addSignedOutHandler`'s handlers.
-    public func message(_ id: String, in roomID: RoomID) async throws -> Message {
+    public func message(_ id: MessageID, in roomID: RoomID) async throws -> Message {
         let connection = connector.connect(roomSocketRequest(roomID: roomID, visible: false, since: nil, around: id))
         defer { connection.close() }
         let page: TimelinePage

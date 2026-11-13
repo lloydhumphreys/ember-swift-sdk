@@ -1,27 +1,15 @@
 import Foundation
 
-/// One socket that keeps itself connected: reconnects with backoff, pings every 25 s, and gives up
-/// only when the server says the session or the room is gone, or refuses it outright. A port of the
-/// web client's `reconnecting-socket.ts`.
-///
-/// Backoff starts over only once a connection has stayed open for `EmberTiming.stablePeriod`. While
-/// the network is gone it waits without backing off further, and it tries again as soon as the
-/// network is back.
-///
-/// It lives on the main actor, and its callbacks arrive there in order. `stop()` stops it wherever it
-/// is, connecting or waiting to try again, and `start()` brings it back.
-@MainActor public final class ReconnectingSocket {
-    /// Where the socket is.
-    public enum Status: Equatable, Sendable {
-        /// Not started, or stopped by `stop()`.
-        case idle
-        /// Trying to connect, or waiting to try again.
-        case connecting
-        /// Connected.
-        case open
-        /// The server said not to come back; `start()` tries again anyway.
-        case stopped(StopReason)
-    }
+/// Where a socket is: the workspace's (`Workspace.connection`) or a room's (`RoomSession.status`).
+public enum ConnectionStatus: Equatable, Sendable {
+    /// Not started, or stopped.
+    case idle
+    /// Trying to connect, or waiting to try again.
+    case connecting
+    /// Connected.
+    case open
+    /// The server said not to come back; starting again tries anyway.
+    case stopped(StopReason)
 
     /// Why the server said not to come back.
     public enum StopReason: Equatable, Sendable {
@@ -33,20 +21,32 @@ import Foundation
         /// but 401, 408 and 429), such as 403 or 404 when the server doesn't take this origin.
         case refused(status: Int)
     }
+}
 
+/// One socket that keeps itself connected: reconnects with backoff, pings every 25 s, and gives up
+/// only when the server says the session or the room is gone, or refuses it outright. A port of the
+/// web client's `reconnecting-socket.ts`.
+///
+/// Backoff starts over only once a connection has stayed open for `EmberTiming.stablePeriod`. While
+/// the network is gone it waits without backing off further, and it tries again as soon as the
+/// network is back.
+///
+/// It lives on the main actor, and its callbacks arrive there in order. `stop()` stops it wherever it
+/// is, connecting or waiting to try again, and `start()` brings it back.
+@MainActor package final class ReconnectingSocket {
     /// Where the socket is now.
-    public private(set) var status: Status = .idle
+    package private(set) var status: ConnectionStatus = .idle
     /// Hears every change of `status`.
-    public var onStatus: (@MainActor (Status) -> Void)?
+    package var onStatus: (@MainActor (ConnectionStatus) -> Void)?
     /// Every text frame but `pong`, in order.
-    public var onText: (@MainActor (String) -> Void)?
+    package var onText: (@MainActor (String) -> Void)?
     /// Whether the network was there when last heard, while the socket is started.
-    public private(set) var isNetworkAvailable = true
+    package private(set) var isNetworkAvailable = true
     /// Hears every change of `isNetworkAvailable`.
     var onNetwork: (@MainActor (Bool) -> Void)?
 
     /// The text of a ping, which the server answers `{"type":"pong"}`.
-    public static let ping = #"{"type":"ping"}"#
+    package static let ping = #"{"type":"ping"}"#
 
     private let connector: any SocketConnector
     private let request: @MainActor () -> URLRequest
@@ -63,12 +63,12 @@ import Foundation
 
     /// A socket on `connector`. `request` is asked again for each attempt, so a room socket can name
     /// the latest `seq`. `timing` says how long it waits; tests pass one on a `ManualClock`.
-    public convenience init(connector: any SocketConnector, timing: EmberTiming = .standard, request: @escaping @MainActor () -> URLRequest) {
+    package convenience init(connector: any SocketConnector, timing: EmberTiming = .standard, request: @escaping @MainActor () -> URLRequest) {
         self.init(connector: connector, timing: timing, network: SteadyNetworkPath(), request: request)
     }
 
     /// A socket on `connector` that hears from `network` whether there's a network to try.
-    public init(connector: any SocketConnector, timing: EmberTiming = .standard, network: any NetworkPathSource, request: @escaping @MainActor () -> URLRequest) {
+    package init(connector: any SocketConnector, timing: EmberTiming = .standard, network: any NetworkPathSource, request: @escaping @MainActor () -> URLRequest) {
         self.connector = connector
         self.timing = timing
         self.network = network
@@ -76,12 +76,12 @@ import Foundation
     }
 
     /// A socket on `connector`, with the standard timing.
-    public convenience init(connector: any SocketConnector, request: @escaping @MainActor () -> URLRequest) {
+    package convenience init(connector: any SocketConnector, request: @escaping @MainActor () -> URLRequest) {
         self.init(connector: connector, timing: .standard, request: request)
     }
 
     /// Starts connecting. Nothing when already connecting or open.
-    public func start() {
+    package func start() {
         switch status {
         case .connecting, .open: return
         case .idle, .stopped: break
@@ -94,7 +94,7 @@ import Foundation
     }
 
     /// Closes the socket and stops trying; `status` becomes `.idle`. `start()` connects again.
-    public func stop() {
+    package func stop() {
         generation += 1
         tearDown()
         waiting?.cancel()
@@ -106,7 +106,7 @@ import Foundation
 
     /// Sends `text` if the socket is open, in order with everything else sent. False when it isn't.
     @discardableResult
-    public func send(_ text: String) -> Bool {
+    package func send(_ text: String) -> Bool {
         guard status == .open, let outbox else { return false }
         outbox.yield(text)
         return true
@@ -188,7 +188,7 @@ import Foundation
     }
 
     private enum Ending: Equatable {
-        case stop(StopReason)
+        case stop(ConnectionStatus.StopReason)
         case now
         case later
     }
@@ -326,7 +326,7 @@ import Foundation
         generation == self.generation && !Task.isCancelled
     }
 
-    private func set(_ status: Status) {
+    private func set(_ status: ConnectionStatus) {
         guard status != self.status else { return }
         self.status = status
         onStatus?(status)

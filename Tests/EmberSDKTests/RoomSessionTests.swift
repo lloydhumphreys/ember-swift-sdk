@@ -13,7 +13,7 @@ import Testing
     }
 
     /// A session in General whose every socket is welcomed with `messages`, unless the test scripts its own.
-    func session(messages: [Message] = Fixtures.messages(3), around: String? = nil, welcome: Bool = true) -> RoomSession {
+    func session(messages: [Message] = Fixtures.messages(3), around: MessageID? = nil, welcome: Bool = true) -> RoomSession {
         if welcome { connector.welcomeEverySocket(messages: messages) }
         return RoomSession(client: .mock(connector: connector, timing: timing), roomID: Fixtures.general.id, around: around)
     }
@@ -66,20 +66,47 @@ import Testing
         #expect(session.timeline.pending.isEmpty)
     }
 
-    @Test func anEditsRefusalIsANotice() async throws {
+    @Test func eachChangesRefusalIsThrownToItOnceAndIsntANotice() async throws {
         let session = session()
         let socket = try await opened(session)
-        session.edit("m001", body: "<p>Changed</p>")
-        session.delete("m002")
-        session.boost("m003", content: "👍")
+        let edit = Task { try await session.edit(message: "m001", body: "<p>Changed</p>") }
+        #expect(await eventually { socket.sent.count == 2 })
+        let deletion = Task { try await session.delete(message: "m002") }
         #expect(await eventually { socket.sent.count == 3 })
-        #expect(socket.sentFrames == [
+        let boost = Task { try await session.boost(message: "m003", content: "👍") }
+        #expect(await eventually { socket.sent.count == 4 })
+        #expect(socket.sentClientFrames.filter { $0.type != "message.check" } == [
             .updateMessage(messageId: "m001", body: "<p>Changed</p>"),
             .deleteMessage(messageId: "m002"),
             .createBoost(messageId: "m003", content: "👍"),
         ])
+        // The room answers a socket's frames in order, so each refusal belongs to the oldest change.
         socket.serverSends(Fixtures.RoomFrames.error("You can’t edit that."))
-        #expect(await eventually { session.notice == "You can’t edit that." })
+        await #expect(throws: EmberError(kind: .refused, message: "You can’t edit that.")) { try await edit.value }
+        socket.serverSends(Fixtures.RoomFrames.error("You can’t delete that."))
+        await #expect(throws: EmberError(kind: .refused, message: "You can’t delete that.")) { try await deletion.value }
+        socket.serverSends(Fixtures.RoomFrames.error("You can’t boost that."))
+        await #expect(throws: EmberError(kind: .refused, message: "You can’t boost that.")) { _ = try await boost.value }
+        #expect(session.notice == nil)
+        // A refusal nothing is waiting for still shows.
+        socket.serverSends(Fixtures.RoomFrames.error("Something else."))
+        #expect(await eventually { session.notice == "Something else." })
+    }
+
+    @Test func sentFramesReadAsTheirFields() async throws {
+        let session = session()
+        let socket = try await opened(session)
+        let id = session.send(body: "<p>Hi</p>", plainText: "Hi")
+        let edit = Task { try await session.edit(message: "m001", body: "<p>Changed</p>") }
+        #expect(await eventually { socket.sent.count == 3 })
+        let frames = socket.sentFrames
+        #expect(frames.map(\.type) == ["message.create", "message.update", "message.check"])
+        #expect(frames[0].string("body") == "<p>Hi</p>")
+        #expect(frames[0]["clientMessageId"] == .string(id.rawValue))
+        #expect(frames[1].string("messageId") == "m001")
+        #expect(frames[1].text == socket.sent[1])
+        socket.serverCloses(code: 1006)
+        _ = await edit.result
     }
 
     @Test func aMessageSentBeforeTheRoomLetsItInGoesOnceChecked() async throws {
@@ -228,12 +255,12 @@ import Testing
         session.start()
         #expect(await eventually { heard == [.sessionEnded] })
 
-        // The app signing out on hearing it doesn't make it asked.
+        // The app signing out on hearing it doesn't make it `.userInitiated`.
         await client.signOut()
         #expect(client.signOutReason == .sessionEnded)
     }
 
-    @Test func aSignOutYouAskedForStaysAskedWhenTheRoomSocketCloses() async throws {
+    @Test func aSignOutYouAskedForStaysUserInitiatedWhenTheRoomSocketCloses() async throws {
         let session = session()
         let socket = try await opened(session)
         let client = session.client
@@ -242,7 +269,7 @@ import Testing
         await client.signOut()
         socket.serverCloses(code: SocketClose.revoked)
         #expect(await eventually { signedOut })
-        #expect(client.signOutReason == .asked)
+        #expect(client.signOutReason == .userInitiated)
     }
 
     @Test func visibilityIsSent() async throws {

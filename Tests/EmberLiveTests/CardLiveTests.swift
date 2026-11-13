@@ -228,7 +228,7 @@ extension LiveTests {
 
     /// Waits for a message from `name` after `known` that satisfies `matches`.
     @MainActor
-    func botMessage(in session: RoomSession, from name: String, excluding known: Set<String>, where matches: (Message) -> Bool = { _ in true }) async -> Message? {
+    func botMessage(in session: RoomSession, from name: String, excluding known: Set<MessageID>, where matches: (Message) -> Bool = { _ in true }) async -> Message? {
         _ = await eventually(within: .seconds(15)) {
             session.timeline.messages.contains { !known.contains($0.id) && $0.creator.name == name && matches($0) }
         }
@@ -278,9 +278,10 @@ extension LiveTests {
         defer { session.stop() }
         let target = try seededCards(in: session)[1]
         #expect(session.notice == nil)
-        #expect(session.edit(target.id, body: "<p>Edited by a person</p>"))
-        #expect(await eventually { session.notice != nil })
-        #expect(session.notice == "Messages with cards can't be edited.")
+        await #expect(throws: EmberError(kind: .refused, message: "Messages with cards can't be edited.")) {
+            try await session.edit(message: target.id, body: "<p>Edited by a person</p>")
+        }
+        #expect(session.notice == nil)
         #expect(session.timeline.pending.isEmpty)
         // Nothing changed. The room's frames come in order, so once a message sent after the edit is back,
         // any update to the card message would have arrived already.
@@ -294,7 +295,7 @@ extension LiveTests {
 
     @Test func searchFindsTheAlertsWithTheirCards() async throws {
         let client = try await signedIn()
-        let results = try await client.search(SearchQuery(q: "HighErrorRate"))
+        let results = try await client.search(SearchQuery("HighErrorRate"))
         let cards = results.matches.compactMap(\.message.cards).flatMap { $0 }
         #expect(cards.contains { $0.label?.hasPrefix("[FIRING]") == true && $0.accent == .danger })
         #expect(cards.contains { $0.label?.hasPrefix("[RESOLVED]") == true && $0.accent == .good })

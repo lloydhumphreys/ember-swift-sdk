@@ -4,9 +4,6 @@ import Foundation
 // server's repository declares them. Names follow the protocol's, so a field
 // here can be looked up there.
 
-public typealias UserID = String
-public typealias RoomID = String
-
 /// An enum the server may grow. A value this build doesn't know decodes as
 /// `unknown` with the server's string, rather than failing the whole answer
 /// (one new role shouldn't empty the directory) or passing for a value it
@@ -274,13 +271,13 @@ public struct Sidebar: Decodable, Sendable {
 }
 
 /// `POST /api/directs`: the DM with exactly these people and the sender.
-public struct NewDirect: Encodable, Sendable {
-    public var userIds: [UserID]
-    public init(userIds: [UserID]) { self.userIds = userIds }
+package struct NewDirect: Encodable, Sendable {
+    package var userIds: [UserID]
+    package init(userIds: [UserID]) { self.userIds = userIds }
 }
 
-public struct StartedDirect: Decodable, Sendable {
-    public var room: Room
+package struct StartedDirect: Decodable, Sendable {
+    package var room: Room
 }
 
 // MARK: - Workspace
@@ -343,7 +340,10 @@ public struct Bootstrap: Decodable, Sendable {
     /// Whether signing in with just a name is on, as a local `pnpm dev` has it.
     public var guestSignIn: Bool
     public var signInWithMemberful: Bool
+    /// The Cloudflare Turnstile site key the reset-code and sign-up forms check with, or nil when
+    /// they don't. When it's set, `EmberClient.askForPasswordReset` needs a token made with it.
     public var turnstileSiteKey: String?
+    /// Whether Ember can email a code to reset a password.
     public var passwordResetCodes: Bool
     public var account: Account
     public var version: String
@@ -367,32 +367,32 @@ public struct Bootstrap: Decodable, Sendable {
 }
 
 /// `POST /api/session` with an email address and password.
-public struct PasswordSignIn: Encodable, Sendable {
-    public var emailAddress: String
-    public var password: String
+package struct PasswordSignIn: Encodable, Sendable {
+    package var emailAddress: String
+    package var password: String
 }
 
 /// `POST /api/session` with just a name, where `Bootstrap.guestSignIn` allows.
-public struct GuestSignIn: Encodable, Sendable {
-    public var name: String
+package struct GuestSignIn: Encodable, Sendable {
+    package var name: String
 }
 
 /// What signing in answers, and `GET /api/me`.
-public struct SignedIn: Decodable, Sendable {
-    public var user: Me
+package struct SignedIn: Decodable, Sendable {
+    package var user: Me
 }
 
 // MARK: - Messages
 
 /// A short reaction someone left on a message: an emoji, or up to `Limits.boost` characters of text.
 public struct Boost: Codable, Hashable, Identifiable, Sendable {
-    public var id: String
-    public var messageId: String
+    public var id: BoostID
+    public var messageId: MessageID
     public var booster: User
     public var content: String
     public var createdAt: Date
 
-    public init(id: String, messageId: String, booster: User, content: String, createdAt: Date) {
+    public init(id: BoostID, messageId: MessageID, booster: User, content: String, createdAt: Date) {
         self.id = id
         self.messageId = messageId
         self.booster = booster
@@ -412,7 +412,7 @@ public struct ThreadSummary: Codable, Hashable, Sendable {
 /// A file message's file. `url`, `downloadUrl` and `previewUrl` are signed
 /// paths on the server that need no cookie and don't expire.
 public struct StoredFile: Codable, Hashable, Identifiable, Sendable {
-    public var id: String
+    public var id: FileID
     public var name: String
     public var contentType: String
     public var byteSize: Int
@@ -429,10 +429,10 @@ public struct StoredFile: Codable, Hashable, Identifiable, Sendable {
 }
 
 public struct Message: Codable, Hashable, Identifiable, Sendable {
-    public var id: String
+    public var id: MessageID
     /// The id its sender's app gave it, which matches a message on its way to
     /// the one the room stored.
-    public var clientMessageId: String
+    public var clientMessageId: ClientMessageID
     public var roomId: RoomID
     public var creator: User
     /// Its body as markup: Action Text's HTML, sanitised by the server.
@@ -448,7 +448,7 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     /// as the protocol's `parseCards` reads them.
     public var cards: [Card]?
     /// The message this one replies to, in its thread.
-    public var parentId: String?
+    public var parentId: MessageID?
     /// Whether a reply was sent to the room too.
     public var alsoSent: Bool?
     public var parentText: String?
@@ -466,9 +466,9 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
     }
 
     public init(
-        id: String, clientMessageId: String, roomId: RoomID, creator: User, body: String, plainText: String,
+        id: MessageID, clientMessageId: ClientMessageID, roomId: RoomID, creator: User, body: String, plainText: String,
         mentions: [User] = [], createdAt: Date, updatedAt: Date? = nil, editedAt: Date? = nil, boosts: [Boost] = [],
-        attachment: StoredFile? = nil, cards: [Card]? = nil, parentId: String? = nil, alsoSent: Bool? = nil,
+        attachment: StoredFile? = nil, cards: [Card]? = nil, parentId: MessageID? = nil, alsoSent: Bool? = nil,
         thread: ThreadSummary? = nil
     ) {
         self.id = id
@@ -491,12 +491,13 @@ public struct Message: Codable, Hashable, Identifiable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(String.self, forKey: .id)
-        clientMessageId = try container.decodeIfPresent(String.self, forKey: .clientMessageId) ?? id
+        id = try container.decode(MessageID.self, forKey: .id)
+        // A message from before client ids had none, and is matched by its own id.
+        clientMessageId = try container.decodeIfPresent(ClientMessageID.self, forKey: .clientMessageId) ?? ClientMessageID(id.rawValue)
         roomId = try container.decode(RoomID.self, forKey: .roomId)
         creator = try container.decode(User.self, forKey: .creator)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
-        parentId = try container.decodeIfPresent(String.self, forKey: .parentId)
+        parentId = try container.decodeIfPresent(MessageID.self, forKey: .parentId)
         // Past what places it, a part this build can't read is left out and the message kept.
         body = (try? container.decodeIfPresent(String.self, forKey: .body)) ?? ""
         plainText = (try? container.decodeIfPresent(String.self, forKey: .plainText)) ?? ""

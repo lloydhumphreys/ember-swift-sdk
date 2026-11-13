@@ -7,15 +7,15 @@ extension Fixtures {
     /// A reply under `parentID`, by Grace in General unless said otherwise, quoting `parentText`.
     /// `alsoSent` puts it in the room's timeline too.
     public static func reply(
-        _ id: String,
+        _ id: MessageID,
         _ text: String,
-        to parentID: String,
+        to parentID: MessageID,
         by creator: User = grace,
         in roomID: RoomID = general.id,
         minute: Int = 0,
         alsoSent: Bool = false,
         parentText: String = "",
-        clientMessageId: String? = nil
+        clientMessageId: ClientMessageID? = nil
     ) -> Message {
         var reply = message(id, text, by: creator, in: roomID, minute: minute, clientMessageId: clientMessageId)
         reply.parentId = parentID
@@ -25,7 +25,7 @@ extension Fixtures {
     }
 
     /// What a deleted message with replies leaves: no text, `deleted`, and its thread still there.
-    public static func tombstone(_ id: String, by creator: User = grace, in roomID: RoomID = general.id, minute: Int = 0) -> Message {
+    public static func tombstone(_ id: MessageID, by creator: User = grace, in roomID: RoomID = general.id, minute: Int = 0) -> Message {
         var message = message(id, "", by: creator, in: roomID, minute: minute)
         message.body = ""
         message.deleted = true
@@ -51,7 +51,7 @@ extension Fixtures {
 
     /// A stored file, served from signed paths under `/files/`.
     public static func storedFile(
-        _ id: String = "file_1",
+        _ id: FileID = "file_1",
         name: String = "notes.txt",
         contentType: String = "text/plain",
         byteSize: Int = 12,
@@ -60,7 +60,7 @@ extension Fixtures {
         preview: Bool = false
     ) -> StoredFile {
         decode(json([
-            "id": id, "name": name, "contentType": contentType, "byteSize": byteSize,
+            "id": id.rawValue, "name": name, "contentType": contentType, "byteSize": byteSize,
             "width": width ?? NSNull(), "height": height ?? NSNull(),
             "url": "/files/\(id)/\(name)?sig=test", "downloadUrl": "/files/\(id)/\(name)?sig=test&download=1",
             "previewUrl": preview ? "/files/\(id)/preview?sig=test" : NSNull(),
@@ -69,14 +69,14 @@ extension Fixtures {
 
     /// A file message, as an upload's last part answers it: no text, and the file attached.
     public static func fileMessage(
-        _ id: String,
+        _ id: MessageID,
         file: StoredFile = storedFile(),
         by creator: User = ada,
         in roomID: RoomID = general.id,
         minute: Int = 0,
-        parentID: String? = nil,
+        parentID: MessageID? = nil,
         alsoSent: Bool = false,
-        clientMessageId: String
+        clientMessageId: ClientMessageID
     ) -> Message {
         var message = message(id, "", by: creator, in: roomID, minute: minute, clientMessageId: clientMessageId)
         message.body = ""
@@ -87,13 +87,13 @@ extension Fixtures {
     }
 
     /// What starting an upload answers.
-    public static func uploadTicket(_ id: String = "upload_1", partSize: Int = 5 * 1024 * 1024, parts: Int = 1) -> UploadTicket {
+    public static func uploadTicket(_ id: UploadID = "upload_1", partSize: Int = 5 * 1024 * 1024, parts: Int = 1) -> UploadTicket {
         UploadTicket(id: id, partSize: partSize, parts: parts)
     }
 
     /// `POST /api/rooms/:id/uploads`'s answer.
     public static func uploadTicketJSON(_ ticket: UploadTicket) -> String {
-        json(["id": ticket.id, "partSize": ticket.partSize, "parts": ticket.parts])
+        json(["id": ticket.id.rawValue, "partSize": ticket.partSize, "parts": ticket.parts])
     }
 
     /// A message as bare JSON, as a completing part answers it.
@@ -105,29 +105,29 @@ extension Fixtures {
 
 extension Fixtures.RoomFrames {
     /// `thread.opened`: the thread's parent (nil for one that's gone) and its newest replies.
-    public static func threadOpened(_ parentID: String, parent: Message?, replies: [Message] = [], hasMore: Bool = false) -> String {
+    public static func threadOpened(_ parentID: MessageID, parent: Message?, replies: [Message] = [], hasMore: Bool = false) -> String {
         Fixtures.json([
-            "type": "thread.opened", "parentId": parentID, "parent": parent.map { Fixtures.value($0) } ?? NSNull(),
+            "type": "thread.opened", "parentId": parentID.rawValue, "parent": parent.map { Fixtures.value($0) } ?? NSNull(),
             "messages": replies.map { Fixtures.value($0) }, "hasMore": hasMore,
         ])
     }
 
     /// `thread.history`: the replies before `before`.
-    public static func threadHistory(_ parentID: String, before: String, replies: [Message], hasMore: Bool) -> String {
+    public static func threadHistory(_ parentID: MessageID, before: MessageID, replies: [Message], hasMore: Bool) -> String {
         Fixtures.json([
-            "type": "thread.history", "parentId": parentID, "before": before,
+            "type": "thread.history", "parentId": parentID.rawValue, "before": before.rawValue,
             "messages": replies.map { Fixtures.value($0) }, "hasMore": hasMore,
         ])
     }
 
     /// A bot typing (or stopping) in a thread.
-    public static func typing(_ user: User, _ typing: Bool, inThread parentID: String) -> String {
-        Fixtures.json(["type": "typing", "user": Fixtures.value(user), "typing": typing, "threadId": parentID])
+    public static func typing(_ user: User, _ typing: Bool, inThread parentID: MessageID) -> String {
+        Fixtures.json(["type": "typing", "user": Fixtures.value(user), "typing": typing, "threadId": parentID.rawValue])
     }
 
     /// A refusal of several messages at once, as the room sends for a `message.check`'s resends.
-    public static func error(_ message: String, clientMessageIds: [String], failed: String? = nil) -> String {
-        var object: [String: Any] = ["type": "error", "message": message, "clientMessageIds": clientMessageIds]
+    public static func error(_ message: String, clientMessageIds: [ClientMessageID], failed: String? = nil) -> String {
+        var object: [String: Any] = ["type": "error", "message": message, "clientMessageIds": clientMessageIds.map(\.rawValue)]
         if let failed { object["failed"] = failed }
         return Fixtures.json(object)
     }

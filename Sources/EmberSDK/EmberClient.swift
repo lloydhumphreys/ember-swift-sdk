@@ -4,8 +4,9 @@ import Synchronization
 /// One Ember server, as the person using this app knows it: its HTTP API, its cookies, and the
 /// sockets it opens.
 ///
-/// Everything goes through two seams, `transport` for HTTP and `connector` for sockets, so tests and
-/// previews hand it EmberTesting's mocks (`EmberClient.mock()`) and nothing touches the network.
+/// Everything it runs on comes in its `EmberEnvironment`: `transport` for HTTP and `connector` for
+/// sockets among them, so tests and previews hand it EmberTesting's mocks (`EmberClient.mock()`)
+/// and nothing touches the network.
 /// Every method fails with `EmberError`.
 ///
 /// The client attaches the session cookie itself from `cookies` and keeps what the server sets
@@ -14,16 +15,29 @@ public final class EmberClient: Sendable {
     /// The server's origin, such as `https://chat.example.com`: lowercased, with no default port
     /// and nothing after the host, as `ServerAddress.normalizedOrigin(_:)` writes it.
     public let origin: URL
+    /// What this client runs on.
+    public let environment: EmberEnvironment
     /// Where HTTP requests go.
-    public let transport: any HTTPTransport
+    public var transport: any HTTPTransport { environment.transport }
     /// Where sockets open.
-    public let connector: any SocketConnector
+    public var connector: any SocketConnector { environment.connector }
     /// Where the session cookie is kept.
-    public let cookies: HTTPCookieStorage
+    public var cookies: HTTPCookieStorage { environment.cookies }
     /// The intervals this client's sockets and stores wait on.
-    public let timing: EmberTiming
+    public var timing: EmberTiming { environment.timing }
     /// Where this client's sockets hear whether there's a network.
-    public let network: any NetworkPathSource
+    public var network: any NetworkPathSource { environment.network }
+    /// Where this client's room sessions keep unsent messages, unless a session is given its own.
+    public var unsentStore: any UnsentMessageStore { environment.unsentStore }
+    /// What this client's room sessions start with to keep a file going up in the background.
+    public var backgroundTime: BackgroundTime { environment.backgroundTime }
+
+    /// Waits for every unsent list handed to `unsentStore` to be written, failed ones and removals
+    /// tried again first. Throws the store's first error, should one stay; what failed is kept and
+    /// goes at the next retry.
+    @MainActor public func flushUnsent() async throws {
+        try await UnsentWriter.writer(for: unsentStore).flush()
+    }
 
     private let signedOutHandlers = SignedOutHandlers()
     private let lastSignOut = Mutex<SignOutReason?>(nil)
@@ -37,29 +51,13 @@ public final class EmberClient: Sendable {
     /// URLSession, with cookies kept in `cookies`: an `EphemeralCookieStorage` keeps a session apart
     /// from the app's own, as the live tests do.
     public convenience init(origin: URL, cookies: HTTPCookieStorage) {
-        let session = URLSessionHTTPTransport.makeSession()
-        self.init(
-            origin: origin,
-            transport: URLSessionHTTPTransport(session: session),
-            connector: URLSessionSocketConnector(session: session),
-            cookies: cookies,
-            network: SystemNetworkPath()
-        )
+        self.init(origin: origin, environment: .system(cookies: cookies))
     }
 
-    /// Any transports: what tests and previews use. Its sockets take the network to be always there.
-    public convenience init(origin: URL, transport: any HTTPTransport, connector: any SocketConnector, cookies: HTTPCookieStorage = .shared, timing: EmberTiming = .standard) {
-        self.init(origin: origin, transport: transport, connector: connector, cookies: cookies, timing: timing, network: SteadyNetworkPath())
-    }
-
-    /// Any transports, with sockets that hear from `network` whether there's a network to try.
-    public init(origin: URL, transport: any HTTPTransport, connector: any SocketConnector, cookies: HTTPCookieStorage = .shared, timing: EmberTiming = .standard, network: any NetworkPathSource) {
+    /// A client on `environment`: `.system()` with some of it changed, or EmberTesting's `.mock()`.
+    public init(origin: URL, environment: EmberEnvironment) {
         self.origin = ServerAddress.normalizedOrigin(origin)
-        self.transport = transport
-        self.connector = connector
-        self.cookies = cookies
-        self.timing = timing
-        self.network = network
+        self.environment = environment
     }
 
     // MARK: Addresses
@@ -145,21 +143,21 @@ public final class EmberClient: Sendable {
     }
 
     /// `DELETE /api/session`, then forgets this server's cookies whatever it answered.
-    /// `signOutReason` becomes `.asked`, unless the session had ended already.
+    /// `signOutReason` becomes `.userInitiated`, unless the session had ended already.
     public func signOut() async {
-        lastSignOut.withLock { $0 = $0 ?? .asked }
+        lastSignOut.withLock { $0 = $0 ?? .userInitiated }
         _ = try? await perform(try request("DELETE", "/api/session"))
         forgetCookies()
     }
 
-    /// Why someone was last signed out on this client: they asked (`signOut()`), or the server
-    /// ended the session (a 401). nil since signing in, or when nobody's been signed out.
+    /// Why someone was last signed out on this client: they signed out themselves (`signOut()`), or
+    /// the server ended the session (a 401). nil since signing in, or when nobody's been signed out.
     public var signOutReason: SignOutReason? {
         lastSignOut.withLock { $0 }
     }
 
     /// A socket found the session gone (closed as revoked, or its upgrade refused 401) and the app is
-    /// about to hear it: `signOutReason` becomes `.sessionEnded`, unless someone asked to sign out.
+    /// about to hear it: `signOutReason` becomes `.sessionEnded`, unless they'd signed out themselves.
     func sessionEnded() {
         lastSignOut.withLock { $0 = $0 ?? .sessionEnded }
     }
@@ -207,11 +205,12 @@ public final class EmberClient: Sendable {
 
     // MARK: Search
 
-    /// `record: true` is a search someone typed (POST /api/searches, which remembers it); false reads
-    /// results or a further page (GET /api/searches). A query with nothing to search for reads just
-    /// your recent searches.
-    public func search(_ query: SearchQuery, sort: SearchSort = .newest, cursor: Int? = nil, record: Bool = false) async throws -> SearchResults {
-        if record && cursor == nil {
+    /// `.record` is a search someone typed (POST /api/searches, which saves it in their recent
+    /// searches); `.skip` reads results or a further page without saving anything (GET
+    /// /api/searches), as does any search with a `cursor`. A query with nothing to search for reads
+    /// just your recent searches.
+    public func search(_ query: SearchQuery, sort: SearchSort = .newest, cursor: Int? = nil, history: SearchHistory = .skip) async throws -> SearchResults {
+        if history == .record && cursor == nil {
             return try await send("POST", "/api/searches", body: query.body(sort: sort))
         }
         // With nothing to search for, the server answers just the recent searches, as the web reads them.
@@ -228,22 +227,22 @@ public final class EmberClient: Sendable {
 
     /// The workspace socket's request: wss (or ws) to `/api/socket`, `Origin` set to the server's
     /// origin, and the session cookie attached.
-    public func workspaceSocketRequest() -> URLRequest {
+    package func workspaceSocketRequest() -> URLRequest {
         socketRequest("/api/socket")
     }
 
     /// A room socket's request, as `RoomSocket.query` names what it asks for.
-    public func roomSocketRequest(roomID: RoomID, visible: Bool, since: Int?, around: String?) -> URLRequest {
+    package func roomSocketRequest(roomID: RoomID, visible: Bool, since: Int?, around: MessageID?) -> URLRequest {
         socketRequest("/api/rooms/\(Self.segment(roomID))/socket?\(RoomSocket.query(visible: visible, since: since, around: around))")
     }
 
     /// The workspace socket, keeping itself connected on this client's connector and network.
-    @MainActor public func workspaceSocket() -> ReconnectingSocket {
+    @MainActor package func workspaceSocket() -> ReconnectingSocket {
         ReconnectingSocket(connector: connector, timing: timing, network: network) { [self] in workspaceSocketRequest() }
     }
 
     /// A room's socket, keeping itself connected; `request` is asked again for each attempt.
-    @MainActor public func roomSocket(request: @escaping @MainActor () -> URLRequest) -> ReconnectingSocket {
+    @MainActor package func roomSocket(request: @escaping @MainActor () -> URLRequest) -> ReconnectingSocket {
         ReconnectingSocket(connector: connector, timing: timing, network: network, request: request)
     }
 
@@ -318,8 +317,21 @@ public final class EmberClient: Sendable {
         guard (200..<300).contains(response.statusCode) else {
             throw refusal(response.statusCode, data: data, request: request, response: response, sessionWasCurrent: answer.sessionWasCurrent)
         }
-        if request.url?.path == "/api/session", request.httpMethod == "POST" { lastSignOut.withLock { $0 = nil } }
+        // A reset answered 200 changed the password without signing in.
+        if Self.startsSession(request), request.url?.path != "/api/password_resets" || response.statusCode == 201 {
+            lastSignOut.withLock { $0 = nil }
+        }
         return (data, response)
+    }
+
+    /// Whether a 2xx to `request` signs someone in: a password or a name (`POST /api/session`), a
+    /// sign-in link (`POST /api/session/transfers`), or a reset code (`PUT /api/password_resets`).
+    /// A 401 to one of these is about what was sent, not the session kept.
+    static func startsSession(_ request: URLRequest) -> Bool {
+        switch (request.httpMethod, request.url?.path) {
+        case ("POST", "/api/session"), ("POST", "/api/session/transfers"), ("PUT", "/api/password_resets"): true
+        default: false
+        }
     }
 
     /// An answer, and whether the session cookie it went with is still the one kept.
@@ -407,7 +419,7 @@ public final class EmberClient: Sendable {
 
     private func refusal(_ status: Int, data: Data, request: URLRequest, response: HTTPURLResponse, sessionWasCurrent: Bool) -> EmberError {
         let error = EmberError.refusal(status: status, data: data)
-        if status == 401, sessionWasCurrent, isOwn(request, response), request.url?.path != "/api/session" {
+        if status == 401, sessionWasCurrent, isOwn(request, response), !Self.startsSession(request) {
             lastSignOut.withLock { $0 = .sessionEnded }
             signedOutHandlers.call()
         }
@@ -452,12 +464,17 @@ public final class EmberClient: Sendable {
     static func segment(_ id: String) -> String {
         id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? id
     }
+
+    /// An id as one segment of a path: `segment(_:)` of its string.
+    static func segment<ID: EmberIdentifier>(_ id: ID) -> String {
+        segment(id.rawValue)
+    }
 }
 
 /// Why someone was signed out.
 public enum SignOutReason: Equatable, Sendable {
-    /// They signed out: `EmberClient.signOut()`.
-    case asked
+    /// They signed out themselves: `EmberClient.signOut()`.
+    case userInitiated
     /// The server no longer knows their session: a request was answered 401, or a socket closed as
     /// revoked or had its upgrade refused 401.
     case sessionEnded

@@ -4,16 +4,41 @@ import EmberSDK
 extension EmberClient {
     /// A client on stand-in transports, with cookies of its own, so nothing touches the network or
     /// the app's real session. Pass `timing` on a `ManualClock` to control every wait, and `network`
-    /// to take the network away.
+    /// to take the network away. Unsent messages are kept in memory, and no background time is
+    /// asked for.
     public static func mock(
         origin: URL = URL(string: "https://ember.test")!,
         transport: MockHTTPTransport = MockHTTPTransport(),
         connector: MockSocketConnector = MockSocketConnector(),
         cookies: HTTPCookieStorage = EphemeralCookieStorage(),
         timing: EmberTiming = EmberTiming(),
-        network: MockNetworkPath = MockNetworkPath()
+        network: MockNetworkPath = MockNetworkPath(),
+        unsentStore: any UnsentMessageStore = MemoryUnsentMessageStore(),
+        backgroundTime: BackgroundTime = .none
     ) -> EmberClient {
-        EmberClient(origin: origin, transport: transport, connector: connector, cookies: cookies, timing: timing, network: network)
+        EmberClient(origin: origin, environment: .mock(
+            transport: transport, connector: connector, cookies: cookies, timing: timing, network: network,
+            unsentStore: unsentStore, backgroundTime: backgroundTime
+        ))
+    }
+}
+
+extension EmberEnvironment {
+    /// Stand-ins for everything, as `EmberClient.mock()` uses: for a test with a transport or
+    /// connector of its own, `EmberClient(origin: url, environment: .mock(transport: mine))`.
+    public static func mock(
+        transport: any HTTPTransport = MockHTTPTransport(),
+        connector: any SocketConnector = MockSocketConnector(),
+        cookies: HTTPCookieStorage = EphemeralCookieStorage(),
+        timing: EmberTiming = EmberTiming(),
+        network: any NetworkPathSource = MockNetworkPath(),
+        unsentStore: any UnsentMessageStore = MemoryUnsentMessageStore(),
+        backgroundTime: BackgroundTime = .none
+    ) -> EmberEnvironment {
+        EmberEnvironment(
+            transport: transport, connector: connector, cookies: cookies, timing: timing, network: network,
+            unsentStore: unsentStore, backgroundTime: backgroundTime
+        )
     }
 }
 

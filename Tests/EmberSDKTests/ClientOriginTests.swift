@@ -56,13 +56,13 @@ import Testing
         #expect(client.signOutReason == .sessionEnded)
     }
 
-    @Test func signingOutSaysItWasAsked() async throws {
+    @Test func signingOutSaysItWasUserInitiated() async throws {
         let transport = MockHTTPTransport()
         let client = EmberClient.mock(transport: transport)
         transport.stub("POST", "/api/session", json: Fixtures.meJSON(), headers: Fixtures.sessionCookieHeaders)
         _ = try await client.signIn(emailAddress: "ada@example.com", password: "not-a-real-password")
         await client.signOut()
-        #expect(client.signOutReason == .asked)
+        #expect(client.signOutReason == .userInitiated)
 
         // Signing in again forgets it.
         _ = try await client.signIn(emailAddress: "ada@example.com", password: "not-a-real-password")
@@ -125,14 +125,7 @@ import Testing
 
 /// A client for `origin` whose every request is answered from `to`.
 private func redirected(from origin: String, to: String) -> EmberClient {
-    EmberClient(
-        origin: URL(string: origin)!,
-        transport: Redirecting(to: to),
-        connector: MockSocketConnector(),
-        cookies: EphemeralCookieStorage(),
-        timing: EmberTiming(),
-        network: MockNetworkPath()
-    )
+    EmberClient(origin: URL(string: origin)!, environment: .mock(transport: Redirecting(to: to)))
 }
 
 /// A server whose `/api/bootstrap` is answered from `to`, as URLSession reports a redirect it followed.

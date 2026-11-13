@@ -13,10 +13,47 @@ public enum RoomList {
     /// Shared rooms, none hidden, in sidebar order: starred first in star order, then the
     /// workspace's shared order, then by name (lowercased, compared in the person's language), then id.
     public static func shared(_ rooms: [SidebarRoom], favorites: [RoomID], sharedOrder: [RoomID]) -> [SidebarRoom] {
+        inSidebarOrder(rooms.filter { !$0.room.isDirect && !isHidden($0) }, favorites: favorites, sharedOrder: sharedOrder)
+    }
+
+    /// Shared rooms, hidden ones too, in the workspace's shared order, stars aside: what an
+    /// administrator puts in order for everyone.
+    public static func inSharedOrder(_ rooms: [SidebarRoom], sharedOrder: [RoomID]) -> [SidebarRoom] {
+        inSidebarOrder(rooms.filter { !$0.room.isDirect }, favorites: [], sharedOrder: sharedOrder)
+    }
+
+    /// `ids` with the ones at `offsets` moved to before `destination`, as SwiftUI's `onMove` gives them.
+    package static func moving<T>(_ ids: [T], fromOffsets offsets: IndexSet, toOffset destination: Int) -> [T] {
+        let moved = offsets.filter { ids.indices.contains($0) }.map { ids[$0] }
+        let before = ids.indices.filter { $0 < destination && !offsets.contains($0) }.map { ids[$0] }
+        let after = ids.indices.filter { $0 >= destination && !offsets.contains($0) }.map { ids[$0] }
+        return before + moved + after
+    }
+
+    /// `ids` with the ones `order` lists in its order, in the places those held, the rest kept where they are.
+    package static func reordered(_ ids: [RoomID], by order: [RoomID]) -> [RoomID] {
+        let present = Set(ids)
+        var queue = order.filter { present.contains($0) }
+        let ordered = Set(queue)
+        var seen = Set<RoomID>()
+        queue.removeAll { !seen.insert($0).inserted }
+        var result: [RoomID] = []
+        var next = queue.makeIterator()
+        for id in ids {
+            if ordered.contains(id) {
+                if let id = next.next() { result.append(id) }
+            } else {
+                result.append(id)
+            }
+        }
+        return result
+    }
+
+    /// `inSidebarOrder` in room-list.ts.
+    private static func inSidebarOrder(_ rooms: [SidebarRoom], favorites: [RoomID], sharedOrder: [RoomID]) -> [SidebarRoom] {
         let stars = places(in: favorites)
         let ranks = places(in: sharedOrder)
         return rooms
-            .filter { !$0.room.isDirect && !isHidden($0) }
             .map { (room: $0, star: stars[$0.id] ?? .max, rank: ranks[$0.id] ?? .max, name: ($0.room.name ?? "").lowercased()) }
             .sorted { a, b in
                 if a.star != b.star { return a.star < b.star }
@@ -44,11 +81,19 @@ public enum RoomList {
     }
 
     /// The people the sidebar suggests for DMs: everyone listed but the people in their DMs, as many
-    /// as there's room for beside those people and them.
-    public static func suggestedPeople(_ suggestions: [User], rooms: [SidebarRoom]) -> [User] {
+    /// as there's room for beside those people and them. Anyone `people` (the directory) has as other
+    /// than active, as banned, deactivated or suspended since the list arrived, is left out; someone
+    /// the directory doesn't have counts as active.
+    public static func suggestedPeople(_ suggestions: [User], rooms: [SidebarRoom], people: [UserID: DirectoryUser] = [:]) -> [User] {
         let inDirects = Set(rooms.filter(\.room.isDirect).flatMap { $0.room.members ?? [] }.map(\.id))
         let count = max(0, suggestedPeopleCount - inDirects.count - 1)
-        return Array(suggestions.filter { !inDirects.contains($0.id) }.prefix(count))
+        let active = suggestions.filter { isSuggestable($0.id, people: people) }
+        return Array(active.filter { !inDirects.contains($0.id) }.prefix(count))
+    }
+
+    /// Whether the sidebar may suggest someone: they're active in `people`, or `people` doesn't have them.
+    public static func isSuggestable(_ id: UserID, people: [UserID: DirectoryUser]) -> Bool {
+        (people[id]?.status ?? .active) == .active
     }
 
     /// Whether the sidebar marks the room unread: never the room on screen, which counts as read while

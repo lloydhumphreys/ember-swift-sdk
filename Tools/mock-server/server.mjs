@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { MAX_PREVIEW_BYTES, PART_SIZE, files } from "./files.mjs";
 import { createBotApi } from "./bots.mjs";
 import { cardPicture, keptCards } from "./cards.mjs";
+import { installAccountRoutes } from "./accounts.mjs";
 import { PEOPLE, deployCards, seed } from "./seed.mjs";
 import { HISTORY_PAGE_SIZE, MAX_BOOST_LENGTH, Store, randomBase36, sortableId } from "./store.mjs";
 import { acceptWebSocket, refuseUpgrade } from "./ws.mjs";
@@ -48,7 +49,8 @@ function sharedPasswordDigest() {
 }
 
 const passwordDigest = sharedPasswordDigest();
-const passwordMatches = (given) => timingSafeEqual(createHash("sha256").update(given).digest(), passwordDigest);
+/// Whether `given` is `user`'s password: their own once they have changed it, else the shared one.
+const passwordMatches = (given, user = null) => timingSafeEqual(createHash("sha256").update(given).digest(), user?.passwordDigest ?? passwordDigest);
 
 const store = new Store();
 const { people, rooms, bots: seededBots } = seed(store, Date.now(), { mediaOrigin: MEDIA_ORIGIN });
@@ -80,6 +82,15 @@ store.hub = {
   workspace(userId, frame) {
     const text = JSON.stringify(frame);
     for (const socket of workspaceSockets) if (socket.userId === userId) socket.conn.send(text);
+  },
+  /// Everyone with a workspace socket open, as the real server tells everyone of a change to a person or to the shared order.
+  everyone(frame) {
+    const text = JSON.stringify(frame);
+    for (const socket of workspaceSockets) socket.conn.send(text);
+  },
+  /// Closes the room's sockets, of one person or all of them, with a close code the client acts on.
+  closeRoom(roomId, userId, code, reason) {
+    for (const socket of [...roomSockets]) if (socket.roomId === roomId && (userId === null || socket.userId === userId)) socket.conn.close(code, reason);
   },
   viewers(roomId) {
     const viewers = new Set();
@@ -208,11 +219,23 @@ function etagged(req, res, body) {
 }
 
 const signedOut = (res) => fail(res, 401, "Not signed in");
+
+/// Ends a person's sessions (all, or all but `exceptToken`), closing their sockets with `code`, as the real server does when a password changes or someone is banned.
+function endSessions(userId, code, reason, exceptToken = null) {
+  const ended = new Set();
+  for (const [token, owner] of [...store.sessions]) {
+    if (owner !== userId || token === exceptToken) continue;
+    store.sessions.delete(token);
+    ended.add(token);
+  }
+  for (const socket of [...workspaceSockets, ...roomSockets]) if (ended.has(socket.token)) socket.conn.close(code, reason);
+}
 for (const bot of Object.values(seededBots)) rooms.engineering.members.set(bot.id, { unread: false, involvement: "mentions" });
 const bots = createBotApi({ store, files, avatarToken, readRaw });
 
 const routes = [];
 const route = (method, pattern, handler) => routes.push({ method, pattern: new RegExp(`^${pattern}$`), handler });
+
 
 route("GET", "/api/account/bots", (req, res) => {
   const user = userOf(req);
@@ -234,7 +257,7 @@ route("GET", "/api/bootstrap", (req, res) => {
       guestSignIn: GUEST_SIGN_IN,
       signInWithMemberful: false,
       turnstileSiteKey: null,
-      passwordResetCodes: false,
+      passwordResetCodes: true,
       account: accountWire(),
       version: VERSION,
       vapidPublicKey: null,
@@ -263,8 +286,8 @@ route("POST", "/api/session", async (req, res) => {
   if (typeof email !== "string" || typeof password !== "string" || email.length > 254 || password === "") return fail(res, 401, SIGN_IN_REJECTED);
   const user = store.userByEmail(email);
   // Compared even when there's no such person, so the answer takes as long either way.
-  const matches = passwordMatches(password);
-  if (!user || !matches) return fail(res, 401, SIGN_IN_REJECTED);
+  const matches = passwordMatches(password, user);
+  if (!user || !matches || user.status !== "active" || user.role === "bot") return fail(res, 401, SIGN_IN_REJECTED);
   reply(res, 201, { user: store.me(user) }, { "Set-Cookie": startSession(user) });
 });
 
@@ -517,6 +540,10 @@ function serveAvatar(res, token) {
   const userId = avatarTokenUser(token);
   const user = userId ? store.users.get(userId) : undefined;
   if (!user) return fail(res, 404, "Not found");
+  if (user.avatar && !user.avatar.initials) {
+    res.writeHead(200, { "Content-Type": user.avatar.type, "Content-Length": user.avatar.bytes.length, "Cache-Control": "public, max-age=1800" });
+    return res.end(user.avatar.bytes);
+  }
   const hue = parseInt(createHash("sha1").update(user.id).digest("hex").slice(0, 4), 16) % 360;
   const initials = initialsOf(user.name).replace(/[<>&]/g, "");
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128"><rect width="128" height="128" fill="hsl(${hue} 55% 45%)"/><text x="64" y="64" fill="#fff" font-family="sans-serif" font-size="52" text-anchor="middle" dominant-baseline="central">${initials}</text></svg>`;
@@ -594,6 +621,11 @@ function workspaceSocket(conn, user, token) {
 
 const unrecognised = (conn) => send(conn, { type: "error", message: "Unrecognized frame" });
 const isId = (value) => typeof value === "string" && value.length > 0 && value.length <= 64;
+// Rooms, sidebar order, profiles, bans, transfers, password resets, invitations and link previews.
+installAccountRoutes({
+  route, store, bots, userOf, sessionToken, startSession, endSessions, reply, fail, readBody, readRaw, lengthOf, isObject, isId, signedOut, avatarToken,
+  passwordMatches, accountWire, ROOM_ID, MAX_LISTED_USERS, origin: `http://${HOST}:${PORT}`,
+});
 /// The real parser's page size: a number, floored and held to 1..100, or else the default.
 const limitOf = (value) => (typeof value === "number" ? Math.min(Math.max(1, Math.floor(value)), 100) : HISTORY_PAGE_SIZE);
 

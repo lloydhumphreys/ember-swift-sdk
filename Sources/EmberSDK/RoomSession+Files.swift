@@ -2,18 +2,18 @@ import Foundation
 
 /// A file on its way, and where its pending message is shown.
 struct UploadJob {
-    let clientMessageId: String
+    let clientMessageId: ClientMessageID
     let source: UploadSource
     /// The thread it replies in; nil for the room.
     let thread: ThreadSession?
-    let alsoSend: Bool
+    let delivery: ReplyDelivery
 }
 
 /// What waits in a session's queue.
 enum Outgoing {
     case file(UploadJob)
     /// A message written with files, which goes once they have.
-    case text(clientMessageId: String, frame: ClientFrame, thread: ThreadSession?)
+    case text(clientMessageId: ClientMessageID, frame: ClientFrame, thread: ThreadSession?)
 }
 
 /// The upload going now. `attempt` tells its answers from those of one cancelled or retried.
@@ -34,23 +34,23 @@ extension RoomSession {
     /// the order given, then the text's, so they pair with `files` by position.
     ///
     /// A file whose `isTooLarge` is true (over 250 MB) is refused: its id is answered all the same,
-    /// to keep the positions, but nothing is pending or sent under it, a temporary one is deleted,
-    /// and `notice` says `Uploads.tooLarge(name)`.
+    /// to keep the positions, but nothing is pending or sent under it, one made with
+    /// `.deleteWhenFinished` is deleted, and `notice` says `Uploads.tooLarge(name)`.
     ///
-    /// Once the workspace has shut the session down (signed out), nothing is sent: temporary files
-    /// are deleted, nothing is pending, and the answer is empty, as nothing went.
+    /// Once the workspace has shut the session down (signed out), nothing is sent: files made with
+    /// `.deleteWhenFinished` are deleted, nothing is pending, and the answer is empty, as nothing went.
     ///
     /// One file goes up at a time, over HTTP, so a socket reconnecting meanwhile doesn't stop it.
     @discardableResult
-    public func send(files: [UploadSource], body: String? = nil, plainText: String? = nil) -> [String] {
-        enqueue(files: files, body: body, plainText: plainText, thread: nil, alsoSend: false)
+    public func send(files: [UploadSource], body: String? = nil, plainText: String? = nil) -> [ClientMessageID] {
+        enqueue(files: files, body: body, plainText: plainText, thread: nil, delivery: .threadOnly)
     }
 
     /// The thread under `parentID`: the one already open if a screen holds it (or one let go of that
     /// still has a reply on its way), else a new one. `replyID` is a reply to open at: on a thread
     /// that's there already, its `timeline.focus` goes to that reply, paging back to it if need be;
     /// nil leaves it where it is.
-    public func thread(_ parentID: String, at replyID: String? = nil) -> ThreadSession {
+    public func thread(_ parentID: MessageID, at replyID: MessageID? = nil) -> ThreadSession {
         if let thread = threads.first(where: { $0.parentID == parentID }) {
             if let replyID { thread.go(to: replyID) }
             return thread
@@ -75,17 +75,17 @@ extension RoomSession {
             || hasUnsentMessages
     }
 
-    func enqueue(files: [UploadSource], body: String?, plainText: String?, thread: ThreadSession?, alsoSend: Bool) -> [String] {
+    func enqueue(files: [UploadSource], body: String?, plainText: String?, thread: ThreadSession?, delivery: ReplyDelivery) -> [ClientMessageID] {
         // A job would hold the session, and `keep` would tie the thread to it again, after sign-out.
         // No ids: one per file would pair the app's thumbnails with messages that never show.
         guard !isShutDown else {
             files.forEach { removeIfTemporary($0) }
             return []
         }
-        var ids: [String] = []
+        var ids: [ClientMessageID] = []
         var refused: [String] = []
         for source in files {
-            let id = UUID().uuidString.lowercased()
+            let id = ClientMessageID(UUID().uuidString.lowercased())
             // Answered all the same, so the ids still pair with `files` by position.
             ids.append(id)
             guard !source.isTooLarge else {
@@ -96,11 +96,11 @@ extension RoomSession {
             }
             let upload = PendingUpload(name: source.name, contentType: source.contentType, byteSize: source.byteSize)
             if let thread {
-                thread.attach(upload, alsoSend: alsoSend, clientMessageId: id)
+                thread.attach(upload, delivery: delivery, clientMessageId: id)
             } else {
                 timeline.attach(upload, clientMessageId: id, now: Date())
             }
-            outgoing.append(.file(UploadJob(clientMessageId: id, source: source, thread: thread, alsoSend: alsoSend)))
+            outgoing.append(.file(UploadJob(clientMessageId: id, source: source, thread: thread, delivery: delivery)))
         }
         // Each refused file named, as the web's composer names them, on the screen that sent them.
         if !refused.isEmpty {
@@ -110,10 +110,10 @@ extension RoomSession {
         if let body, !body.isEmpty {
             let plainText = plainText ?? body
             if outgoing.isEmpty, running == nil {
-                ids.append(thread?.reply(body: body, plainText: plainText, alsoSend: alsoSend) ?? send(body: body, plainText: plainText))
+                ids.append(thread?.reply(body: body, plainText: plainText, delivery: delivery) ?? send(body: body, plainText: plainText))
             } else {
-                let id = UUID().uuidString.lowercased()
-                let frame = thread?.hold(body: body, plainText: plainText, alsoSend: alsoSend, clientMessageId: id)
+                let id = ClientMessageID(UUID().uuidString.lowercased())
+                let frame = thread?.hold(body: body, plainText: plainText, delivery: delivery, clientMessageId: id)
                     ?? timeline.send(body: body, plainText: plainText, clientMessageId: id)
                 outgoing.append(.text(clientMessageId: id, frame: frame, thread: thread))
                 ids.append(id)
@@ -150,7 +150,7 @@ extension RoomSession {
     /// Whether a held room message is still pending (not discarded meanwhile) and can go now. One
     /// that can't waits for the check that follows the next welcome, as any message does, timed
     /// from its turn.
-    private func admittedPending(_ id: String) -> Bool {
+    private func admittedPending(_ id: ClientMessageID) -> Bool {
         isAdmitted && timeline.pending.contains { $0.clientMessageId == id && $0.failure == nil }
     }
 
@@ -166,7 +166,7 @@ extension RoomSession {
             do {
                 let message = try await client.upload(
                     job.source, in: roomID, clientMessageId: id,
-                    parentId: job.thread?.parentID, alsoSend: job.alsoSend, resuming: resuming,
+                    parentId: job.thread?.parentID, delivery: job.delivery, resuming: resuming,
                     checkpoint: { [weak self] checkpoint in await self?.checkpointed(id, attempt: attempt, checkpoint) },
                     progress: { [weak self] sent in
                         Task { @MainActor in self?.progressed(id, attempt: attempt, sent: sent) }
@@ -180,12 +180,12 @@ extension RoomSession {
         running = RunningUpload(job: job, attempt: attempt, task: task, endBackground: endBackground)
     }
 
-    private func checkpointed(_ id: String, attempt: UUID, _ checkpoint: UploadCheckpoint) {
+    private func checkpointed(_ id: ClientMessageID, attempt: UUID, _ checkpoint: UploadCheckpoint) {
         guard running?.attempt == attempt else { return }
         uploadCheckpoints[id] = checkpoint
     }
 
-    private func progressed(_ id: String, attempt: UUID, sent: Int) {
+    private func progressed(_ id: ClientMessageID, attempt: UUID, sent: Int) {
         guard let running, running.attempt == attempt else { return }
         if let thread = running.job.thread {
             thread.uploadProgress(id, sentBytes: sent)
@@ -196,7 +196,7 @@ extension RoomSession {
 
     /// Whether `id` is a text held behind files. A reconnect's `message.check` finds it missing, and
     /// it isn't sent then: it goes in its turn.
-    func isHeldText(_ id: String) -> Bool {
+    func isHeldText(_ id: ClientMessageID) -> Bool {
         outgoing.contains { if case let .text(held, _, _) = $0 { held == id } else { false } }
     }
 
@@ -231,7 +231,7 @@ extension RoomSession {
     }
 
     /// Queues a failed file to go again, from the part after the last the server took.
-    func retryUpload(_ id: String) {
+    func retryUpload(_ id: ClientMessageID) {
         guard let job = failedUploads.removeValue(forKey: id) else { return }
         // Confirmed since it failed: sending it again would only post it twice.
         guard isUnconfirmed(job) else {
@@ -245,7 +245,7 @@ extension RoomSession {
     }
 
     /// Stops a file wherever it is (going, waiting or failed) and deletes it if it was temporary.
-    func discardUpload(_ id: String) {
+    func discardUpload(_ id: ClientMessageID) {
         var job: UploadJob?
         uploadCheckpoints[id] = nil
         if let running, running.job.clientMessageId == id {
@@ -310,10 +310,11 @@ extension RoomSession {
         }
     }
 
-    /// Deletes a temporary source, and the folder it was in once that's empty: the app stages each
-    /// file in a folder of its own. Never the temporary directory itself, and never further up.
+    /// Deletes a source made with `.deleteWhenFinished`, and the folder it was in once that's empty:
+    /// the app stages each file in a folder of its own. Never the temporary directory itself, and
+    /// never further up.
     func removeIfTemporary(_ source: UploadSource) {
-        guard source.isTemporary else { return }
+        guard source.disposition == .deleteWhenFinished else { return }
         try? FileManager.default.removeItem(at: source.fileURL)
         let folder = source.fileURL.deletingLastPathComponent()
         let temporary = FileManager.default.temporaryDirectory

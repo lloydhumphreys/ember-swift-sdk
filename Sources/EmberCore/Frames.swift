@@ -4,17 +4,17 @@ import Foundation
 // packages/protocol/src/index.ts declare them. Each `type` string here is the protocol's own.
 
 /// A page of a room's messages that takes the timeline's place: the newest, or the one around a message.
-public struct TimelinePage: Decodable, Hashable, Sendable {
+package struct TimelinePage: Decodable, Hashable, Sendable {
     /// Oldest first.
-    public var messages: [Message]
+    package var messages: [Message]
     /// Whether the room has messages older than the page.
-    public var hasMore: Bool
+    package var hasMore: Bool
     /// Whether it has newer ones, which only a page around a message can leave out.
-    public var hasNewer: Bool
+    package var hasNewer: Bool
     /// The message the page is around, or nil for the newest page.
-    public var around: String?
+    package var around: MessageID?
 
-    public init(messages: [Message], hasMore: Bool = false, hasNewer: Bool = false, around: String? = nil) {
+    package init(messages: [Message], hasMore: Bool = false, hasNewer: Bool = false, around: MessageID? = nil) {
         self.messages = messages
         self.hasMore = hasMore
         self.hasNewer = hasNewer
@@ -23,47 +23,47 @@ public struct TimelinePage: Decodable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey { case messages, hasMore, hasNewer, around }
 
-    public init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         messages = try container.decodeIfPresent(Lossy<Message>.self, forKey: .messages)?.elements ?? []
         hasMore = try container.decodeIfPresent(Bool.self, forKey: .hasMore) ?? false
         hasNewer = try container.decodeIfPresent(Bool.self, forKey: .hasNewer) ?? false
-        around = try container.decodeIfPresent(String.self, forKey: .around)
+        around = try container.decodeIfPresent(MessageID.self, forKey: .around)
     }
 }
 
 // MARK: - Client frames
 
 /// What a client sends on a room socket.
-public enum ClientFrame: Equatable, Sendable {
+package enum ClientFrame: Equatable, Sendable {
     /// A new message, its body markup. With `parentId`, a reply in that message's thread, which
     /// `alsoSend` sends to the room too.
-    case createMessage(clientMessageId: String, body: String, parentId: String? = nil, alsoSend: Bool? = nil)
-    case updateMessage(messageId: String, body: String)
-    case deleteMessage(messageId: String)
-    case createBoost(messageId: String, content: String)
-    case deleteBoost(boostId: String)
+    case createMessage(clientMessageId: ClientMessageID, body: String, parentId: MessageID? = nil, alsoSend: Bool? = nil)
+    case updateMessage(messageId: MessageID, body: String)
+    case deleteMessage(messageId: MessageID)
+    case createBoost(messageId: MessageID, content: String)
+    case deleteBoost(boostId: BoostID)
     case typingStart
     case typingStop
     /// Up to `limit` messages before `messageId`, oldest first. The wire calls it `before`.
-    case historyBefore(messageId: String, limit: Int? = nil)
+    case historyBefore(messageId: MessageID, limit: Int? = nil)
     /// Up to `limit` messages after `messageId`. The wire calls it `after`.
-    case historyAfter(messageId: String, limit: Int? = nil)
+    case historyAfter(messageId: MessageID, limit: Int? = nil)
     /// The page around a message, or the newest page for nil.
-    case historyAround(messageId: String?)
+    case historyAround(messageId: MessageID?)
     /// Which of these the room stored, after a closed socket lost their confirmations. At most
     /// `Limits.checkedMessages` ids.
-    case checkMessages(clientMessageIds: [String])
-    case openThread(parentId: String)
-    case closeThread(parentId: String)
-    case threadBefore(parentId: String, before: String, limit: Int? = nil)
+    case checkMessages(clientMessageIds: [ClientMessageID])
+    case openThread(parentId: MessageID)
+    case closeThread(parentId: MessageID)
+    case threadBefore(parentId: MessageID, before: MessageID, limit: Int? = nil)
     /// `presence.visible`: the app is or isn't in front.
     case visible(Bool)
     case ping
 
     /// The protocol's name for the frame (`message.create`, `history.before`…), which is what a server
     /// `error` frame's `failed` names.
-    public var type: String {
+    package var type: String {
         switch self {
         case .createMessage: "message.create"
         case .updateMessage: "message.update"
@@ -85,11 +85,12 @@ public enum ClientFrame: Equatable, Sendable {
     }
 
     /// The frame's fields, `type` among them, as the wire has them.
-    public var fields: [String: JSONValue] {
+    package var fields: [String: JSONValue] {
         var fields: [String: JSONValue] = ["type": .string(type)]
         func set(_ key: String, _ value: String?) { if let value { fields[key] = .string(value) } }
         func set(_ key: String, _ value: Int?) { if let value { fields[key] = .number(Double(value)) } }
         func set(_ key: String, _ value: Bool?) { if let value { fields[key] = .bool(value) } }
+        func set<ID: EmberIdentifier>(_ key: String, _ value: ID?) { set(key, value?.rawValue) }
         switch self {
         case let .createMessage(clientMessageId, body, parentId, alsoSend):
             set("clientMessageId", clientMessageId)
@@ -115,7 +116,7 @@ public enum ClientFrame: Equatable, Sendable {
         case let .historyAround(messageId):
             set("messageId", messageId)
         case let .checkMessages(clientMessageIds):
-            fields["clientMessageIds"] = .array(clientMessageIds.map(JSONValue.string))
+            fields["clientMessageIds"] = .array(clientMessageIds.map { .string($0.rawValue) })
         case let .openThread(parentId), let .closeThread(parentId):
             set("parentId", parentId)
         case let .threadBefore(parentId, before, limit):
@@ -131,7 +132,7 @@ public enum ClientFrame: Equatable, Sendable {
     }
 
     /// The frame as the JSON text the socket sends. `ping` is exactly `{"type":"ping"}`.
-    public var text: String {
+    package var text: String {
         if case .ping = self { return #"{"type":"ping"}"# }
         let encoder = EmberJSON.encoder()
         encoder.outputFormatting.insert(.sortedKeys)
@@ -142,51 +143,52 @@ public enum ClientFrame: Equatable, Sendable {
 
     /// Reads a frame a client sent, as the room would: nil for anything it wouldn't take. For tests and
     /// stand-in servers that check what a client sent.
-    public init?(text: String) {
+    package init?(text: String) {
         guard let value = try? EmberJSON.decoder().decode(JSONValue.self, from: Data(text.utf8)),
               case let .object(f) = value, case let .string(type)? = f["type"] else { return nil }
         func string(_ key: String) -> String? { if case let .string(s)? = f[key] { s } else { nil } }
         func int(_ key: String) -> Int? { if case let .number(n)? = f[key], n == n.rounded() { Int(n) } else { nil } }
         func bool(_ key: String) -> Bool? { if case let .bool(b)? = f[key] { b } else { nil } }
+        func identifier<ID: EmberIdentifier>(_ key: String) -> ID? { string(key).map(ID.init(rawValue:)) }
         switch type {
         case "message.create":
-            guard let id = string("clientMessageId"), let body = string("body") else { return nil }
-            self = .createMessage(clientMessageId: id, body: body, parentId: string("parentId"), alsoSend: bool("alsoSend"))
+            guard let id: ClientMessageID = identifier("clientMessageId"), let body = string("body") else { return nil }
+            self = .createMessage(clientMessageId: id, body: body, parentId: identifier("parentId"), alsoSend: bool("alsoSend"))
         case "message.update":
-            guard let id = string("messageId"), let body = string("body") else { return nil }
+            guard let id: MessageID = identifier("messageId"), let body = string("body") else { return nil }
             self = .updateMessage(messageId: id, body: body)
         case "message.delete":
-            guard let id = string("messageId") else { return nil }
+            guard let id: MessageID = identifier("messageId") else { return nil }
             self = .deleteMessage(messageId: id)
         case "boost.create":
-            guard let id = string("messageId"), let content = string("content") else { return nil }
+            guard let id: MessageID = identifier("messageId"), let content = string("content") else { return nil }
             self = .createBoost(messageId: id, content: content)
         case "boost.delete":
-            guard let id = string("boostId") else { return nil }
+            guard let id: BoostID = identifier("boostId") else { return nil }
             self = .deleteBoost(boostId: id)
         case "typing.start": self = .typingStart
         case "typing.stop": self = .typingStop
         case "history.before":
-            guard let id = string("before") else { return nil }
+            guard let id: MessageID = identifier("before") else { return nil }
             self = .historyBefore(messageId: id, limit: int("limit"))
         case "history.after":
-            guard let id = string("after") else { return nil }
+            guard let id: MessageID = identifier("after") else { return nil }
             self = .historyAfter(messageId: id, limit: int("limit"))
         case "history.around":
-            self = .historyAround(messageId: string("messageId"))
+            self = .historyAround(messageId: identifier("messageId"))
         case "message.check":
             guard case let .array(items)? = f["clientMessageIds"] else { return nil }
-            let ids = items.compactMap { if case let .string(s) = $0 { s } else { nil } }
+            let ids = items.compactMap { if case let .string(s) = $0 { ClientMessageID(s) } else { nil } }
             guard ids.count == items.count else { return nil }
             self = .checkMessages(clientMessageIds: ids)
         case "thread.open":
-            guard let id = string("parentId") else { return nil }
+            guard let id: MessageID = identifier("parentId") else { return nil }
             self = .openThread(parentId: id)
         case "thread.close":
-            guard let id = string("parentId") else { return nil }
+            guard let id: MessageID = identifier("parentId") else { return nil }
             self = .closeThread(parentId: id)
         case "thread.before":
-            guard let id = string("parentId"), let before = string("before") else { return nil }
+            guard let id: MessageID = identifier("parentId"), let before: MessageID = identifier("before") else { return nil }
             self = .threadBefore(parentId: id, before: before, limit: int("limit"))
         case "presence.visible":
             guard let visible = bool("visible") else { return nil }
@@ -201,39 +203,39 @@ public enum ClientFrame: Equatable, Sendable {
 
 /// What a room sends. `init(text:)` never throws: anything it can't read is `.unknown(type)`, with
 /// the frame's `type`, or an empty string when the text isn't a frame at all.
-public enum ServerFrame: Equatable, Sendable {
+package enum ServerFrame: Equatable, Sendable {
     /// Everything a newcomer needs. Its page is the newest, or the one around the message the
     /// socket's address named.
     case welcome(you: User, present: [User], seq: Int, page: TimelinePage)
     /// In place of a welcome, to a socket that named `since=`: the messages changed since, as they are
     /// now, oldest first, and the ids of those deleted.
-    case resumed(you: User, messages: [Message], deletedIds: [String], present: [User], seq: Int)
+    case resumed(you: User, messages: [Message], deletedIds: [MessageID], present: [User], seq: Int)
     case messageCreated(Message, seq: Int)
     case messageUpdated(Message, seq: Int)
-    case messageDeleted(messageId: String, seq: Int)
+    case messageDeleted(messageId: MessageID, seq: Int)
     case boostCreated(Boost, seq: Int)
-    case boostDeleted(boostId: String, messageId: String, seq: Int)
+    case boostDeleted(boostId: BoostID, messageId: MessageID, seq: Int)
     case presenceJoined(User)
     case presenceLeft(userId: UserID)
     /// Someone started or stopped typing: in the room's composer, or, with `threadId`, in that thread.
-    case typing(user: User, typing: Bool, threadId: String?)
+    case typing(user: User, typing: Bool, threadId: MessageID?)
     /// Answers `history.before`.
-    case history(before: String, messages: [Message], hasMore: Bool)
+    case history(before: MessageID, messages: [Message], hasMore: Bool)
     /// Answers `history.after`.
-    case historyAfter(after: String, messages: [Message], hasNewer: Bool)
+    case historyAfter(after: MessageID, messages: [Message], hasNewer: Bool)
     /// Answers `history.around` with a page to show in the timeline's place.
     case historyAround(TimelinePage)
     /// Answers `message.check`: which the room stored, and which it never received.
-    case messageChecked(stored: [String], missing: [String])
-    case threadOpened(parentId: String, parent: Message?, messages: [Message], hasMore: Bool)
-    case threadHistory(parentId: String, before: String, messages: [Message], hasMore: Bool)
+    case messageChecked(stored: [ClientMessageID], missing: [ClientMessageID])
+    case threadOpened(parentId: MessageID, parent: Message?, messages: [Message], hasMore: Bool)
+    case threadHistory(parentId: MessageID, before: MessageID, messages: [Message], hasMore: Bool)
     /// `failed` names the request that went wrong (a `ClientFrame.type`), and `clientMessageId` or
     /// `clientMessageIds` the messages it was about.
-    case error(message: String, clientMessageId: String?, clientMessageIds: [String]?, failed: String?)
+    case error(message: String, clientMessageId: ClientMessageID?, clientMessageIds: [ClientMessageID]?, failed: String?)
     case pong
     case unknown(String)
 
-    public init(text: String) {
+    package init(text: String) {
         let data = Data(text.utf8)
         let decoder = EmberJSON.decoder()
         guard let head = try? decoder.decode(FrameType.self, from: data) else {
@@ -307,20 +309,20 @@ public enum ServerFrame: Equatable, Sendable {
 
     // Lists are read one element at a time: one the build can't read is left out, never the frame.
     private struct Welcome: Decodable { var you: User; var present: Lossy<User>?; var seq: Int }
-    private struct Resumed: Decodable { var you: User; var messages: Lossy<Message>?; var deletedIds: [String]?; var present: Lossy<User>?; var seq: Int }
+    private struct Resumed: Decodable { var you: User; var messages: Lossy<Message>?; var deletedIds: [MessageID]?; var present: Lossy<User>?; var seq: Int }
     private struct MessageChange: Decodable { var message: Message; var seq: Int }
-    private struct MessageDeleted: Decodable { var messageId: String; var seq: Int }
+    private struct MessageDeleted: Decodable { var messageId: MessageID; var seq: Int }
     private struct BoostCreated: Decodable { var boost: Boost; var seq: Int }
-    private struct BoostDeleted: Decodable { var boostId: String; var messageId: String; var seq: Int }
+    private struct BoostDeleted: Decodable { var boostId: BoostID; var messageId: MessageID; var seq: Int }
     private struct PresenceJoined: Decodable { var user: User }
     private struct PresenceLeft: Decodable { var userId: UserID }
-    private struct Typing: Decodable { var user: User; var typing: Bool; var threadId: String? }
-    private struct History: Decodable { var before: String; var messages: Lossy<Message>?; var hasMore: Bool? }
-    private struct HistoryAfter: Decodable { var after: String; var messages: Lossy<Message>?; var hasNewer: Bool? }
-    private struct Checked: Decodable { var stored: [String]?; var missing: [String]? }
-    private struct ThreadOpened: Decodable { var parentId: String; var parent: Lenient<Message>?; var messages: Lossy<Message>?; var hasMore: Bool? }
-    private struct ThreadHistory: Decodable { var parentId: String; var before: String; var messages: Lossy<Message>?; var hasMore: Bool? }
-    private struct ErrorFrame: Decodable { var message: String?; var clientMessageId: String?; var clientMessageIds: [String]?; var failed: String? }
+    private struct Typing: Decodable { var user: User; var typing: Bool; var threadId: MessageID? }
+    private struct History: Decodable { var before: MessageID; var messages: Lossy<Message>?; var hasMore: Bool? }
+    private struct HistoryAfter: Decodable { var after: MessageID; var messages: Lossy<Message>?; var hasNewer: Bool? }
+    private struct Checked: Decodable { var stored: [ClientMessageID]?; var missing: [ClientMessageID]? }
+    private struct ThreadOpened: Decodable { var parentId: MessageID; var parent: Lenient<Message>?; var messages: Lossy<Message>?; var hasMore: Bool? }
+    private struct ThreadHistory: Decodable { var parentId: MessageID; var before: MessageID; var messages: Lossy<Message>?; var hasMore: Bool? }
+    private struct ErrorFrame: Decodable { var message: String?; var clientMessageId: ClientMessageID?; var clientMessageIds: [ClientMessageID]?; var failed: String? }
 }
 
 /// A frame's `type`, read before the rest.
@@ -339,7 +341,7 @@ private struct Lenient<Value: Decodable>: Decodable {
 
 /// What the workspace socket (`/api/socket`) sends. `init(text:)` never throws: anything it can't
 /// read is `.unknown(type)`, as for `ServerFrame`.
-public enum WorkspaceFrame: Equatable, Sendable {
+package enum WorkspaceFrame: Equatable, Sendable {
     /// Sent as the socket opens: who its session signs in, and the workspace as it is then.
     case welcome(you: Me, account: Account)
     /// A room of theirs has a message they haven't seen.
@@ -367,7 +369,7 @@ public enum WorkspaceFrame: Equatable, Sendable {
     case pong
     case unknown(String)
 
-    public init(text: String) {
+    package init(text: String) {
         let data = Data(text.utf8)
         let decoder = EmberJSON.decoder()
         guard let head = try? decoder.decode(FrameType.self, from: data) else {
@@ -423,24 +425,24 @@ public enum WorkspaceFrame: Equatable, Sendable {
 
 /// The query of a room socket's address, as `roomSocketQuery` writes it, without its `?`:
 /// `visible=0|1&protocol=4[&since=<seq>][&around=<id>]`.
-public enum RoomSocket {
+package enum RoomSocket {
     /// The revision of the room protocol this SDK speaks. The room refuses messages from older ones.
-    public static let protocolRevision = 4
+    package static let protocolRevision = 4
 
-    public static func query(visible: Bool, since: Int?, around: String?) -> String {
+    package static func query(visible: Bool, since: Int?, around: MessageID?) -> String {
         var query = "visible=\(visible ? 1 : 0)&protocol=\(protocolRevision)"
         if let since { query += "&since=\(since)" }
-        if let around { query += "&around=\(encodeURIComponent(around))" }
+        if let around { query += "&around=\(encodeURIComponent(around.rawValue))" }
         return query
     }
 }
 
 /// The close codes a socket ends with when it isn't coming back as it was (`CloseCode` upstream).
-public enum SocketClose {
+package enum SocketClose {
     /// Connect again, after checking the session is still signed in.
-    public static let reconnect = 4001
+    package static let reconnect = 4001
     /// Don't connect again: the person was removed from the workspace or banned.
-    public static let revoked = 4003
+    package static let revoked = 4003
     /// Don't connect again: the room isn't there for this person.
-    public static let notFound = 4004
+    package static let notFound = 4004
 }

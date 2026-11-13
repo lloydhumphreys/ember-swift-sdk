@@ -40,7 +40,7 @@ import EmberRichText
     @Test func theOneMessageSample() async throws {
         connector.onConnect { $0.serverSends(Fixtures.RoomFrames.welcome(messages: Fixtures.messages(3), around: "m002")) }
         let client = EmberClient.mock(transport: transport, connector: connector)
-        let messageID = "m002"
+        let messageID: MessageID = "m002"
 
         let message = try await client.message(messageID, in: roomID)
 
@@ -51,7 +51,7 @@ import EmberRichText
     }
 
     @Test func theSearchSample() async throws {
-        let launch = SearchQuery(q: "launch")
+        let launch = SearchQuery("launch")
         transport.stub("GET", "/api/searches", json: Fixtures.searchJSON(recent: [launch]))
         transport.stub("POST", "/api/searches", status: 201, json: Fixtures.searchJSON(search: launch, matches: Fixtures.messages(2), next: 2, rooms: [Fixtures.general], recent: [launch]))
         transport.stub("GET", "/api/searches?q=launch&cursor=2", json: Fixtures.searchJSON(search: launch, matches: Fixtures.messages(1, from: 3), rooms: [Fixtures.general]))
@@ -60,7 +60,7 @@ import EmberRichText
         let search = SearchSession(client: client)
         await search.loadRecent()           // when the screen opens, before anything is typed
         search.query.q = "launch"
-        search.run(record: true)            // true when someone typed it: it joins their recent searches
+        search.run(history: .record)            // .record when someone typed it: it joins their recent searches
         #expect(await eventually { search.phase == .loaded })
         _ = (search.phase, search.matches, search.rooms, search.recent)
         if search.canLoadMore { search.loadMore() }
@@ -79,7 +79,7 @@ import EmberRichText
         _ = EmberClient(origin: origin, cookies: cookies)
 
         transport.stubSignedIn()
-        transport.stub("GET", "/api/searches?q=launch", json: Fixtures.searchJSON(search: SearchQuery(q: "launch"), matches: Fixtures.messages(1)))
+        transport.stub("GET", "/api/searches?q=launch", json: Fixtures.searchJSON(search: SearchQuery("launch"), matches: Fixtures.messages(1)))
         let jar = EphemeralCookieStorage()
         jar.setCookie(HTTPCookie(properties: [.name: "session_token", .value: "test-session", .domain: "ember.test", .path: "/"])!)
         let client = EmberClient.mock(transport: transport, cookies: jar)
@@ -87,7 +87,7 @@ import EmberRichText
         guard client.hasSessionCookie else { Issue.record("the session cookie should be found"); return }
         let me = try await client.me()
         let sidebar = try await client.sidebar()
-        let results = try await client.search(SearchQuery(q: "launch"))
+        let results = try await client.search(SearchQuery("launch"))
 
         #expect(me == Fixtures.me)
         #expect(!sidebar.rooms.isEmpty)
@@ -119,6 +119,26 @@ import EmberRichText
         #expect(!client.hasSessionCookie)
     }
 
+    @Test func theOwnTransportSample() async throws {
+        // MyTransport forwards to a mock, so the client is the sample's and its requests are checked.
+        struct MyTransport: HTTPTransport {
+            var mock = MockHTTPTransport()
+            func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) { try await mock.send(request) }
+        }
+        let origin = URL(string: "https://chat.example.com")!
+
+        var environment = EmberEnvironment.system()
+        environment.transport = MyTransport()                // any HTTPTransport
+        let client = EmberClient(origin: origin, environment: environment)
+
+        let mine = try #require(client.transport as? MyTransport)
+        mine.mock.stub("GET", "/api/bootstrap", json: Fixtures.bootstrapJSON(user: nil))
+        _ = try await client.bootstrap()
+        #expect(mine.mock.requests("GET", "/api/bootstrap").count == 1)
+        #expect(client.unsentStore is FileUnsentMessageStore)
+        #expect(client.cookies === HTTPCookieStorage.shared)
+    }
+
     @Test func theServerCheckSample() async throws {
         transport.stub("GET", "/api/bootstrap", json: Fixtures.bootstrapJSON(user: nil))
         // The sample's typed address is the real transport's; the test checks through the mock.
@@ -141,8 +161,8 @@ import EmberRichText
 
         workspace.onSignedOut = {
             switch client.signOutReason {
-            case .sessionEnded: break     // the server ended the session: a request was answered 401
-            case .asked, nil: break       // they signed out
+            case .sessionEnded: break     // the server ended the session (a request was answered 401)
+            case .userInitiated, nil: break // signed out manually
             }
             reasons.append(client.signOutReason)
         }
@@ -167,15 +187,27 @@ import EmberRichText
         workspace.stop()
     }
 
+    @Test func theIdsSample() throws {
+        let url = URL(string: "https://ember.test/rooms/general/m002")!
+
+        let general: RoomID = "general"
+        let message = MessageID(url.lastPathComponent)   // a String needs wrapping
+        let raw = general.rawValue                       // "general"
+
+        #expect(raw == "general")
+        #expect(message == "m002")
+        #expect(try JSONEncoder().encode([general: 1]) == Data(#"{"general":1}"#.utf8))
+    }
+
     @Test func thePlainTextSample() throws {
         let room = RoomSession(client: .mock(connector: connector), roomID: roomID)
         let thread = room.thread("m001")
 
         let id = try room.send(text: "Use <b> for bold")     // shows as typed, "<b>" and all
-        try thread.reply(text: "Yes\nand no", alsoSend: true)
+        try thread.reply(text: "Yes\nand no", delivery: .threadAndRoom)
 
         #expect(room.timeline.pending.first { $0.clientMessageId == id }?.body.contains("&lt;b&gt;") == true)
-        #expect(thread.timeline.pending.first?.alsoSend == true)
+        #expect(thread.timeline.pending.first?.delivery == .threadAndRoom)
     }
 
     @Test func theUnsentSample() async throws {
@@ -194,10 +226,11 @@ import EmberRichText
             room.retry(message.clientMessageId)               // or room.discard(message.clientMessageId)
         }
         #expect(room.timeline.pending.first?.failure == nil)
+        try await room.flushUnsent()                         // as the app goes to the background
         let store = try #require(room.unsentStore as? MemoryUnsentMessageStore)
         #expect(!store.saved.isEmpty)
         // On signing out, forget what this account left unsent on this device, in every room.
-        room.unsentStore.removeAll(server: client.origin, userID: me.id)
+        try await room.unsentStore.discardUnsent(server: client.origin, userID: me.id)
         #expect(store.saved.isEmpty)
         room.stop()
     }

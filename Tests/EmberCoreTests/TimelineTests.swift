@@ -3,14 +3,14 @@ import Testing
 @testable import EmberCore
 
 /// A timeline welcomed, as `ada`, with `messages` and the page's flags.
-private func welcomed(_ messages: [Message], hasMore: Bool = false, hasNewer: Bool = false, around: String? = nil, seq: Int = 1) -> Timeline {
+private func welcomed(_ messages: [Message], hasMore: Bool = false, hasNewer: Bool = false, around: MessageID? = nil, seq: Int = 1) -> Timeline {
     var timeline = Timeline()
     _ = timeline.apply(.welcome(you: ada, present: [ada], seq: seq, page: TimelinePage(messages: messages, hasMore: hasMore, hasNewer: hasNewer, around: around)))
     return timeline
 }
 
 /// A message `ada` sent from here, as the room confirms it.
-private func mine(_ id: String, _ clientMessageId: String) -> Message {
+private func mine(_ id: MessageID, _ clientMessageId: ClientMessageID) -> Message {
     message(id, by: ada, clientMessageId: clientMessageId)
 }
 
@@ -300,8 +300,8 @@ private func mine(_ id: String, _ clientMessageId: String) -> Message {
         guard case let .createMessage(clientMessageId, _, nil, nil) = timeline.send(body: "Hi", plainText: "Hi") else {
             Issue.record("not a message.create"); return
         }
-        #expect(clientMessageId == clientMessageId.lowercased())
-        #expect(UUID(uuidString: clientMessageId) != nil)
+        #expect(clientMessageId.rawValue == clientMessageId.rawValue.lowercased())
+        #expect(UUID(uuidString: clientMessageId.rawValue) != nil)
     }
 }
 

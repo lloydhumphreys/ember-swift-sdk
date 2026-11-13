@@ -215,14 +215,14 @@ import Testing
     }
 
     @Test(arguments: [
-        (SocketClosed(closeCode: 4003), ReconnectingSocket.StopReason.signedOut),
+        (SocketClosed(closeCode: 4003), ConnectionStatus.StopReason.signedOut),
         (SocketClosed(closeCode: 4004), .notFound),
         (SocketClosed(httpStatus: 401), .signedOut),
         (SocketClosed(httpStatus: 403), .refused(status: 403)),
         (SocketClosed(httpStatus: 404), .refused(status: 404)),
         (SocketClosed(httpStatus: 400), .refused(status: 400)),
     ])
-    func stopsWhenTheServerSaysNotToComeBack(closed: SocketClosed, reason: ReconnectingSocket.StopReason) async {
+    func stopsWhenTheServerSaysNotToComeBack(closed: SocketClosed, reason: ConnectionStatus.StopReason) async {
         connector.autoOpen = closed.httpStatus == nil
         socket.start()
         #expect(await eventually { connector.connections.count == 1 })
@@ -338,5 +338,5 @@ import Testing
 /// What a socket's callbacks heard.
 @MainActor final class Heard {
     var texts: [String] = []
-    var statuses: [ReconnectingSocket.Status] = []
+    var statuses: [ConnectionStatus] = []
 }

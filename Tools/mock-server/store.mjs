@@ -168,12 +168,14 @@ export class Store {
   account = { name: process.env.EMBER_WORKSPACE_NAME || "Fernwood", tagline: "Calm software, made together" };
   joinCode = "";
   /// Replaced by server.mjs: who hears what, and who is where.
-  hub = { room() {}, workspace() {}, viewers: () => new Set(), present: () => [], typing: () => {} };
+  hub = { room() {}, workspace() {}, everyone() {}, closeRoom() {}, viewers: () => new Set(), present: () => [], typing: () => {} };
+  /// People invited by email and not yet joined, newest first: { id, emailAddress, invitedBy, createdAt, expiresAt, delivery, digest }.
+  emailInvitations = [];
 
   // People
 
   addUser({ id, name, email = null, bio = null, role = "member", createdAt }) {
-    const user = { id, name, email, bio, role, createdAt, updatedAt: createdAt };
+    const user = { id, name, email, bio, role, createdAt, updatedAt: createdAt, status: "active", passwordDigest: null, avatar: null };
     this.users.set(id, user);
     return user;
   }
@@ -197,7 +199,7 @@ export class Store {
       name: user.name,
       bio: user.bio,
       role: user.role,
-      status: "active",
+      status: user.status ?? "active",
       avatarUrl: `/users/${avatarToken(user.id)}/avatar?v=${versionOf(user.updatedAt)}`,
     };
   }
@@ -252,7 +254,7 @@ export class Store {
       }
     }
     const suggestions = [...this.users.values()]
-      .filter((user) => user.role !== "bot" && user.id !== userId && !talkedTo.has(user.id))
+      .filter((user) => user.role !== "bot" && user.status === "active" && user.id !== userId && !talkedTo.has(user.id))
       .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1))
       .slice(0, Math.max(0, SUGGESTED_PEOPLE - directMembers.size - 1))
       .map((user) => this.ref(user.id));
@@ -267,6 +269,70 @@ export class Store {
       invitation,
       suggestions,
     };
+  }
+
+  /// Everyone active, by name, as a room's settings list them.
+  activePeople() {
+    return [...this.users.values()].filter((user) => user.status === "active").sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()) || (a.id < b.id ? -1 : 1));
+  }
+
+  /// A new open or closed room. An open room has everyone active; a closed one just the people named who exist, as on the real server, which does not add the creator.
+  createRoom(creatorId, { kind, name, icon, memberIds }) {
+    const now = Date.now();
+    const ids = kind === "closed" ? [...new Set(memberIds)].filter((id) => this.users.has(id)) : this.activePeople().map((user) => user.id);
+    const room = this.addRoom({ id: sortableId(now), kind, name, icon: icon || null, memberIds: ids, createdAt: now, by: creatorId });
+    const wire = this.roomWire(room);
+    for (const id of ids) this.hub.workspace(id, { type: "room.saved", room: wire });
+    return room;
+  }
+
+  /// Renames, re-icons, opens or closes a room. Answers whether it changed. Opening adds everyone active; closing keeps exactly `memberIds`.
+  changeRoom(room, { name, icon, kind, memberIds }) {
+    const before = this.roomWire(room);
+    if (name !== undefined) room.name = name;
+    if (icon !== undefined) room.icon = icon || null;
+    const was = new Set(room.members.keys());
+    let wanted = was;
+    if (kind === "open") wanted = new Set([...was, ...this.activePeople().map((user) => user.id)]);
+    else if (kind === "closed") wanted = new Set(memberIds.filter((id) => this.users.has(id)));
+    if (kind !== undefined) room.kind = kind;
+    const added = [...wanted].filter((id) => !was.has(id));
+    const removed = [...was].filter((id) => !wanted.has(id));
+    for (const id of added) room.members.set(id, { unread: false, involvement: "mentions" });
+    for (const id of removed) {
+      room.members.delete(id);
+      const favourites = this.favouritesOf(id);
+      if (favourites.rooms.includes(room.id)) {
+        favourites.rooms = favourites.rooms.filter((candidate) => candidate !== room.id);
+        favourites.version += 1;
+        this.hub.workspace(id, { type: "favorites.changed", favorites: { rooms: [...favourites.rooms], version: favourites.version } });
+      }
+    }
+    const wire = this.roomWire(room);
+    const changed = JSON.stringify(before) !== JSON.stringify(wire);
+    for (const id of removed) {
+      this.hub.workspace(id, { type: "room.gone", roomId: room.id });
+      this.hub.closeRoom(room.id, id, 4004, "NotFound");
+    }
+    for (const id of changed ? room.members.keys() : added) this.hub.workspace(id, { type: "room.saved", room: wire });
+    if (added.length > 0 && this.sharedOrder.includes(room.id)) for (const id of added) this.hub.workspace(id, { type: "rooms.reordered" });
+    return changed;
+  }
+
+  /// Removes a room and its messages, telling its members and closing its sockets.
+  deleteRoom(room) {
+    const members = [...room.members.keys()];
+    this.rooms.delete(room.id);
+    this.sharedOrder = this.sharedOrder.filter((id) => id !== room.id);
+    for (const id of members) {
+      const favourites = this.favouritesOf(id);
+      if (favourites.rooms.includes(room.id)) {
+        favourites.rooms = favourites.rooms.filter((candidate) => candidate !== room.id);
+        favourites.version += 1;
+      }
+      this.hub.workspace(id, { type: "room.gone", roomId: room.id });
+    }
+    this.hub.closeRoom(room.id, null, 4004, "NotFound");
   }
 
   originalRoom() {

@@ -13,7 +13,7 @@ public enum AvatarStyle {
 
     /// The colour of someone's avatar as hex, the one the CRC32 of their id picks.
     public static func hex(for userID: UserID) -> String {
-        colours[Int(crc32(userID) % UInt32(colours.count))]
+        colours[Int(crc32(userID.rawValue) % UInt32(colours.count))]
     }
 
     /// The colour of someone's avatar, each component from 0 to 1.

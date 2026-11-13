@@ -8,6 +8,14 @@ extension Limits {
     public static let typingTTL: TimeInterval = 5
 }
 
+/// Where a thread reply goes.
+public enum ReplyDelivery: Sendable, Hashable {
+    /// Into its thread only.
+    case threadOnly
+    /// Into its thread, and into the room's timeline too, as "also send to the room" does.
+    case threadAndRoom
+}
+
 /// One thread as a client holds it: its parent, its replies, and what's sent from it, as the room's
 /// socket frames add up to.
 public struct ThreadTimeline: Equatable, Sendable {
@@ -21,7 +29,7 @@ public struct ThreadTimeline: Equatable, Sendable {
         case message(Message)
     }
 
-    public let parentId: String
+    public let parentId: MessageID
     public private(set) var me: User?
     public private(set) var parent: Parent = .unknown
     /// Every loaded reply, oldest first. Never cut.
@@ -35,23 +43,23 @@ public struct ThreadTimeline: Equatable, Sendable {
     /// Bots answering in this thread. (People can't type in a thread.)
     public private(set) var typing: [User] = []
     /// The reply to bring into view: the one the thread was opened at, once it's loaded.
-    public private(set) var focus: String?
+    public private(set) var focus: MessageID?
     /// What went wrong opening or paging, for the screen to show and clear.
-    public var notice: String?
+    public package(set) var notice: String?
 
     /// The reply a permalink goes to, until the thread has gone there, paging back if it's older
     /// than every reply loaded.
-    private var openingAt: String?
+    private var openingAt: MessageID?
     /// The id `thread.before` pages back from. It stays put when the oldest reply is deleted, since
     /// the room pages from ids, not from what's shown.
-    private var oldestId: String?
+    private var oldestId: MessageID?
     /// Whether a `thread.open` is waiting on its `thread.opened`.
     private var isOpening = false
     /// When each typist was last heard from.
     private var typingSince: [UserID: Date] = [:]
 
     /// `replyId` is a reply to open at (a permalink or search result).
-    public init(parentId: String, me: User? = nil, at replyId: String? = nil) {
+    package init(parentId: MessageID, me: User? = nil, at replyId: MessageID? = nil) {
         self.parentId = parentId
         self.me = me
         openingAt = replyId
@@ -67,7 +75,7 @@ public struct ThreadTimeline: Equatable, Sendable {
 
     /// Applies any frame from the room's socket; one that isn't about this thread changes nothing.
     /// Answers what to send back.
-    public mutating func apply(_ frame: ServerFrame, now: Date = Date()) -> [ClientFrame] {
+    package mutating func apply(_ frame: ServerFrame, now: Date = Date()) -> [ClientFrame] {
         switch frame {
         case let .welcome(you, _, _, _):
             me = you
@@ -190,39 +198,39 @@ public struct ThreadTimeline: Equatable, Sendable {
     }
 
     /// `thread.open`. The session sends it once admitted, and again after every welcome or resumed.
-    public mutating func opening() -> ClientFrame {
+    package mutating func opening() -> ClientFrame {
         isOpening = true
         return .openThread(parentId: parentId)
     }
 
     /// Shows a reply as pending, and answers the frame that sends it.
-    public mutating func reply(body: String, plainText: String, alsoSend: Bool, clientMessageId: String, now: Date) -> ClientFrame {
-        let reply = PendingMessage(clientMessageId: clientMessageId, body: body, plainText: plainText, createdAt: now, parentId: parentId, alsoSend: alsoSend)
+    package mutating func reply(body: String, plainText: String, delivery: ReplyDelivery, clientMessageId: ClientMessageID, now: Date) -> ClientFrame {
+        let reply = PendingMessage(clientMessageId: clientMessageId, body: body, plainText: plainText, createdAt: now, parentId: parentId, delivery: delivery)
         pending.append(reply)
         return reply.createFrame
     }
 
     /// Shows a file on its way up as a pending reply. Nothing to send: the file goes over HTTP.
-    public mutating func attach(_ upload: PendingUpload, alsoSend: Bool, clientMessageId: String, now: Date) {
+    package mutating func attach(_ upload: PendingUpload, delivery: ReplyDelivery, clientMessageId: ClientMessageID, now: Date) {
         pending.append(PendingMessage(
-            clientMessageId: clientMessageId, body: "", plainText: upload.name, createdAt: now, parentId: parentId, alsoSend: alsoSend, upload: upload
+            clientMessageId: clientMessageId, body: "", plainText: upload.name, createdAt: now, parentId: parentId, delivery: delivery, upload: upload
         ))
     }
 
     /// Moves a pending upload's progress on. Nothing for an unknown id.
-    public mutating func uploadProgress(_ clientMessageId: String, sentBytes: Int) {
+    package mutating func uploadProgress(_ clientMessageId: ClientMessageID, sentBytes: Int) {
         pending.progress(clientMessageId, sentBytes: sentBytes)
     }
 
     /// Marks a pending as failed. For an upload, answers the `message.check` to send, since the file
     /// may have been posted anyway.
-    public mutating func fail(_ clientMessageId: String, reason: String) -> ClientFrame? {
+    package mutating func fail(_ clientMessageId: ClientMessageID, reason: String) -> ClientFrame? {
         pending.fail(clientMessageId, reason: reason)
     }
 
     /// The message an upload's last part answered with: its pending goes and it shows among the
     /// replies, once.
-    public mutating func posted(_ message: Message) {
+    package mutating func posted(_ message: Message) {
         pending.removeAll { $0.clientMessageId == message.clientMessageId }
         guard message.parentId == parentId else { return }
         upsert(message, always: true, replacing: false)
@@ -232,7 +240,7 @@ public struct ThreadTimeline: Equatable, Sendable {
     /// it. nil when it isn't pending, and for a file, which the session uploads again. The room
     /// doesn't de-duplicate a create, so `ThreadSession` asks it with `message.check` first and sends
     /// this only for a reply the room says is missing.
-    public mutating func retry(_ clientMessageId: String) -> ClientFrame? {
+    package mutating func retry(_ clientMessageId: ClientMessageID) -> ClientFrame? {
         guard let index = pending.firstIndex(where: { $0.clientMessageId == clientMessageId }) else { return nil }
         pending[index].failure = nil
         if pending[index].upload != nil {
@@ -242,13 +250,13 @@ public struct ThreadTimeline: Equatable, Sendable {
         return pending[index].createFrame
     }
 
-    public mutating func discard(_ clientMessageId: String) {
+    package mutating func discard(_ clientMessageId: ClientMessageID) {
         pending.removeAll { $0.clientMessageId == clientMessageId }
     }
 
     /// `thread.before` from the oldest loaded reply; nil while loading, with nothing more, or with
     /// nothing loaded.
-    public mutating func olderPage() -> ClientFrame? {
+    package mutating func olderPage() -> ClientFrame? {
         guard isLoaded, hasMore, !isLoadingOlder, let oldestId else { return nil }
         isLoadingOlder = true
         return .threadBefore(parentId: parentId, before: oldestId)
@@ -261,21 +269,21 @@ public struct ThreadTimeline: Equatable, Sendable {
     ///
     /// `isOpen` false says the socket isn't in the room, so a reply not loaded waits for the next
     /// `thread.opened` rather than paging now.
-    public mutating func go(to replyId: String, isOpen: Bool = true) -> [ClientFrame] {
+    package mutating func go(to replyId: MessageID, isOpen: Bool = true) -> [ClientFrame] {
         openingAt = replyId
         guard isLoaded, isOpen || replies.contains(where: { $0.id == replyId }) else { return [] }
         return goToOpeningReply()
     }
 
     /// The screen has brought `focus` into view: forget it, so it isn't brought there again.
-    public mutating func clearFocus() {
+    package mutating func clearFocus() {
         focus = nil
     }
 
     /// The page of older replies didn't come: the room refused it, or didn't answer in time. It
     /// leaves nothing in flight, so the reader can page again, though the thread stops paging back
     /// to the reply a permalink goes to, and `notice` says `reason`. Nothing when none is on its way.
-    public mutating func olderPageFailed(_ reason: String = Timeline.pageNotLoaded) {
+    package mutating func olderPageFailed(_ reason: String = Timeline.pageNotLoaded) {
         guard isLoadingOlder else { return }
         isLoadingOlder = false
         openingAt = nil
@@ -283,14 +291,14 @@ public struct ThreadTimeline: Equatable, Sendable {
     }
 
     /// The socket dropped: loading flags and typing clear; replies and pendings stay.
-    public mutating func disconnected() {
+    package mutating func disconnected() {
         isLoadingOlder = false
         isOpening = false
         clearTyping()
     }
 
     /// Drops bots not heard from for `Limits.typingTTL`.
-    public mutating func expireTyping(now: Date) {
+    package mutating func expireTyping(now: Date) {
         let before = now.addingTimeInterval(-Limits.typingTTL)
         for (id, since) in typingSince where since < before {
             stopTyping(id)
@@ -360,7 +368,7 @@ public struct ThreadTimeline: Equatable, Sendable {
     }
 
     /// Changes the parent or a loaded reply, whichever has `id`.
-    private mutating func change(_ id: String, _ body: (inout Message) -> Void) {
+    private mutating func change(_ id: MessageID, _ body: (inout Message) -> Void) {
         if id == parentId, case var .message(message) = parent {
             body(&message)
             parent = .message(message)
