@@ -60,9 +60,12 @@ extension LiveTests {
         return workspace
     }
 
-    /// Runs `body`, then `cleanUp` whether or not it threw.
+    /// Runs `body`, then `cleanUp` whether or not it threw. Both run on the main actor, as their
+    /// types say: Swift 6.1 takes an unmarked one as leaving it, and won't bring `T` back.
     @MainActor
-    func afterwards<T>(_ cleanUp: () async throws -> Void, _ body: () async throws -> T) async throws -> T {
+    func afterwards<T>(
+        _ cleanUp: @MainActor () async throws -> Void, _ body: @MainActor () async throws -> T
+    ) async throws -> T {
         let result: T
         do {
             result = try await body()
