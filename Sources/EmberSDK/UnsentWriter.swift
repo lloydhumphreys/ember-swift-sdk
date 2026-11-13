@@ -1,9 +1,10 @@
 import Foundation
 
-/// Writes one `UnsentMessageStore`'s lists off the main actor, one operation at a time, in the order
-/// they were asked for. Only the newest list for a key waits: a newer one takes the place of one not
-/// yet written. Every session on a store shares its writer, so a session made later sees what an
-/// earlier one handed over and hasn't been written yet.
+/// Writes one `UnsentMessageStore`'s lists on a serial queue of its own, off the main actor and off
+/// Swift's shared threads, one operation at a time, in the order they were asked for. Only the
+/// newest list for a key waits: a newer one takes the place of one not yet written. Every session
+/// on a store shares its writer, so a session made later sees what an earlier one handed over and
+/// hasn't been written yet.
 ///
 /// A list that fails to be written is kept, and goes again at the next `retry`. So is a removal,
 /// before which nothing of that account is written. Nothing handed over before an account's
@@ -62,6 +63,8 @@ import Foundation
     }
 
     private weak var store: (any UnsentMessageStore)?
+    /// Where the store's `save` and `removeAll` run, one at a time.
+    private let storeQueue = DispatchQueue(label: "EmberSDK.UnsentWriter")
     /// The store, held while anything is waiting, going or failed, so none of it is lost.
     private var heldStore: (any UnsentMessageStore)?
 
@@ -245,10 +248,7 @@ import Foundation
                     break
                 }
                 inFlight = (operation, messages, ticket, false)
-                let error = await Task.detached { () -> (any Error)? in
-                    do { try store.save(messages, for: key) } catch { return error }
-                    return nil
-                }.value
+                let error = await perform { try store.save(messages, for: key) }
                 let discarded = inFlight?.discarded ?? false
                 inFlight = nil
                 if let error {
@@ -259,10 +259,7 @@ import Foundation
                 }
             case let .remove(account):
                 inFlight = (operation, [], ticket, false)
-                let error = await Task.detached { () -> (any Error)? in
-                    do { try store.removeAll(server: account.server, userID: account.userID) } catch { return error }
-                    return nil
-                }.value
+                let error = await perform { try store.removeAll(server: account.server, userID: account.userID) }
                 inFlight = nil
                 if let error {
                     let error = UnsentStoreError(error, as: .couldNotRemove)
@@ -287,6 +284,22 @@ import Foundation
         isDraining = false
         resolveWaiters()
         releaseIfIdle()
+    }
+
+    /// Runs `work` on `storeQueue` and answers what it threw. A store's calls block while they write,
+    /// so they go on a thread of the writer's own rather than one of Swift's shared ones: a slow or
+    /// stuck write holds up only this store's writes.
+    private func perform(_ work: @escaping @Sendable () throws -> Void) async -> (any Error)? {
+        await withCheckedContinuation { continuation in
+            storeQueue.async {
+                do {
+                    try work()
+                    continuation.resume(returning: nil)
+                } catch {
+                    continuation.resume(returning: error)
+                }
+            }
+        }
     }
 
     private func fail(_ key: UnsentMessageKey, _ messages: [UnsentMessage], _ error: UnsentStoreError, _ ticket: Int) {

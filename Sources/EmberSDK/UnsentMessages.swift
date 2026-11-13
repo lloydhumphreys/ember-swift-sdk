@@ -96,9 +96,10 @@ public struct UnsentMessage: Codable, Hashable, Sendable {
 /// How the SDK calls it:
 /// - `messages(for:)` on the main actor, as a session learns who's signed in, since the room's first
 ///   `message.check` depends on what's pending.
-/// - `save(_:for:)` and `removeAll(server:userID:)` off the main actor, one at a time for each store
-///   instance, in the order they were asked for. While one runs, only the newest list for a key
-///   waits behind it.
+/// - `save(_:for:)` and `removeAll(server:userID:)` on a serial dispatch queue the SDK keeps for each
+///   store instance, so off the main actor and off Swift's shared threads: they may block while
+///   they write. One at a time, in the order they were asked for. While one runs, only the newest
+///   list for a key waits behind it.
 ///
 /// Each method throws rather than answering as if nothing were saved: a session doesn't write over
 /// what it couldn't read, and keeps a list it couldn't write to try again. The SDK's stores throw
