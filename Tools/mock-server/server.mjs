@@ -10,9 +10,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MAX_PREVIEW_BYTES, PART_SIZE, files } from "./files.mjs";
 import { createBotApi } from "./bots.mjs";
-import { cardPicture, keptCards } from "./cards.mjs";
+import { actingButton, cardPicture, isActionId, isActionValue, keptCards } from "./cards.mjs";
 import { installAccountRoutes } from "./accounts.mjs";
-import { PEOPLE, deployCards, seed } from "./seed.mjs";
+import { PEOPLE, alertButtons, deployCards, seed } from "./seed.mjs";
 import { HISTORY_PAGE_SIZE, MAX_BOOST_LENGTH, Store, randomBase36, sortableId } from "./store.mjs";
 import { acceptWebSocket, refuseUpgrade } from "./ws.mjs";
 
@@ -27,6 +27,12 @@ const MEDIA_ORIGIN = (process.env.MEDIA_ORIGIN ?? `http://media.localhost:${PORT
 const delayOf = (name, fallback) => (Number.isFinite(Number(process.env[name])) && process.env[name] !== undefined && process.env[name] !== "" ? Math.max(0, Number(process.env[name])) : fallback);
 const BOT_DELAY = delayOf("EMBER_BOT_DELAY", 1500);
 const BOT_REPLACE_DELAY = delayOf("EMBER_BOT_REPLACE_DELAY", 6000);
+/// How long a card's bot takes to answer a click on one of its buttons.
+const CLICK_DELAY = delayOf("EMBER_CLICK_DELAY", 300);
+/// The clicks one person may have waiting for their bots at once, as on the real server.
+const MAX_WAITING_CLICKS = 3;
+const BUTTON_GONE = "That button is no longer there";
+const TOO_MANY_CLICKS = "Wait for your earlier clicks to be answered";
 const COOKIE = "session_token";
 const COOKIE_MAX_AGE = 400 * 24 * 60 * 60;
 const ROOM_PROTOCOL = 4;
@@ -230,7 +236,7 @@ function endSessions(userId, code, reason, exceptToken = null) {
   }
   for (const socket of [...workspaceSockets, ...roomSockets]) if (ended.has(socket.token)) socket.conn.close(code, reason);
 }
-for (const bot of Object.values(seededBots)) rooms.engineering.members.set(bot.id, { unread: false, involvement: "mentions" });
+for (const bot of Object.values(seededBots)) rooms.engineering.members.set(bot.id, { unread: false, involvement: "mentions", since: Date.now() });
 const bots = createBotApi({ store, files, avatarToken, readRaw });
 
 const routes = [];
@@ -277,7 +283,7 @@ route("POST", "/api/session", async (req, res) => {
     if (name.toLowerCase() === "ember") return fail(res, 422, "Ember is the AI assistant’s name. Choose another.");
     const guest = store.addUser({ id: randomBase36(16), name, role: "member", createdAt: Date.now() });
     for (const room of store.rooms.values()) {
-      if (room.kind === "open") room.members.set(guest.id, { unread: false, involvement: "mentions" });
+      if (room.kind === "open") room.members.set(guest.id, { unread: false, involvement: "mentions", since: guest.createdAt });
     }
     return reply(res, 201, { user: store.me(guest) }, { "Set-Cookie": startSession(guest) });
   }
@@ -740,6 +746,10 @@ function roomSocket(conn, user, token, room, params) {
       case "thread.before":
         if (!isId(frame.parentId) || !isId(frame.before)) return unrecognised(conn);
         return send(conn, store.threadBefore(room, frame.parentId, frame.before, limitOf(frame.limit)));
+      case "card.click":
+        if (!isId(frame.clickId) || !isId(frame.messageId) || !isActionId(frame.actionId)) return unrecognised(conn);
+        if ((frame.blockId !== undefined && !isActionId(frame.blockId)) || (frame.value !== undefined && !isActionValue(frame.value))) return unrecognised(conn);
+        return click(conn, user, room, frame);
       case "presence.visible":
         if (typeof frame.visible !== "boolean") return unrecognised(conn);
         socket.visible = frame.visible;
@@ -750,6 +760,30 @@ function roomSocket(conn, user, token, room, params) {
     }
   };
 }
+
+// Clicks: the button must still be on an undeleted message in the room. The card's bot takes the click after
+// `EMBER_CLICK_DELAY`, posts a line in the room saying who clicked what, and the clicker hears `card.clicked`.
+
+const waitingClicks = new Map();
+
+function click(conn, user, room, { clickId, messageId, actionId, blockId, value }) {
+  const refuse = (message) => send(conn, { type: "error", message, clickId, failed: "card.click" });
+  const message = room.messages.find((candidate) => candidate.id === messageId && !candidate.deleted);
+  const button = message && actingButton(message.cards, { actionId, blockId, value });
+  if (!button) return refuse(BUTTON_GONE);
+  const waiting = waitingClicks.get(user.id) ?? 0;
+  if (waiting >= MAX_WAITING_CLICKS) return refuse(TOO_MANY_CLICKS);
+  waitingClicks.set(user.id, waiting + 1);
+  setTimeout(() => {
+    const left = (waitingClicks.get(user.id) ?? 1) - 1;
+    if (left > 0) waitingClicks.set(user.id, left);
+    else waitingClicks.delete(user.id);
+    store.createMessage(room, message.creatorId, { clientMessageId: sortableId(), body: `<p>${escapeHtml(user.name)} clicked ${escapeHtml(button.text)}.</p>` });
+    send(conn, { type: "card.clicked", clickId });
+  }, CLICK_DELAY);
+}
+
+const escapeHtml = (text) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
 // The scripted other person: a message in the random room, or in the DM between Sam and Maya, is answered by
 // someone else after a moment, once, so a client has typing and an arriving message to show without a second person.
@@ -809,7 +843,7 @@ function alertCards() {
         { kind: "title", text: "[FIRING] HighErrorRate message-api", href: alertLink },
         { kind: "text", html: "<p>5xx rate is <strong>4.2%</strong> over the last 5 minutes (threshold 1%).</p>" },
         { kind: "fields", fields: [{ title: "Severity", html: "<p>critical</p>", short: true }, { title: "Region", html: "<p>fra1</p>", short: true }] },
-        { kind: "buttons", buttons: [{ text: "Runbook", href: "https://runbooks.fernwood.example/high-error-rate", style: "danger" }] },
+        { kind: "buttons", buttons: alertButtons },
         { kind: "footer", text: "Uptime", at: Math.floor(Date.now() / 1000) },
       ],
     },

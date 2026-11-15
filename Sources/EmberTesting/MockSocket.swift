@@ -93,6 +93,28 @@ public final class MockSocketConnection: SocketConnection, @unchecked Sendable {
         }
     }
 
+    /// The `card.click` frames the client sent, in order.
+    public var sentClicks: [SentFrame] {
+        sentFrames.filter { $0.type == "card.click" }
+    }
+
+    /// The server says the bot took the newest click the client sent. False when it sent none.
+    @discardableResult
+    public func answerClick() -> Bool {
+        guard let clickId = sentClicks.last?.string("clickId") else { return false }
+        serverSends(Fixtures.RoomFrames.cardClicked(ClickID(clickId)))
+        return true
+    }
+
+    /// The server refuses the newest click the client sent, with `message`, as it does a button the
+    /// card no longer has. False when it sent none.
+    @discardableResult
+    public func refuseClick(_ message: String = "That button is no longer there") -> Bool {
+        guard let clickId = sentClicks.last?.string("clickId") else { return false }
+        serverSends(Fixtures.RoomFrames.error(message, clickId: ClickID(clickId)))
+        return true
+    }
+
     /// Whether the client closed it.
     public var isClosedByClient: Bool {
         lock.withLock { closedByClient }

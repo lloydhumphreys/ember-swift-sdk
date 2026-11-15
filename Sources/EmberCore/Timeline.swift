@@ -291,7 +291,7 @@ public struct Timeline: Equatable, Sendable {
         case .threadOpened, .threadHistory:
             break
 
-        case let .error(text, clientMessageId, clientMessageIds, failed):
+        case let .error(text, clientMessageId, clientMessageIds, _, failed):
             switch failed {
             case "history.before":
                 isLoadingOlder = false
@@ -308,7 +308,7 @@ public struct Timeline: Equatable, Sendable {
                 pending[index].failure = text
             }
 
-        case .pong, .unknown:
+        case .cardClicked, .pong, .unknown:
             break
         }
         return []

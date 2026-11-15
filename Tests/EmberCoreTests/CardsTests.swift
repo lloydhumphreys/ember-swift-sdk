@@ -173,6 +173,62 @@ private let link = CardButton(text: "Open", href: "https://example.com/open")
         #expect(try parts(#"[{"kind":"tiles","tiles":[{"icon":\#(icon)}]}]"#) == [])
     }
 
+    @Test func aButtonActsByWhatAClickTellsItsBotOrLinksOrGoes() throws {
+        func button(_ action: String, _ rest: String = "") -> String { #"{"text":"Approve","action":\#(action)\#(rest)}"# }
+        let longID = String(repeating: "x", count: CardAction.maxIDLength + 1)
+        let mostID = String(repeating: "x", count: CardAction.maxIDLength)
+        let longValue = String(repeating: "x", count: CardAction.maxValueLength + 1)
+        let mostValue = String(repeating: "x", count: CardAction.maxValueLength)
+        let buttons = [
+            button(#"{"id":"approve","blockId":"deploy","value":"{\"build\":42}","extra":true}"#, #","style":"primary","extra":true"#),
+            button(#"{"id":"reject"}"#),
+            button(#"{"id":"open"}"#, #","href":"https://example.com/open""#),
+            button(#"{"id":"nowhere"}"#, #","href":null"#),
+            button(#"{"id":""}"#),
+            button(#"{"id":7}"#),
+            button(#"{"blockId":"deploy","value":"nameless"}"#),
+            button(#""approve""#),
+            button(#"{"id":"\#(longID)"}"#),
+            button(#"{"id":"long","blockId":"\#(longID)","value":"\#(longValue)"}"#),
+            button(#"{"id":"most","blockId":"\#(mostID)","value":"\#(mostValue)"}"#),
+            #"{"action":{"id":"untitled"}}"#,
+        ].joined(separator: ",")
+        let read = try parts(#"""
+        [{"kind":"buttons","buttons":[\#(buttons)]},
+         {"kind":"section","html":"<p>Deploy?</p>","button":\#(button(#"{"id":"approve","value":""}"#))},
+         {"kind":"tiles","tiles":[{"buttons":[\#(button(#"{"id":"book"}"#))]}]},
+         {"kind":"buttons","buttons":[\#(button(#"{"id":"tool:close_issue","value":"{}","appId":"app-1"}"#)),\#(button(#"{"id":"tool:close_issue","appId":7}"#))]}]
+        """#)
+        #expect(read == [
+            .buttons([
+                CardButton(text: "Approve", action: CardAction(id: "approve", blockId: "deploy", value: #"{"build":42}"#), style: .primary),
+                CardButton(text: "Approve", action: CardAction(id: "reject")),
+                CardButton(text: "Approve", href: "https://example.com/open"),
+                CardButton(text: "Approve", action: CardAction(id: "long")),
+                CardButton(text: "Approve", action: CardAction(id: "most", blockId: mostID, value: mostValue)),
+            ]),
+            .section(html: "<p>Deploy?</p>", fields: [], thumb: nil, button: CardButton(text: "Approve", action: CardAction(id: "approve", value: ""))),
+            .tiles([CardTile(buttons: [CardButton(text: "Approve", action: CardAction(id: "book"))])]),
+            // The app whose tool a button on a tool's card calls stays with it.
+            .buttons([
+                CardButton(text: "Approve", action: CardAction(id: "tool:close_issue", value: "{}", appId: "app-1")),
+                CardButton(text: "Approve", action: CardAction(id: "tool:close_issue")),
+            ]),
+        ])
+    }
+
+    @Test func aButtonIsALinkOrActs() {
+        let link = CardButton(text: "Open", href: "https://example.com/open")
+        let acting = CardButton(text: "Approve", action: CardAction(id: "approve"), style: .primary)
+        #expect(link.kind == .link(href: "https://example.com/open") && link.href == "https://example.com/open" && link.action == nil)
+        #expect(acting.kind == .action(CardAction(id: "approve")) && acting.href == nil && acting.action == CardAction(id: "approve"))
+        #expect(CardAction(id: "approve", blockId: "deploy", value: "").isValid)
+        #expect(!CardAction(id: "").isValid)
+        #expect(!CardAction(id: "approve", blockId: "").isValid)
+        #expect(!CardAction(id: String(repeating: "x", count: CardAction.maxIDLength + 1)).isValid)
+        #expect(!CardAction(id: "approve", value: String(repeating: "x", count: CardAction.maxValueLength + 1)).isValid)
+    }
+
     @Test func aContextItemNamingAnImageIsOne() throws {
         #expect(try parts(#"[{"kind":"context","items":[{"image":{"url":"https://example.com/i.png"}},{"html":"<p>Gone</p>","image":7},{"html":""},{"html":"<p>Kept</p>"}]}]"#) == [
             .context([.image(CardImage(url: "https://example.com/i.png")), .html("<p>Kept</p>")]),
@@ -233,6 +289,11 @@ private let link = CardButton(text: "Open", href: "https://example.com/open")
             .context([.html("<p>Small</p>"), .image(image)]),
             .divider,
             .buttons([link, CardButton(text: "Stop", href: "https://example.com/stop", style: .danger)]),
+            .buttons([
+                CardButton(text: "Approve", action: CardAction(id: "approve", blockId: "deploy", value: "42", appId: "app-1"), style: .primary),
+                CardButton(text: "Hold", action: CardAction(id: "hold", value: "")),
+            ]),
+            .section(html: "<p>Acts</p>", fields: [], thumb: nil, button: CardButton(text: "Logs", action: CardAction(id: "logs"))),
             .table(rows: [["<p>a</p>", ""], ["<p>b</p>"]], columns: [CardColumn(align: .right, wrap: true)]),
             .tiles([CardTile(hero: image, icon: image, title: "T", subtitle: "S", body: "<p>B</p>", subtext: "<p>s</p>", buttons: [link]), CardTile(title: "Only a title")]),
             .footer(text: "Footer", icon: "https://example.com/f.png", at: Date(timeIntervalSince1970: 1_792_584_000.5)),
@@ -243,6 +304,9 @@ private let link = CardButton(text: "Open", href: "https://example.com/open")
         #expect(try EmberJSON.decoder().decode(Card.self, from: EmberJSON.encoder().encode(card)) == card)
         let footer = try written(CardPart.footer(text: nil, icon: nil, at: Date(timeIntervalSince1970: 1_792_584_000)))
         #expect(footer == json(#"{"kind":"footer","at":1792584000}"#))
+        let acting = try written(CardButton(text: "Hold", action: CardAction(id: "hold", blockId: "deploy"), style: .danger))
+        #expect(acting == json(#"{"text":"Hold","action":{"id":"hold","blockId":"deploy"},"style":"danger"}"#))
+        #expect(try written(link) == json(#"{"text":"Open","href":"https://example.com/open"}"#))
     }
 
     @Test func aMessageWritesItsCardsBack() throws {
@@ -368,6 +432,14 @@ private let link = CardButton(text: "Open", href: "https://example.com/open")
         let kept = CardButton(text: "Kept", href: "good", style: .primary)
         #expect(through([.buttons([gone, kept])])?.parts == [.buttons([CardButton(text: "Kept", href: "https://proxy.test/?good", style: .primary)])])
         #expect(through([.buttons([gone]), .header(text: "Kept")])?.parts == [.header(text: "Kept")])
+    }
+
+    @Test func aButtonThatActsHasNoAddressToShow() {
+        let acting = CardButton(text: "Approve", action: CardAction(id: "approve"))
+        #expect(through([.buttons([CardButton(text: "Gone", href: "bad"), acting])])?.parts == [.buttons([acting])])
+        let section = CardPart.section(html: "<p>Kept</p>", fields: [], thumb: nil, button: acting)
+        #expect(through([section])?.parts == [section])
+        #expect(through([.tiles([CardTile(hero: bad, buttons: [acting])])])?.parts == [.tiles([CardTile(buttons: [acting])])])
     }
 
     @Test func aTileLeftWithNothingGoes() {

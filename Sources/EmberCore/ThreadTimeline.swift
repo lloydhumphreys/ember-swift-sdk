@@ -173,7 +173,7 @@ public struct ThreadTimeline: Equatable, Sendable {
                 stopTyping(user.id)
             }
 
-        case let .error(text, clientMessageId, clientMessageIds, failed):
+        case let .error(text, clientMessageId, clientMessageIds, _, failed):
             switch failed {
             case "thread.open":
                 if isOpening {
@@ -191,7 +191,7 @@ public struct ThreadTimeline: Equatable, Sendable {
                 }
             }
 
-        case .presenceJoined, .presenceLeft, .history, .historyAfter, .historyAround, .pong, .unknown:
+        case .presenceJoined, .presenceLeft, .history, .historyAfter, .historyAround, .cardClicked, .pong, .unknown:
             break
         }
         return []

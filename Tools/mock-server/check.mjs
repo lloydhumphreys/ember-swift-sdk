@@ -1302,7 +1302,7 @@ await check("a message without cards has no cards key, and a card message's plai
   );
   expect(
     find("Message API errors are up\n[FIRING]").plainText ===
-      "Message API errors are up\n[FIRING] HighErrorRate message-api\n5xx rate is 4.2% over the last 5 minutes (threshold 1%).\nSeverity\ncritical\nRegion\nfra1\nRunbook\nUptime",
+      "Message API errors are up\n[FIRING] HighErrorRate message-api\n5xx rate is 4.2% over the last 5 minutes (threshold 1%).\nSeverity\ncritical\nRegion\nfra1\nRunbook · Acknowledge · Silence for 1 hour\nUptime",
     "C2's plain text",
   );
 });
@@ -1369,6 +1369,49 @@ await check("saying alert in Engineering brings Uptime's alert, which Uptime the
   }
   maya.send({ type: "message.delete", messageId: created.message.id });
   await maya.nextOfType("message.deleted");
+});
+
+await check("a click on a button that acts is taken by the card's bot, which says so in the room", async () => {
+  const { socket: maya, welcome } = await engineeringWelcome(state.maya);
+  const watcher = await roomSocket(state.rooms.Engineering, state.leo);
+  await watcher.nextOfType("welcome");
+  const c2 = welcome.messages.find((message) => message.plainText.startsWith("Message API errors are up\n[FIRING]"));
+  const buttons = c2.cards[0].parts.find((part) => part.kind === "buttons").buttons;
+  expect(buttons.map((button) => button.text).join() === "Runbook,Acknowledge,Silence for 1 hour", "C2's buttons");
+  const acknowledge = buttons[1];
+  expect(!("href" in acknowledge) && acknowledge.style === "primary", "Acknowledge has no link");
+  expect(JSON.stringify(acknowledge.action) === JSON.stringify({ id: "acknowledge", blockId: "alert_actions", value: "high-error-rate" }), "Acknowledge's action");
+  expect(JSON.stringify(buttons[2].action) === JSON.stringify({ id: "silence", blockId: "alert_actions", value: "1h" }) && !("style" in buttons[2]), "Silence's action");
+
+  maya.send({ type: "card.click", clickId: "check-click-1", messageId: c2.id, actionId: "acknowledge", blockId: "alert_actions", value: "high-error-rate" });
+  const said = await maya.next((frame) => frame.type === "message.created" && frame.message.creator.name === "Uptime", "Uptime's line", 10_000);
+  expect(said.message.body === "<p>Maya Chen clicked Acknowledge.</p>", `the line, got ${said.message.body}`);
+  expect((await maya.nextOfType("card.clicked")).clickId === "check-click-1", "the click is answered by its id");
+  await watcher.next((frame) => frame.type === "message.created" && frame.message.id === said.message.id, "the line, for everyone");
+  expect(await watcher.quiet((frame) => frame.type === "card.clicked"), "only the clicker hears the answer");
+
+  for (const [frame, why] of [
+    [{ actionId: "acknowledge", blockId: "alert_actions", value: "other" }, "another value"],
+    [{ actionId: "acknowledge", value: "high-error-rate" }, "no block"],
+    [{ actionId: "nothing", blockId: "alert_actions", value: "high-error-rate" }, "an unknown action"],
+    [{ actionId: "acknowledge", blockId: "alert_actions", value: "high-error-rate", messageId: "missing" }, "an unknown message"],
+  ]) {
+    maya.send({ type: "card.click", clickId: "check-click-2", messageId: c2.id, ...frame });
+    const error = await maya.nextOfType("error");
+    expect(error.message === "That button is no longer there" && error.clickId === "check-click-2" && error.failed === "card.click", `${why} is refused by the click's id`);
+  }
+  for (const frame of [{ clickId: "", actionId: "acknowledge" }, { clickId: "k", actionId: "" }, { clickId: "k", actionId: "acknowledge", value: 3 }, { clickId: "k", actionId: "acknowledge", blockId: "" }]) {
+    maya.send({ type: "card.click", messageId: c2.id, ...frame });
+    const error = await maya.nextOfType("error");
+    expect(error.message === "Unrecognized frame" && !("clickId" in error), "a frame that isn't a click is unrecognised");
+  }
+
+  for (const n of [1, 2, 3, 4]) maya.send({ type: "card.click", clickId: `check-many-${n}`, messageId: c2.id, actionId: "silence", blockId: "alert_actions", value: "1h" });
+  const refused = await maya.nextOfType("error");
+  expect(refused.message === "Wait for your earlier clicks to be answered" && refused.clickId === "check-many-4", "a fourth click waiting is refused");
+  const answered = new Set();
+  while (answered.size < 3) answered.add((await maya.nextOfType("card.clicked")).clickId);
+  expect([1, 2, 3].every((n) => answered.has(`check-many-${n}`)), "the first three are answered");
 });
 
 // The keyed bot API

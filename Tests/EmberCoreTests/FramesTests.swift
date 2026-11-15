@@ -26,6 +26,9 @@ import Testing
         (.threadBefore(parentId: "m1", before: "m9", limit: 5), #"{"type":"thread.before","parentId":"m1","before":"m9","limit":5}"#),
         (.visible(true), #"{"type":"presence.visible","visible":true}"#),
         (.visible(false), #"{"type":"presence.visible","visible":false}"#),
+        (.clickCard(clickId: "k1", messageId: "m1", actionId: "approve"), #"{"type":"card.click","clickId":"k1","messageId":"m1","actionId":"approve"}"#),
+        (.clickCard(clickId: "k1", messageId: "m1", actionId: "approve", blockId: "deploy", value: ""),
+         #"{"type":"card.click","clickId":"k1","messageId":"m1","actionId":"approve","blockId":"deploy","value":""}"#),
         (.ping, #"{"type":"ping"}"#),
     ]
 
@@ -141,7 +144,16 @@ import Testing
             == .error(message: "No", clientMessageId: "c1", clientMessageIds: nil, failed: "message.create"))
         #expect(ServerFrame(text: #"{"type":"error","message":"No","clientMessageIds":["c1","c2"],"failed":"message.check"}"#)
             == .error(message: "No", clientMessageId: nil, clientMessageIds: ["c1", "c2"], failed: "message.check"))
+        #expect(ServerFrame(text: #"{"type":"error","message":"That button is no longer there","clickId":"k1"}"#)
+            == .error(message: "That button is no longer there", clientMessageId: nil, clientMessageIds: nil, clickId: "k1", failed: nil))
+        #expect(ServerFrame(text: #"{"type":"error","message":"That click couldn’t be delivered","clickId":"k1","failed":"card.click"}"#)
+            == .error(message: "That click couldn’t be delivered", clientMessageId: nil, clientMessageIds: nil, clickId: "k1", failed: "card.click"))
         #expect(ServerFrame(text: #"{"type":"pong"}"#) == .pong)
+    }
+
+    @Test func aClickTaken() {
+        #expect(ServerFrame(text: #"{"type":"card.clicked","clickId":"k1"}"#) == .cardClicked(clickId: "k1"))
+        #expect(ServerFrame(text: #"{"type":"card.clicked"}"#) != .cardClicked(clickId: "k1"))
     }
 
     @Test(arguments: [

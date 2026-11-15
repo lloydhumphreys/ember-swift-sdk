@@ -92,3 +92,9 @@ public struct FileID: EmberIdentifier {
     public let rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }
 }
+
+/// The id a client gives a click on a card's button, which matches the room's answer to it.
+public struct ClickID: EmberIdentifier {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+}

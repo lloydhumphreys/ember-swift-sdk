@@ -11,6 +11,8 @@ const MAX_PARTS = 60;
 const MAX_ITEMS = 100;
 const MAX_COLUMNS = 20;
 const MAX_TILE_BUTTONS = 3;
+const MAX_ACTION_ID_LENGTH = 255;
+const MAX_ACTION_VALUE_LENGTH = 2000;
 const COLOR = /^(?:good|warning|danger|#[0-9a-f]{6})$/i;
 const ALIGNMENTS = new Set(["left", "center", "right"]);
 
@@ -37,12 +39,42 @@ function imageOf(value) {
   return url === undefined ? undefined : { url, alt: textOf(value.alt) ?? "" };
 }
 
+/// Whether `value` can name a button that acts, or its block: text, some but not too much.
+export const isActionId = (value) => typeof value === "string" && value !== "" && value.length <= MAX_ACTION_ID_LENGTH;
+/// Whether `value` can be what a button that acts tells its bot: text, but not too much.
+export const isActionValue = (value) => typeof value === "string" && value.length <= MAX_ACTION_VALUE_LENGTH;
+
+/// A button that links, or, without an `href` key, one that acts, by what a click tells its bot.
 function buttonOf(value) {
   if (!isRecord(value)) return undefined;
   const text = textOf(value.text);
   const href = urlOf(value.href);
-  if (text === undefined || href === undefined) return undefined;
-  return { text, href, ...(value.style === "primary" || value.style === "danger" ? { style: value.style } : {}) };
+  const action = value.href === undefined ? actionOf(value.action) : undefined;
+  if (text === undefined || (href === undefined && action === undefined)) return undefined;
+  return { text, ...(href !== undefined && { href }), ...(action && { action }), ...(value.style === "primary" || value.style === "danger" ? { style: value.style } : {}) };
+}
+
+function actionOf(value) {
+  if (!isRecord(value) || !isActionId(value.id)) return undefined;
+  return {
+    id: value.id,
+    ...(isActionId(value.blockId) && { blockId: value.blockId }),
+    ...(isActionValue(value.value) && { value: value.value }),
+    ...(isActionId(value.appId) && { appId: value.appId }),
+  };
+}
+
+/// The button among `cards`' that act that a click names: the one of its `actionId`, in the block `blockId`
+/// names, or in none without one, with its `value`, or undefined (apps/worker/src/bots/clicks.ts).
+export function actingButton(cards, { actionId, blockId, value }) {
+  const buttons = (cards ?? []).flatMap(({ parts }) =>
+    parts.flatMap((part) => {
+      if (part.kind === "buttons") return part.buttons;
+      if (part.kind === "section") return part.button ? [part.button] : [];
+      return part.kind === "tiles" ? part.tiles.flatMap((tile) => tile.buttons ?? []) : [];
+    }),
+  );
+  return buttons.find(({ action }) => action !== undefined && action.id === actionId && action.blockId === blockId && action.value === value);
 }
 
 function fieldOf(value) {

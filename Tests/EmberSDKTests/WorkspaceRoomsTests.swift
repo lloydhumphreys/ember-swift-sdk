@@ -45,6 +45,22 @@ import Testing
         #expect(workspace.rooms.filter { $0.id == looms.id }.count == 1)
     }
 
+    @Test func aSidebarReadAroundSomeoneTakenOutOfARoomAndPutBackInIsReadAgain() async throws {
+        try await started()
+        let loads = sidebarLoads
+        let gate = transport.hold("GET", "/api/sidebar")
+        let reload = Task { await workspace.reload() }
+        await gate.waitForRequest()
+        connector.latest?.serverSends(Fixtures.WorkspaceFrames.roomGone(Fixtures.engines.id))
+        connector.latest?.serverSends(Fixtures.WorkspaceFrames.roomSaved(Fixtures.engines))
+        #expect(await eventually { workspace.room(Fixtures.engines.id) != nil && workspace.rooms.last?.id == Fixtures.engines.id })
+        gate.release()
+        await reload.value
+        #expect(sidebarLoads == loads + 2)
+        // What the second read says stands, with nothing to replay over it.
+        #expect(workspace.rooms.map(\.id) == Fixtures.sidebarRooms.map(\.id))
+    }
+
     @Test func aRefusedRoomIsntAdded() async throws {
         try await started()
         transport.stub("POST", "/api/rooms", status: 422, json: Fixtures.errorJSON("Name can’t be blank"))

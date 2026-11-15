@@ -4,6 +4,21 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Added
+
+- Buttons that act. `CardButton.kind` is `.link(href:)` or `.action(_:)`, and a `CardAction` is what a click tells the card's bot: its `id`, and the `blockId`, `value` and `appId` it was given. `CardButton(text:action:style:)` makes one, and `CardButton.action` reads it. A button without an `href` key on the wire acts, as upstream Ember 0.5.0-beta.4 reads it; a card part's plain text has its buttons' texts joined with " · ".
+- Async throwing `RoomSession.click(_:on:)` and `ThreadSession.click(_:on:)`, which click a button that acts on a message, on the room's socket. They return once the card's bot has taken the click, and throw the server's refusal as `.refused` (such as "That button is no longer there"), `.unreachable` with `RoomSession.notConnected` before the room lets the socket in or when it drops, `.unreachable` with `RoomSession.clickLost` when the room lets the socket in again before answering, and `.invalid` for a click the server wouldn't take. A refusal isn't put in `notice`.
+- `ClickID`, the id a click's answer comes back under. The room socket sends `card.click` and reads `card.clicked`, and an `error` with a `clickId`.
+- EmberTesting: `Fixtures.approvalCard`, `approveAction`, `holdAction` and `logsAction`, `Fixtures.RoomFrames.cardClicked(_:)`, and `MockSocketConnection.sentClicks`, `answerClick()` and `refuseClick(_:)`.
+- The stand-in server keeps buttons that act and answers `card.click`: Uptime's seeded firing alert has Acknowledge and Silence for 1 hour, a click on one brings a line from the bot and `card.clicked`, and a button that isn't there, or a fourth click waiting, is refused with the click's id. `EMBER_CLICK_DELAY` sets how long the bot takes. `Tools/mock-server/check.mjs` checks them.
+
+### Changed
+
+- `CardButton.href` is optional, and nil for a button that acts. `CardButton(text:href:style:)` still makes a link.
+- The sidebar lists shared rooms starred first, then in the workspace's shared order, then in the order the server gives them, the order someone was put in them, rather than by name, as upstream Ember now does. A sidebar that arrives while someone was taken out of a room it lists and put back in is asked for again, since the room may be out of place.
+- `Fixtures.RoomFrames.error(_:clientMessageId:clickId:failed:)` takes a `clickId`.
+- The stand-in server lists each person's rooms in the order they were put in them, then oldest first, as the real server does.
+
 ## [0.1.0] - 2026-11-13
 
 The first tagged release. What's listed is what changed since the SDK was first published.

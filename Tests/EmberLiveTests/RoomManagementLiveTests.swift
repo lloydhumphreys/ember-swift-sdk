@@ -134,7 +134,7 @@ extension LiveTests {
     }
 
     @MainActor @Test(.enabled(if: liveStandIn, "Only against the local stand-in"))
-    func clearingTheSharedOrderWithRoomsMadeSinceListsThemByNameAndStays() async throws {
+    func clearingTheSharedOrderWithRoomsMadeSinceListsThemInTheServersOrderAndStays() async throws {
         let client = try await signedIn()
         let original = try await client.sidebar().sharedOrder
         let workspace = try await loadedWorkspace(on: client)
@@ -154,8 +154,11 @@ extension LiveTests {
             await workspace.clearSharedOrder()
             #expect(workspace.notice == nil)
             #expect(workspace.sharedOrder.isEmpty)
-            let byName = workspace.roomsInSharedOrder.map { ($0.room.name ?? "").lowercased() }
-            #expect(byName == byName.sorted { $0.compare($1, locale: .current) == .orderedAscending })
+            // The rooms someone was put in most recently come last.
+            let listed = workspace.roomsInSharedOrder.map(\.id)
+            let given = try await client.sidebar().rooms.map(\.id).filter(listed.contains)
+            #expect(listed == given)
+            #expect(listed.suffix(2) == [open.id, closed.id])
 
             // rooms.reordered loads the sidebar again, which keeps it cleared.
             await workspace.reload()

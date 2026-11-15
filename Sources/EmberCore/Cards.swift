@@ -2,8 +2,8 @@ import Foundation
 
 // A bot's cards, as `packages/protocol/src/cards.ts` declares them: what a Slack-style webhook's
 // legacy attachments and Block Kit blocks show under the message a bot posts. The server translates
-// Slack's payload at ingest, so a client only ever sees these. Nothing in a card is interactive: a
-// button is a link. Text is plain (a name, a title, a header, a footer, a field's title, an image's
+// Slack's payload at ingest, so a client only ever sees these. A button is a link, or one that acts,
+// whose click the room reports to the bot that posted it (`RoomSession.click`). Text is plain (a name, a title, a header, a footer, a field's title, an image's
 // alt) or, where it's called `html`, `pretext`, `body` or `subtext`, and in a table's cells, rich text
 // in the stored form, as a message's body is (`CardText.document` reads it). Addresses come as the
 // webhook sent them: pass a card through `withAddresses` before showing it.
@@ -59,7 +59,7 @@ public enum CardPart: Codable, Hashable, Sendable {
     case header(text: String)
     /// Rich text, which folds when it's long (`CardText.isLong`).
     case text(html: String)
-    /// A section block: its rich text over its fields, with a thumbnail or a link button at their trailing side.
+    /// A section block: its rich text over its fields, with a thumbnail or a button at their trailing side.
     /// Always has `html` or at least one field.
     case section(html: String?, fields: [CardField], thumb: CardImage?, button: CardButton?)
     case fields([CardField])
@@ -143,20 +143,50 @@ public struct CardImage: Codable, Hashable, Sendable {
     }
 }
 
-/// A link drawn as a button: bordered by default, filled for `primary`, red for `danger`.
+/// A button, bordered by default, filled for `primary`, red for `danger`: a link, or one that acts,
+/// whose click the room reports to the bot that posted it. On the wire, a button with both `href`
+/// and `action` is a link.
 public struct CardButton: Codable, Hashable, Sendable {
     public enum Style: String, Codable, Hashable, Sendable {
         case primary, danger
     }
 
+    /// What clicking a button does.
+    public enum Kind: Hashable, Sendable {
+        /// Opens `href`.
+        case link(href: String)
+        /// Tells the bot that posted the card, through the room (`RoomSession.click`).
+        case action(CardAction)
+    }
+
     public var text: String
-    public var href: String
+    public var kind: Kind
     public var style: Style?
 
-    public init(text: String, href: String, style: Style? = nil) {
+    public init(text: String, kind: Kind, style: Style? = nil) {
         self.text = text
-        self.href = href
+        self.kind = kind
         self.style = style
+    }
+
+    /// A link button.
+    public init(text: String, href: String, style: Style? = nil) {
+        self.init(text: text, kind: .link(href: href), style: style)
+    }
+
+    /// A button that acts.
+    public init(text: String, action: CardAction, style: Style? = nil) {
+        self.init(text: text, kind: .action(action), style: style)
+    }
+
+    /// The address a link button opens; nil for a button that acts.
+    public var href: String? {
+        if case let .link(href) = kind { href } else { nil }
+    }
+
+    /// What a button that acts tells its bot; nil for a link.
+    public var action: CardAction? {
+        if case let .action(action) = kind { action } else { nil }
     }
 
     public init(from decoder: Decoder) throws {
@@ -169,6 +199,51 @@ public struct CardButton: Codable, Hashable, Sendable {
     public func encode(to encoder: Encoder) throws {
         try json.encode(to: encoder)
     }
+}
+
+/// What a button that acts tells its bot when it's clicked, as a Block Kit button's `action_id` and
+/// `value` do, and its block's `block_id`: `id` names the button, which a click finds by it, `blockId`
+/// and `value`. On the card a connected app's tool answered with, a button calls a tool of that app,
+/// `appId`, which only the room writes there.
+public struct CardAction: Codable, Hashable, Sendable {
+    /// The longest `id` and `blockId` the protocol takes (`MAX_ACTION_ID_LENGTH`), in UTF-16 code units.
+    public static let maxIDLength = 255
+    /// The longest `value` the protocol takes (`MAX_ACTION_VALUE_LENGTH`), in UTF-16 code units.
+    public static let maxValueLength = 2000
+
+    public var id: String
+    public var blockId: String?
+    public var value: String?
+    public var appId: String?
+
+    public init(id: String, blockId: String? = nil, value: String? = nil, appId: String? = nil) {
+        self.id = id
+        self.blockId = blockId
+        self.value = value
+        self.appId = appId
+    }
+
+    public init(from decoder: Decoder) throws {
+        guard let action = CardAction(json: try JSONValue(from: decoder)) else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Not a card action"))
+        }
+        self = action
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        try json.encode(to: encoder)
+    }
+
+    /// Whether the protocol takes it in a click: an `id`, and a `blockId`, if any, of some but not too
+    /// much text, and a `value`, if any, not too long.
+    package var isValid: Bool {
+        Self.isID(id) && (blockId.map(Self.isID) ?? true) && (value.map(Self.isValue) ?? true)
+    }
+
+    /// `isActionId`: text, some but not too much.
+    static func isID(_ text: String) -> Bool { !text.isEmpty && text.utf16.count <= maxIDLength }
+    /// `isActionValue`: text, but not too much.
+    static func isValue(_ text: String) -> Bool { text.utf16.count <= maxValueLength }
 }
 
 /// Rich text or an image in a context row. On the wire, `{html}` or `{image}`.
@@ -212,7 +287,7 @@ public struct CardColumn: Codable, Hashable, Sendable {
 }
 
 /// A card block's small card: an image across its top, an icon beside its title and subtitle in plain
-/// text, its body and subtext in rich text, and up to three link buttons.
+/// text, its body and subtext in rich text, and up to three buttons.
 public struct CardTile: Codable, Hashable, Sendable {
     public var hero: CardImage?
     public var icon: CardImage?
@@ -314,7 +389,8 @@ extension Card {
     ///
     /// A refused image goes (the card's or a section's thumbnail, an image part with its part, a context
     /// image, a tile's hero or icon); a refused icon or link (an author's, a title's, a footer's) goes,
-    /// leaving its text; a refused button goes, and with it a row of buttons left empty. A part, or a
+    /// leaving its text; a link button whose address is refused goes, and with it a row of buttons left
+    /// empty, while a button that acts, which has no address, stays. A part, or a
     /// tile, left with nothing to show goes, and a card left with nothing is nil.
     public func withAddresses(_ shown: (String) -> String?) -> Card? {
         func image(_ image: CardImage?) -> CardImage? {
@@ -323,8 +399,13 @@ extension Card {
         }
         func address(_ value: String?) -> String? { value.flatMap(shown) }
         func button(_ button: CardButton?) -> CardButton? {
-            guard let button, let href = shown(button.href) else { return nil }
-            return CardButton(text: button.text, href: href, style: button.style)
+            guard let button else { return nil }
+            switch button.kind {
+            case let .link(href):
+                return shown(href).map { CardButton(text: button.text, href: $0, style: button.style) }
+            case .action:
+                return button
+            }
         }
 
         var card = self
@@ -576,14 +657,49 @@ extension CardImage {
 }
 
 extension CardButton {
+    /// `buttonOf`: a link, or, with no `href` at all, a button that acts.
     init?(json value: JSONValue) {
-        guard case let .object(object) = value, let text = textOf(object["text"]), let href = urlOf(object["href"]) else { return nil }
-        self.init(text: text, href: href, style: object["style"]?.string.flatMap(Style.init(rawValue:)))
+        guard case let .object(object) = value, let text = textOf(object["text"]) else { return nil }
+        let kind: Kind
+        if let href = object["href"] {
+            guard let href = urlOf(href) else { return nil }
+            kind = .link(href: href)
+        } else {
+            guard let action = object["action"].flatMap(CardAction.init(json:)) else { return nil }
+            kind = .action(action)
+        }
+        self.init(text: text, kind: kind, style: object["style"]?.string.flatMap(Style.init(rawValue:)))
     }
 
     var json: JSONValue {
-        var object: [String: JSONValue] = ["text": .string(text), "href": .string(href)]
+        var object: [String: JSONValue] = ["text": .string(text)]
+        switch kind {
+        case let .link(href): object["href"] = .string(href)
+        case let .action(action): object["action"] = action.json
+        }
         object["style"] = style.map { .string($0.rawValue) }
+        return .object(object)
+    }
+}
+
+extension CardAction {
+    /// `actionOf`: an `id` it can be named by, with a `blockId`, `value` and `appId` kept when they're
+    /// what they can be and left out otherwise.
+    init?(json value: JSONValue) {
+        guard case let .object(object) = value, let id = object["id"]?.string, Self.isID(id) else { return nil }
+        self.init(
+            id: id,
+            blockId: object["blockId"]?.string.flatMap { Self.isID($0) ? $0 : nil },
+            value: object["value"]?.string.flatMap { Self.isValue($0) ? $0 : nil },
+            appId: object["appId"]?.string.flatMap { Self.isID($0) ? $0 : nil }
+        )
+    }
+
+    var json: JSONValue {
+        var object: [String: JSONValue] = ["id": .string(id)]
+        object["blockId"] = blockId.map { .string($0) }
+        object["value"] = value.map { .string($0) }
+        object["appId"] = appId.map { .string($0) }
         return .object(object)
     }
 }

@@ -37,6 +37,29 @@ extension Fixtures {
         .footer(text: "Grafana", icon: "https://grafana.com/static/assets/img/fav32.png", at: date("2026-10-12T10:00:00.000Z")),
     ])
 
+    /// The action of `approvalCard`'s Approve button.
+    public static let approveAction = CardAction(id: "approve", blockId: "deploy_actions", value: "web-2.4.1")
+
+    /// The action of `approvalCard`'s Hold button.
+    public static let holdAction = CardAction(id: "hold", blockId: "deploy_actions", value: "web-2.4.1")
+
+    /// The action of `approvalCard`'s section button, which has no block id or value.
+    public static let logsAction = CardAction(id: "logs")
+
+    /// A deploy waiting for approval in blocks: a section with a button that acts, and a row of
+    /// buttons, two that act and a link.
+    public static let approvalCard = Card(source: .blocks, parts: [
+        .section(
+            html: "<p>web 2.4.1 is ready for <strong>production</strong>.</p>", fields: [], thumb: nil,
+            button: CardButton(text: "Show logs", action: logsAction)
+        ),
+        .buttons([
+            CardButton(text: "Approve", action: approveAction, style: .primary),
+            CardButton(text: "Hold", action: holdAction, style: .danger),
+            CardButton(text: "Diff", href: "https://example.com/compare/2.4.0...2.4.1"),
+        ]),
+    ])
+
     /// A bot's message: no body, its plain text, and `cards` under it.
     public static func cardMessage(
         _ id: MessageID,

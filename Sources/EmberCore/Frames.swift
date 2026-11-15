@@ -59,6 +59,9 @@ package enum ClientFrame: Equatable, Sendable {
     case threadBefore(parentId: MessageID, before: MessageID, limit: Int? = nil)
     /// `presence.visible`: the app is or isn't in front.
     case visible(Bool)
+    /// `card.click`: a button that acts, on a card under `messageId`, was clicked. The button is found
+    /// by its action's `id`, `blockId` and `value`; `clickId` matches the room's answer.
+    case clickCard(clickId: ClickID, messageId: MessageID, actionId: String, blockId: String? = nil, value: String? = nil)
     case ping
 
     /// The protocol's name for the frame (`message.create`, `history.before`…), which is what a server
@@ -80,6 +83,7 @@ package enum ClientFrame: Equatable, Sendable {
         case .closeThread: "thread.close"
         case .threadBefore: "thread.before"
         case .visible: "presence.visible"
+        case .clickCard: "card.click"
         case .ping: "ping"
         }
     }
@@ -125,6 +129,12 @@ package enum ClientFrame: Equatable, Sendable {
             set("limit", limit)
         case let .visible(visible):
             set("visible", visible)
+        case let .clickCard(clickId, messageId, actionId, blockId, value):
+            set("clickId", clickId)
+            set("messageId", messageId)
+            set("actionId", actionId)
+            set("blockId", blockId)
+            set("value", value)
         case .typingStart, .typingStop, .ping:
             break
         }
@@ -193,6 +203,10 @@ package enum ClientFrame: Equatable, Sendable {
         case "presence.visible":
             guard let visible = bool("visible") else { return nil }
             self = .visible(visible)
+        case "card.click":
+            guard let clickId: ClickID = identifier("clickId"), let messageId: MessageID = identifier("messageId"),
+                  let actionId = string("actionId") else { return nil }
+            self = .clickCard(clickId: clickId, messageId: messageId, actionId: actionId, blockId: string("blockId"), value: string("value"))
         case "ping": self = .ping
         default: return nil
         }
@@ -229,9 +243,11 @@ package enum ServerFrame: Equatable, Sendable {
     case messageChecked(stored: [ClientMessageID], missing: [ClientMessageID])
     case threadOpened(parentId: MessageID, parent: Message?, messages: [Message], hasMore: Bool)
     case threadHistory(parentId: MessageID, before: MessageID, messages: [Message], hasMore: Bool)
-    /// `failed` names the request that went wrong (a `ClientFrame.type`), and `clientMessageId` or
-    /// `clientMessageIds` the messages it was about.
-    case error(message: String, clientMessageId: ClientMessageID?, clientMessageIds: [ClientMessageID]?, failed: String?)
+    /// The bot took the click `clickId` names.
+    case cardClicked(clickId: ClickID)
+    /// `failed` names the request that went wrong (a `ClientFrame.type`), `clientMessageId` or
+    /// `clientMessageIds` the messages it was about, and `clickId` the click.
+    case error(message: String, clientMessageId: ClientMessageID?, clientMessageIds: [ClientMessageID]?, clickId: ClickID? = nil, failed: String?)
     case pong
     case unknown(String)
 
@@ -299,7 +315,9 @@ package enum ServerFrame: Equatable, Sendable {
             return .threadHistory(parentId: f.parentId, before: f.before, messages: f.messages?.elements ?? [], hasMore: f.hasMore ?? false)
         case "error":
             let f = try read(ErrorFrame.self)
-            return .error(message: f.message ?? "", clientMessageId: f.clientMessageId, clientMessageIds: f.clientMessageIds, failed: f.failed)
+            return .error(message: f.message ?? "", clientMessageId: f.clientMessageId, clientMessageIds: f.clientMessageIds, clickId: f.clickId, failed: f.failed)
+        case "card.clicked":
+            return .cardClicked(clickId: try read(CardClicked.self).clickId)
         case "pong":
             return .pong
         default:
@@ -322,7 +340,8 @@ package enum ServerFrame: Equatable, Sendable {
     private struct Checked: Decodable { var stored: [ClientMessageID]?; var missing: [ClientMessageID]? }
     private struct ThreadOpened: Decodable { var parentId: MessageID; var parent: Lenient<Message>?; var messages: Lossy<Message>?; var hasMore: Bool? }
     private struct ThreadHistory: Decodable { var parentId: MessageID; var before: MessageID; var messages: Lossy<Message>?; var hasMore: Bool? }
-    private struct ErrorFrame: Decodable { var message: String?; var clientMessageId: ClientMessageID?; var clientMessageIds: [ClientMessageID]?; var failed: String? }
+    private struct CardClicked: Decodable { var clickId: ClickID }
+    private struct ErrorFrame: Decodable { var message: String?; var clientMessageId: ClientMessageID?; var clientMessageIds: [ClientMessageID]?; var clickId: ClickID?; var failed: String? }
 }
 
 /// A frame's `type`, read before the rest.

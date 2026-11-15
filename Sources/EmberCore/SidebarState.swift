@@ -198,8 +198,10 @@ public struct SidebarState: Equatable, Sendable {
     package mutating func willLoad() { unseen = [] }
 
     /// The sidebar asked for has arrived: it takes the place of this one, with the changes made since
-    /// it was asked for over it.
-    package mutating func loaded(_ sidebar: Sidebar) {
+    /// it was asked for over it. Returns true when it's to be asked for again, since it may have a room
+    /// in the wrong place (`putBackIn`).
+    @discardableResult
+    package mutating func loaded(_ sidebar: Sidebar) -> Bool {
         let changes = unseen ?? []
         let before = self
         self = SidebarState(sidebar)
@@ -207,6 +209,7 @@ public struct SidebarState: Equatable, Sendable {
         (guesses, guessesMade) = (before.guesses, before.guessesMade)
         (favoriteOrders, sharedOrders, dismissals) = (before.favoriteOrders, before.sharedOrders, before.dismissals)
         for change in changes { apply(change) }
+        return Self.putBackIn(sidebar, changes)
     }
 
     /// The sidebar asked for didn't arrive: keep this one, and stop keeping changes.
@@ -221,6 +224,24 @@ public struct SidebarState: Equatable, Sendable {
         case starred(Favorites)
         case ordered([RoomID])
         case invitationDismissed
+    }
+
+    /// Whether `changes`, made while `sidebar` was on its way, take someone out of a room it lists and
+    /// put them back in, which may leave the room in the wrong place, since the sidebar doesn't say
+    /// which it shows: the room where it was before they were taken out, which the changes move last,
+    /// or where it is since they were put back, which the changes move past any room they were put in
+    /// after it.
+    private static func putBackIn(_ sidebar: Sidebar, _ changes: [Change]) -> Bool {
+        let listed = Set(sidebar.rooms.map(\.id))
+        var takenOut = Set<RoomID>()
+        for change in changes {
+            switch change {
+            case let .gone(id) where listed.contains(id): takenOut.insert(id)
+            case let .saved(room) where takenOut.contains(room.id): return true
+            default: break
+            }
+        }
+        return false
     }
 
     private mutating func record(_ change: Change) {

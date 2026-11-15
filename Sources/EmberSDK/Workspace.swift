@@ -763,7 +763,8 @@ import Observation
         if !isShutDown {
             switch answer {
             case let .success(sidebar):
-                state.loaded(sidebar)
+                // A room someone was taken out of and put back in meanwhile may be out of place.
+                if state.loaded(sidebar) { loadAgain = true }
                 isLoaded = true
                 loadError = nil
                 if let currentRoomID { state.markRead(currentRoomID) }

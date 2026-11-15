@@ -220,7 +220,8 @@ export class Store {
       changes: [],
       activeAt: createdAt,
     };
-    for (const userId of memberIds) room.members.set(userId, { unread: false, involvement: kind === "direct" ? "everything" : "mentions" });
+    // `since` is when each member was put in the room, which their sidebar lists their rooms by.
+    for (const userId of memberIds) room.members.set(userId, { unread: false, involvement: kind === "direct" ? "everything" : "mentions", since: createdAt });
     this.rooms.set(id, room);
     return room;
   }
@@ -230,9 +231,12 @@ export class Store {
     return { id: room.id, kind: room.kind, name: room.name, icon: room.icon };
   }
 
-  /// The rooms `userId` is in, oldest first.
+  /// The rooms `userId` is in, in the order they were put in them, then oldest first, as the real
+  /// server lists them (`ORDER BY memberships.created_at, rooms.created_at, rooms.id`).
   roomsOf(userId) {
-    return [...this.rooms.values()].filter((room) => room.members.has(userId)).sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
+    return [...this.rooms.values()]
+      .filter((room) => room.members.has(userId))
+      .sort((a, b) => a.members.get(userId).since - b.members.get(userId).since || a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1));
   }
 
   favouritesOf(userId) {
@@ -298,7 +302,8 @@ export class Store {
     if (kind !== undefined) room.kind = kind;
     const added = [...wanted].filter((id) => !was.has(id));
     const removed = [...was].filter((id) => !wanted.has(id));
-    for (const id of added) room.members.set(id, { unread: false, involvement: "mentions" });
+    const now = Date.now();
+    for (const id of added) room.members.set(id, { unread: false, involvement: "mentions", since: now });
     for (const id of removed) {
       room.members.delete(id);
       const favourites = this.favouritesOf(id);

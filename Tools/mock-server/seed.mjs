@@ -64,6 +64,14 @@ export function deployCards(version) {
   ];
 }
 
+/// The buttons on Uptime's firing alert, as the seed and the scripted bot both write them: a link, and two
+/// that act, which a click reports to Uptime.
+export const alertButtons = [
+  { text: "Runbook", href: "https://runbooks.fernwood.example/high-error-rate", style: "danger" },
+  { text: "Acknowledge", action: { id: "acknowledge", blockId: "alert_actions", value: "high-error-rate" }, style: "primary" },
+  { text: "Silence for 1 hour", action: { id: "silence", blockId: "alert_actions", value: "1h" } },
+];
+
 /// Builds the workspace into `store`. Answers the keys the server needs to know: people and rooms by name.
 export function seed(store, now = Date.now(), { mediaOrigin = "http://media.localhost:8787" } = {}) {
   const people = {};
@@ -237,7 +245,7 @@ export function seed(store, now = Date.now(), { mediaOrigin = "http://media.loca
   ];
   const firing = now - 20 * HOUR;
   say(cardsRoom, uptime, p("Message API errors are up"), firing, {
-    cards: alertCard(firing, "danger", "FIRING", p("5xx rate is ", strong("4.2%"), " over the last 5 minutes (threshold 1%)."), "critical", [button("Runbook", "https://runbooks.fernwood.example/high-error-rate", "danger")]),
+    cards: alertCard(firing, "danger", "FIRING", p("5xx rate is ", strong("4.2%"), " over the last 5 minutes (threshold 1%)."), "critical", alertButtons),
   });
   const resolved = now - 19 * HOUR;
   say(cardsRoom, uptime, p("Message API errors are back to normal"), resolved, {

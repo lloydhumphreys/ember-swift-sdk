@@ -3,6 +3,14 @@ import Foundation
 // Ports of apps/web/src/lib/room-list.ts and directs.ts.
 
 /// How the sidebar lists someone's rooms, and how it names and finds people for DMs.
+///
+/// Someone's rooms keep the order the sidebar's answer gives them, the order they were put in them.
+/// The sidebar lists their DMs apart from the other rooms, and lists the rooms they've starred first,
+/// in the order they starred them, then the rooms the workspace's shared order ranks, in its order,
+/// then the rest in the order they were put in them, rather than by name, so a room that's just been
+/// made, or that they've just been put in, comes last. Their DMs go by when each was last active,
+/// latest first. The rooms someone has hidden are listed too, for them to open, but their sidebar
+/// leaves them out.
 public enum RoomList {
     /// How many people the sidebar suggests for DMs, you included (`SUGGESTED_PEOPLE`).
     public static let suggestedPeopleCount = 20
@@ -10,8 +18,9 @@ public enum RoomList {
     /// Whether someone has hidden the room, which leaves it out of the sidebar but not out of the list.
     public static func isHidden(_ room: SidebarRoom) -> Bool { room.involvement == .invisible }
 
-    /// Shared rooms, none hidden, in sidebar order: starred first in star order, then the
-    /// workspace's shared order, then by name (lowercased, compared in the person's language), then id.
+    /// Shared rooms, none hidden, in sidebar order: starred first in star order, then the ones the
+    /// workspace's shared order ranks, in its order, then the rest in the order they're given, the
+    /// order someone was put in them.
     public static func shared(_ rooms: [SidebarRoom], favorites: [RoomID], sharedOrder: [RoomID]) -> [SidebarRoom] {
         inSidebarOrder(rooms.filter { !$0.room.isDirect && !isHidden($0) }, favorites: favorites, sharedOrder: sharedOrder)
     }
@@ -49,20 +58,18 @@ public enum RoomList {
         return result
     }
 
-    /// `inSidebarOrder` in room-list.ts.
+    /// `rooms`, given in the order someone was put in them, in the sidebar's order: the rooms in
+    /// `favorites` first, then the ones `sharedOrder` ranks, then the rest as they're given, each
+    /// room's places worked out once rather than at every comparison (`inSidebarOrder` in room-list.ts).
     private static func inSidebarOrder(_ rooms: [SidebarRoom], favorites: [RoomID], sharedOrder: [RoomID]) -> [SidebarRoom] {
         let stars = places(in: favorites)
         let ranks = places(in: sharedOrder)
-        return rooms
-            .map { (room: $0, star: stars[$0.id] ?? .max, rank: ranks[$0.id] ?? .max, name: ($0.room.name ?? "").lowercased()) }
+        return rooms.enumerated()
+            .map { (room: $0.element, star: stars[$0.element.id] ?? .max, rank: ranks[$0.element.id] ?? .max, given: $0.offset) }
             .sorted { a, b in
                 if a.star != b.star { return a.star < b.star }
                 if a.rank != b.rank { return a.rank < b.rank }
-                switch a.name.compare(b.name, locale: .current) {
-                case .orderedAscending: return true
-                case .orderedDescending: return false
-                case .orderedSame: return jsLess(a.room.id, b.room.id)
-                }
+                return a.given < b.given
             }
             .map(\.room)
     }
@@ -102,9 +109,11 @@ public enum RoomList {
         room.unread && room.id != currentRoomID && !isHidden(room)
     }
 
-    /// `rooms` with `room` as it is now: keeps its mark and level, or adds it last, read, at the level
-    /// its kind starts at. A DM keeps the later of its two last-active times, since a message can come
-    /// between the server reading it and its answer arriving.
+    /// `rooms` with `room` as it is now, in place of what it was, keeping its mark and level, or last,
+    /// read and at the level its kind starts at, as the room someone was put in most recently, whether
+    /// it's just been made or they've just been put in it, which is where the list has it when it loads
+    /// again. A DM keeps the later of its two last-active times, since a message can come between the
+    /// server reading it and its answer arriving.
     public static func withRoom(_ rooms: [SidebarRoom], _ room: Room) -> [SidebarRoom] {
         guard let index = rooms.firstIndex(where: { $0.id == room.id }) else {
             return rooms + [SidebarRoom(room: room, unread: false, involvement: .starting(for: room.kind))]

@@ -1,7 +1,7 @@
 // The ten translated payloads of ember-cloudflare's apps/worker/test/fixtures/slack_payloads.json:
 // each one's name and the cards the server stores for it, as they come over the wire.
 //
-// A hand-copied snapshot, checked equal to the server at commit 7657ea4c (release 0.4.2). To refresh it after the
+// A hand-copied snapshot, checked equal to the server at commit 0dc47c6 (release 0.5.0-beta.4). To refresh it after the
 // server changes, copy each entry's `name` and `message.cards` from that file over the entries below, then run
 //     EMBER_SERVER_CHECKOUT=/path/to/ember-cloudflare swift test --filter SlackFixtureDrift
 // which fails on any difference and is skipped when the variable is not set.

@@ -119,6 +119,8 @@ import Observation
     @ObservationIgnored private var lingering = false
     /// Changes sent with the `async` forms of edit, delete and boost, waiting to be shown made.
     @ObservationIgnored var changes: [ChangeWaiter] = []
+    /// Clicks on cards' buttons, waiting for the room's answer.
+    @ObservationIgnored var clicks: [ClickID: CheckedContinuation<Void, any Error>] = [:]
     /// How far each file got before it failed, so a retry goes on from there.
     @ObservationIgnored var uploadCheckpoints: [ClientMessageID: UploadCheckpoint] = [:]
     /// What keeps a file going up when the app leaves the foreground: the client's `backgroundTime`
@@ -791,6 +793,7 @@ import Observation
         newerTimer = nil
         created = []
         changesDisconnected(status)
+        clicksLost(Self.notConnected)
         // Whatever page was on its way won't come on this connection: the next one opens around it.
         aroundsAsked = 0
         if let jumpTarget { aroundOnConnect = .message(jumpTarget) }
@@ -807,17 +810,20 @@ import Observation
 
     /// Handles one frame from the room's socket.
     func handle(_ frame: ServerFrame) {
+        let isClick = clickAnswered(frame)
         switch frame {
         case let .welcome(you, _, _, _):
+            clicksLost(Self.clickLost)
             // Read (or read again, after a failure) before the welcome's check, which asks about
             // what's pending.
             if unsentKey == nil { restoreUnsent(for: you.id) } else if unsentReadFailure != nil { readUnsent() }
             admitted = true
             if phase != .admitted { phase = .admitted }
         case .resumed:
+            clicksLost(Self.clickLost)
             admitted = true
             if phase != .admitted { phase = .admitted }
-        case let .error(message, clientMessageId, clientMessageIds, failed):
+        case let .error(message, clientMessageId, clientMessageIds, _, failed) where !isClick:
             let ids = Set(clientMessageIds ?? clientMessageId.map { [$0] } ?? [])
             // A reply's refusal is its thread's to show, as a message's is the timeline's.
             let isPending = timeline.pending.contains { ids.contains($0.clientMessageId) }

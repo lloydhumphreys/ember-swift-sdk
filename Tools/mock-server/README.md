@@ -21,6 +21,7 @@ A small Node server (no dependencies, Node 18 or later) that speaks Ember's HTTP
 | `MEDIA_ORIGIN` | Origin written into the seeded cards' image URLs. Default `http://media.localhost:<PORT>`. |
 | `EMBER_BOT_DELAY` | Milliseconds before a scripted bot posts its card. Default 1500. |
 | `EMBER_BOT_REPLACE_DELAY` | Milliseconds before the alert bot replaces its card. Default 6000. |
+| `EMBER_CLICK_DELAY` | Milliseconds before a card's bot takes a click on one of its buttons. Default 300. |
 
 The password is read from `EMBER_SEED_PASSWORD`, or else from `.dev/seed-password` at the root of the SDK checkout. If neither exists the server exits and says where it looked. The server and the checker never print it.
 
@@ -55,7 +56,7 @@ The replier starts typing 700 ms after a message and replies about two seconds l
 
 ## Implemented
 
-Bootstrap, sign-in and sign-out, me, sidebar and users with ETags, favourites, involvement, starting direct messages, search with filters and recent searches, avatars, uploads and file serving, and the workspace socket and room sockets. The room socket handles welcome, resume with `since`, `around`, history paging, create, update, delete, boosts, typing, presence, read marks and `message.check`.
+Bootstrap, sign-in and sign-out, me, sidebar and users with ETags, favourites, involvement, starting direct messages, search with filters and recent searches, avatars, uploads and file serving, and the workspace socket and room sockets. The room socket handles welcome, resume with `since`, `around`, history paging, create, update, delete, boosts, typing, presence, read marks, `message.check` and `card.click`.
 
 Cross-site writes are refused with 422, and a socket from the wrong origin gets 404, as on the real server. Signing out closes that session's sockets with 4003.
 
@@ -78,6 +79,10 @@ Messages can carry `cards`, stored already translated to Ember's wire shape; the
 Engineering ends with seven card messages, the newest things in the room: a deploy blocks card (26 h ago), an uptime alert and its resolution, a deploy summary with a table, a CI attachment with pretext, thumb and image, tiles, and a certificate warning (90 min ago). Times are relative to start-up.
 
 Card images are generated PNGs at `GET /card-media/<name>.png` (`avatar`, `icon`, `thumb`, `chart`, `hero-1`, `hero-2`), served with any Host and no session, so `media.localhost` works.
+
+A button links, with `href`, or acts, with `action: {id, blockId?, value?, appId?}` and no `href`, as the real server keeps them; a card part's plain-text line joins its buttons' texts with " · ". The seeded alert's buttons are Runbook, a link, then Acknowledge (primary) and Silence for 1 hour, which act, in the block `alert_actions`; the scripted alert has the same.
+
+A room socket's `{type: "card.click", clickId, messageId, actionId, blockId?, value?}` names a button that acts by its action's id, block and value, matched exactly, on an undeleted message in the room. A malformed frame is `Unrecognized frame`. A button that isn't there answers `{type: "error", message: "That button is no longer there", clickId, failed: "card.click"}`, and a fourth click from one person while three wait answers `Wait for your earlier clicks to be answered` the same way. Otherwise, after `EMBER_CLICK_DELAY`, the card's bot posts `<p><name> clicked <button>.</p>` in the room, and the clicker's socket gets `{type: "card.clicked", clickId}`. Clicks are taken whether or not the replier is on. Bots' click webhooks are not ported.
 
 Editing a card message answers `Messages with cards can't be edited.` (`failed: "message.update"`). Boosts and deletes work.
 
@@ -113,6 +118,8 @@ Routes, messages, permissions and socket frames follow the real worker.
 | `GET /api/account` | `{account, joinCode, invitations, ...}`; members get no invitations | |
 | `POST /api/email_links/lookup` | `{kind, emailAddress}` or 404 | |
 | `POST /api/unfurl` | 200 preview, 204 none, 429 past 30 a minute | |
+
+The sidebar lists a person's rooms in the order they were put in them, then oldest first, as the real server does; clients put favourites first, then the shared order.
 
 Banned people and bots can't sign in. A changed password replaces the shared seed password for that person.
 

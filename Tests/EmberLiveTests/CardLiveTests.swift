@@ -84,7 +84,11 @@ extension LiveTests {
             #expect(href == "https://status.fernwood.example/alerts/high-error-rate")
         } else { Issue.record("C2 has no title") }
         if case let .buttons(buttons) = cards[1].parts[3] {
-            #expect(buttons.contains { $0.style == .danger })
+            #expect(buttons.map(\.text) == ["Runbook", "Acknowledge", "Silence for 1 hour"])
+            #expect(buttons.map(\.style) == [.danger, .primary, nil])
+            #expect(buttons[0].href == "https://runbooks.fernwood.example/high-error-rate")
+            #expect(buttons[1].kind == .action(CardAction(id: "acknowledge", blockId: "alert_actions", value: "high-error-rate")))
+            #expect(buttons[2].action == CardAction(id: "silence", blockId: "alert_actions", value: "1h"))
         } else { Issue.record("C2 has no buttons") }
         if case let .footer(text, _, at) = cards[1].parts[4] {
             #expect(text == "Uptime")
@@ -174,16 +178,16 @@ extension LiveTests {
                     case let .title(_, href): if let href { links.append(href) }
                     case let .section(_, _, thumb, button):
                         image(thumb)
-                        if let button { links.append(button.href) }
+                        if let href = button?.href { links.append(href) }
                     case let .image(value, _): image(value)
                     case let .context(items):
                         for item in items { if case let .image(value) = item { image(value) } }
-                    case let .buttons(buttons): links += buttons.map(\.href)
+                    case let .buttons(buttons): links += buttons.compactMap(\.href)
                     case let .tiles(tiles):
                         for tile in tiles {
                             image(tile.hero)
                             image(tile.icon)
-                            links += tile.buttons.map(\.href)
+                            links += tile.buttons.compactMap(\.href)
                         }
                     case let .footer(_, icon, _): if let icon { images.append(icon) }
                     default: break
@@ -291,6 +295,29 @@ extension LiveTests {
         #expect(kept.cards == target.cards)
         #expect(kept.body == target.body)
         #expect(kept.editedAt == nil)
+    }
+
+    @MainActor @Test func aClickOnASeededButtonIsTakenByItsBot() async throws {
+        let client = try await signedIn()
+        let session = try await engineering(on: client)
+        defer { session.stop() }
+        let alert = try seededCards(in: session)[1]
+        guard case let .buttons(buttons) = alert.cards?.first?.parts[3] else {
+            Issue.record("C2 has no buttons")
+            return
+        }
+        let acknowledge = try #require(buttons.first { $0.text == "Acknowledge" }?.action)
+        let known = Set(session.timeline.messages.map(\.id))
+        try await session.click(acknowledge, on: alert.id)
+        // The bot's line goes out before the click's answer, on the same socket.
+        let said = try #require(session.timeline.messages.first { !known.contains($0.id) && $0.creator.name == "Uptime" })
+        #expect(said.plainText.hasSuffix(" clicked Acknowledge."))
+        #expect(session.notice == nil)
+
+        await #expect(throws: EmberError(kind: .refused, message: "That button is no longer there")) {
+            try await session.click(CardAction(id: "acknowledge", blockId: "alert_actions", value: "another"), on: alert.id)
+        }
+        #expect(session.notice == nil)
     }
 
     @Test func searchFindsTheAlertsWithTheirCards() async throws {

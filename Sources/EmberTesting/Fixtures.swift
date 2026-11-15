@@ -196,12 +196,19 @@ public enum Fixtures {
             json(["type": "typing", "user": value(user), "typing": typing])
         }
 
-        /// A refusal; with a `clientMessageId` it's a message's, otherwise something else's.
-        public static func error(_ message: String, clientMessageId: ClientMessageID? = nil, failed: String? = nil) -> String {
+        /// A refusal; with a `clientMessageId` it's a message's, with a `clickId` a click's, otherwise
+        /// something else's.
+        public static func error(_ message: String, clientMessageId: ClientMessageID? = nil, clickId: ClickID? = nil, failed: String? = nil) -> String {
             var object: [String: Any] = ["type": "error", "message": message]
             if let clientMessageId { object["clientMessageId"] = clientMessageId.rawValue }
+            if let clickId { object["clickId"] = clickId.rawValue }
             if let failed { object["failed"] = failed }
             return json(object)
+        }
+
+        /// The bot took the click `clickId` names.
+        public static func cardClicked(_ clickId: ClickID) -> String {
+            json(["type": "card.clicked", "clickId": clickId.rawValue])
         }
 
         public static let pong = #"{"type":"pong"}"#

@@ -17,7 +17,8 @@ private func directRoom(_ id: RoomID, _ names: [String], minutes: Int = 0) -> Ro
     Room(id: id, kind: .direct, members: names.map { User(id: UserID($0.lowercased()), name: $0) }, activeAt: noon(minutes))
 }
 
-private let four = [room("r1", "Design"), room("r2", "general"), room("r3", "Ops"), room("r4", "Zebra")]
+/// Four rooms, in the order someone was put in them, which isn't by name.
+private let four = [room("r1", "general"), room("r2", "Zebra"), room("r3", "Design"), room("r4", "Ops")]
 
 private func sidebar(_ rooms: [SidebarRoom], favorites: Favorites = Favorites(), invitation: Invitation? = nil) -> SidebarState {
     SidebarState(Sidebar(rooms: rooms, favorites: favorites, invitation: invitation))
@@ -29,31 +30,39 @@ private func sidebarJSON(_ rooms: String, favorites: String = #"{"rooms":[],"ver
 }
 
 @Suite struct RoomOrderTests {
-    @Test func aNewRoomGoesLastAndTheSidebarPutsItInItsPlaceByName() {
-        let rooms = RoomList.withRoom([room("r1", "Design"), room("r2", "general"), room("r3", "Zebra")], Room(id: "r4", kind: .open, name: "Finance"))
-        #expect(rooms.map(\.room.name) == ["Design", "general", "Zebra", "Finance"])
-        #expect(RoomList.shared(rooms, favorites: [], sharedOrder: []).map(\.room.name) == ["Design", "Finance", "general", "Zebra"])
+    @Test func aNewRoomGoesLastAsTheRoomSomeoneWasPutInMostRecentlyWhateverItsName() {
+        let rooms = RoomList.withRoom([room("r1", "general"), room("r2", "Zebra"), room("r3", "Design")], Room(id: "r4", kind: .open, name: "Annex"))
+        #expect(rooms.map(\.room.name) == ["general", "Zebra", "Design", "Annex"])
+        #expect(RoomList.shared(rooms, favorites: [], sharedOrder: []).map(\.room.name) == ["general", "Zebra", "Design", "Annex"])
+        // Below the starred rooms and the ones the shared order ranks, which it doesn't yet.
+        #expect(RoomList.shared(rooms, favorites: ["r3"], sharedOrder: ["r2", "r1"]).map(\.room.name) == ["Design", "Zebra", "general", "Annex"])
     }
 
-    @Test func aRenamedRoomKeepsItsPlaceAndTheSidebarMovesIt() {
+    @Test func aRenamedRoomKeepsItsPlaceInTheSidebarToo() {
         let rooms = RoomList.withRoom([room("r1", "Design"), room("r2", "general")], Room(id: "r1", kind: .open, name: "Product design"))
         #expect(rooms == [room("r1", "Product design"), room("r2", "general")])
-        #expect(RoomList.shared(rooms, favorites: [], sharedOrder: []) == [room("r2", "general"), room("r1", "Product design")])
+        #expect(RoomList.shared(rooms, favorites: [], sharedOrder: []) == [room("r1", "Product design"), room("r2", "general")])
     }
 
-    @Test func starredFirstInStarOrder() {
-        #expect(RoomList.shared(four, favorites: ["r4", "r2"], sharedOrder: []).map(\.room.name) == ["Zebra", "general", "Design", "Ops"])
-        #expect(RoomList.shared(four, favorites: ["gone", "r3"], sharedOrder: []).map(\.room.name) == ["Ops", "Design", "general", "Zebra"])
+    @Test func starredFirstInStarOrderThenTheRestInTheOrderTheyWerePutInThem() {
+        #expect(RoomList.shared(four, favorites: ["r4", "r2"], sharedOrder: []).map(\.room.name) == ["Ops", "Zebra", "general", "Design"])
     }
 
-    @Test func namesWhateverTheirCaseThenId() {
+    @Test func passesOverStarsOnRoomsTheListHasntGot() {
+        #expect(RoomList.shared(four, favorites: ["gone", "r3"], sharedOrder: []).map(\.room.name) == ["Design", "general", "Zebra", "Ops"])
+    }
+
+    @Test func roomsNothingRanksKeepTheOrderGivenWhateverTheirNamesAndIds() {
         let rooms = [room("r4", "zed"), room("r2", "alpha"), room("r3", "Éclair"), room("r1", "ALPHA")]
-        #expect(RoomList.shared(rooms, favorites: [], sharedOrder: []).map(\.id) == ["r1", "r2", "r3", "r4"])
+        #expect(RoomList.shared(rooms, favorites: [], sharedOrder: []).map(\.id) == ["r4", "r2", "r3", "r1"])
     }
 
-    @Test func sharedOrderAfterStars() {
-        #expect(RoomList.shared(four, favorites: ["r4"], sharedOrder: ["r3", "r4", "r2"]).map(\.room.name) == ["Zebra", "Ops", "general", "Design"])
-        #expect(RoomList.shared(four, favorites: [], sharedOrder: ["gone", "r2"]).map(\.room.name) == ["general", "Design", "Ops", "Zebra"])
+    @Test func sharedOrderAfterStarsThenTheRestInTheOrderTheyWerePutInThem() {
+        #expect(RoomList.shared(four, favorites: ["r4"], sharedOrder: ["r3", "r4", "r2"]).map(\.room.name) == ["Ops", "Design", "Zebra", "general"])
+    }
+
+    @Test func passesOverRanksOfRoomsTheListHasntGot() {
+        #expect(RoomList.shared(four, favorites: [], sharedOrder: ["gone", "r2"]).map(\.room.name) == ["Zebra", "general", "Design", "Ops"])
     }
 
     @Test func dmsApartAndHiddenLeftOut() {
@@ -332,6 +341,31 @@ private func sidebarJSON(_ rooms: String, favorites: String = #"{"rooms":[],"ver
         state.apply(.roomGone("r1"))
         state.loaded(list)
         #expect(state.rooms.map(\.id) == ["r2"])
+    }
+
+    @Test func asksAgainWhenARoomSomeoneWasTakenOutOfAndPutBackInMayBeInTheWrongPlace() {
+        var state = sidebar([room("r1", "general"), room("r2", "Design")])
+        // While a sidebar is on its way, Ada is taken out of Design and put back in it, then put in Finance.
+        state.willLoad()
+        state.apply(.roomGone("r2"))
+        state.apply(.roomSaved(Room(id: "r2", kind: .open, name: "Design")))
+        state.apply(.roomSaved(Room(id: "r3", kind: .open, name: "Finance")))
+        let now = [room("r1", "general"), room("r2", "Design"), room("r3", "Finance")]
+        #expect(state.rooms == now)
+
+        // Asked for after all three, the sidebar has Design where it is now, which the changes move past Finance.
+        var unsure = state
+        let asksAgain = unsure.loaded(Sidebar(rooms: now))
+        #expect(asksAgain)
+        unsure.willLoad()
+        let asksAgainAgain = unsure.loaded(Sidebar(rooms: now))
+        #expect(!asksAgainAgain)
+        #expect(unsure.rooms == now)
+
+        // Asked for after she was taken out and before she was put back, it hasn't got Design, which the changes put last.
+        let asksAgainWithout = state.loaded(Sidebar(rooms: [room("r1", "general")]))
+        #expect(!asksAgainWithout)
+        #expect(state.rooms == now)
     }
 
     @Test func aSidebarThatDoesntArriveKeepsTheOneThereIs() {
