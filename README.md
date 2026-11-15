@@ -29,7 +29,7 @@ Bot cards, Ember's message attachments for bots, are read in `EmberCore` and the
 Until 1.0 the API may change between minor versions, so stay within one:
 
 ```swift
-.package(url: "https://github.com/lloydhumphreys/ember-swift-sdk", .upToNextMinor(from: "0.1.0"))
+.package(url: "https://github.com/lloydhumphreys/ember-swift-sdk", .upToNextMinor(from: "0.2.0"))
 ```
 
 Then add `EmberSDK` to your target, plus `EmberRichText` if you draw message bodies, and `EmberTesting` to your test target.
