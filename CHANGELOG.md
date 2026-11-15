@@ -4,6 +4,8 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-15
+
 ### Added
 
 - Buttons that act. `CardButton.kind` is `.link(href:)` or `.action(_:)`, and a `CardAction` is what a click tells the card's bot: its `id`, and the `blockId`, `value` and `appId` it was given. `CardButton(text:action:style:)` makes one, and `CardButton.action` reads it. A button without an `href` key on the wire acts, as upstream Ember 0.5.0-beta.4 reads it; a card part's plain text has its buttons' texts joined with " · ".
