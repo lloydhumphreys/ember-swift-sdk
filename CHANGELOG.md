@@ -4,6 +4,8 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-20
+
 Tracks upstream Ember `v0.5.0-beta.12` (commit `30755b2a`), rather than `main`.
 
 ### Added
