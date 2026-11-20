@@ -66,6 +66,17 @@ import Testing
         #expect(written.sorted() == Data(Self.json.utf8).sorted())
     }
 
+    @Test func aMessageToRewriteKeepsSaying() throws {
+        let message = UnsentMessage(clientMessageId: "client_3", body: "<p>Hi</p>", plainText: "Hi", createdAt: Date(timeIntervalSinceReferenceDate: 3000), failure: "Blocked", toRewrite: true)
+        let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(message)) as? NSDictionary
+        #expect(json?["rewrite"] as? Bool == true)
+        #expect(try JSONDecoder().decode(UnsentMessage.self, from: JSONEncoder().encode(message)).toRewrite)
+        // Only one that failed can be to rewrite, and one that isn't writes nothing for it.
+        #expect(!UnsentMessage(clientMessageId: "c", body: "", plainText: "", createdAt: .now, toRewrite: true).toRewrite)
+        let plain = try JSONSerialization.jsonObject(with: JSONEncoder().encode(Self.messages[1])) as? NSDictionary
+        #expect(plain?["rewrite"] == nil)
+    }
+
     @Test func readsAFileInTodaysFormat() throws {
         defer { try? FileManager.default.removeItem(at: folder) }
         let directory = folder.appending(path: Self.user1Folder, directoryHint: .isDirectory)

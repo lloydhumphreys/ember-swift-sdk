@@ -62,6 +62,27 @@ private func mine(_ id: MessageID, _ clientMessageId: ClientMessageID) -> Messag
         #expect(timeline.pending.isEmpty)
     }
 
+    @Test func aMessageRefusedForWhatItSaysIsToRewriteAndCantBeRetried() {
+        var timeline = welcomed([])
+        _ = timeline.send(body: "Hi", plainText: "Hi", clientMessageId: "c1")
+        _ = timeline.apply(.error(message: "That message has a word this workspace doesn’t allow.", clientMessageId: "c1", clientMessageIds: nil, failed: "message.create", rewrite: true))
+        #expect(timeline.pending.first?.failure == "That message has a word this workspace doesn’t allow.")
+        #expect(timeline.pending.first?.toRewrite == true)
+        #expect(timeline.retry("c1") == nil)
+        #expect(timeline.pending.first?.failure != nil)
+        timeline.discard("c1")
+        #expect(timeline.pending.isEmpty)
+    }
+
+    @Test func aLaterRefusalThatIsntForWhatItSaysCanBeRetried() {
+        var timeline = welcomed([])
+        _ = timeline.send(body: "Hi", plainText: "Hi", clientMessageId: "c1")
+        _ = timeline.apply(.error(message: "Blocked", clientMessageId: "c1", clientMessageIds: nil, failed: "message.create", rewrite: true))
+        _ = timeline.apply(.error(message: "Slow down", clientMessageId: nil, clientMessageIds: ["c1"], failed: "message.create"))
+        #expect(timeline.pending.first?.toRewrite == false)
+        #expect(timeline.retry("c1") == .createMessage(clientMessageId: "c1", body: "Hi"))
+    }
+
     @Test func anErrorAboutNoMessageOfMineChangesNothing() {
         var timeline = welcomed([])
         _ = timeline.send(body: "Hi", plainText: "Hi", clientMessageId: "c1")

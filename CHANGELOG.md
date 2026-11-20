@@ -4,6 +4,29 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+Tracks upstream Ember `v0.5.0-beta.12` (commit `30755b2a`), rather than `main`.
+
+### Added
+
+- `PendingMessage.toRewrite` and `UnsentMessage.toRewrite`: the room refused the message for what it says (an `error` frame with `rewrite: true`, such as for a blocked word). `retry` returns nil for one; edit its text, send it as a new message, and discard the old one. It is kept across launches.
+- `SidebarRoom.unreadSince`, when the first message someone hasn't seen came, and `SidebarRoom.unreadCount`, how many have come since in a DM. Both are nil while a room is read. `room.unread` carries them, and a mark without a time keeps the one before.
+- `Workspace.setVisible(_:)` and `Workspace.setActive(_:)`, with `isVisible` and `isActive`, which tell the Workspace whether the app is shown and in use (`presence.visible` and `presence.active`). The workspace socket opens with `?visible=1` or `?visible=0`, and says whether it's in use once welcomed. `EmberClient.workspaceSocketRequest(visible:)` takes it.
+- EmberTesting: `Fixtures.RoomFrames.error(...rewrite:)` and `Fixtures.WorkspaceFrames.roomUnread(_:at:count:)`.
+- The stand-in server lists `unreadSince` and `unreadCount`, sends `room.unread` with `at` and, in a DM, a `count` for each message, and takes `presence.active` and `presence.visible` on the workspace socket.
+
+### Changed
+
+- `Limits.message` is 40,000, as upstream: "Messages can be up to 40,000 characters." The stand-in server takes as many.
+- A change to someone other than you no longer loads the sidebar again; only a change to your own administrator role does, as upstream.
+
+### Removed
+
+- **Breaking:** `Workspace.suggestedPeople`, `Workspace.suggestions`, `Sidebar.suggestions` and `RoomList.suggestedPeople`. Upstream no longer sends sidebar suggestions; the stand-in server doesn't either.
+
+### Fixed
+
+- A date in a frame field read leniently, such as `room.unread`'s `at`, was never read.
+
 ## [0.2.0] - 2026-11-15
 
 ### Added

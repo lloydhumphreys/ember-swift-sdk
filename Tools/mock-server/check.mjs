@@ -129,7 +129,15 @@ class Client {
   #write(opcode, payload) {
     const mask = randomBytes(4);
     const length = payload.length;
-    const header = length < 126 ? Buffer.from([0x80 | opcode, 0x80 | length]) : Buffer.from([0x80 | opcode, 0x80 | 126, length >> 8, length & 0xff]);
+    let header;
+    if (length < 126) header = Buffer.from([0x80 | opcode, 0x80 | length]);
+    else if (length < 65536) header = Buffer.from([0x80 | opcode, 0x80 | 126, length >> 8, length & 0xff]);
+    else {
+      header = Buffer.alloc(10);
+      header[0] = 0x80 | opcode;
+      header[1] = 0x80 | 127;
+      header.writeBigUInt64BE(BigInt(length), 2);
+    }
     const masked = Buffer.from(payload);
     for (let i = 0; i < masked.length; i++) masked[i] ^= mask[i & 3];
     this.#socket.write(Buffer.concat([header, mask, masked]));
@@ -325,7 +333,9 @@ await check("the sidebar lists rooms, DMs, favourites and unread marks", async (
   state.samDm = sidebar.rooms.find((room) => room.kind === "direct" && room.members.length === 2 && room.members.some((member) => member.name === "Sam Rivera")).id;
   expect(sidebar.favorites.rooms.includes(state.rooms.Launch), "Launch should be starred");
   expect(sidebar.rooms.filter((room) => room.unread).length >= 2, "expected a couple of unread rooms");
-  expect(Array.isArray(sidebar.sharedOrder) && Array.isArray(sidebar.suggestions), "sharedOrder and suggestions are lists");
+  expect(Array.isArray(sidebar.sharedOrder) && !("suggestions" in sidebar), "sharedOrder is a list, and there are no suggestions");
+  expect(sidebar.rooms.filter((room) => room.unread).every((room) => Date.parse(room.unreadSince) > 0), "an unread room says since when");
+  expect(sidebar.rooms.every((room) => room.unread ? (room.kind === "direct") === (room.unreadCount >= 1) : room.unreadSince === undefined && room.unreadCount === undefined), "only an unread DM has a count, and a read room no mark");
   expect(sidebar.invitation === null || (sidebar.invitation.roomId && sidebar.invitation.joinCode), "the invitation is null or has a room and a code");
   const etag = res.headers.etag;
   expect(etag, "no ETag");
@@ -413,6 +423,11 @@ await check("the workspace socket welcomes, pongs, and refuses the wrong origin 
   expect(welcome.you.id === state.mayaId && welcome.account?.name, "welcome has you and the account");
   client.send({ type: "ping" });
   await client.nextOfType("pong");
+  client.send({ type: "presence.active", active: true });
+  client.send({ type: "presence.visible", visible: false });
+  expect(await client.quiet((frame) => frame.type === "error"), "presence.active and presence.visible are taken");
+  client.send({ type: "presence.active", active: "yes" });
+  await client.nextOfType("error");
   const foreign = await openSocket("/api/socket", { cookie: state.maya, originHeader: "http://evil.example" });
   expect(foreign.status === 404, `a foreign origin should get 404, got ${foreign.status}`);
   const noOrigin = await openSocket("/api/socket", { cookie: state.maya, originHeader: null });
@@ -478,7 +493,8 @@ await check("a message sent comes back created to the sender and the other perso
   expect(created.message.plainText === "Hello everyone" && created.message.creator.id === state.mayaId, "the stored message");
   expect(Date.parse(created.message.createdAt) > 0 && created.message.editedAt === null && Array.isArray(created.message.boosts), "the message's dates and boosts");
   await sam.next((frame) => frame.type === "message.created" && frame.message.id === created.message.id, "message.created for Sam");
-  await tomasWorkspace.next((frame) => frame.type === "room.unread" && frame.roomId === state.rooms.Launch, "room.unread for someone not viewing");
+  const unread = await tomasWorkspace.next((frame) => frame.type === "room.unread" && frame.roomId === state.rooms.Launch, "room.unread for someone not viewing");
+  expect(Date.parse(unread.at) > 0 && unread.count === undefined, "a room's mark has a time and no count");
   state.sent = created.message;
   state.seqAfter = created.seq;
 });
@@ -603,6 +619,29 @@ await check("the scripted person types, then replies, in a DM", async () => {
   await maya.next((frame) => frame.type === "typing" && frame.typing === false, "typing stops", 2000);
 });
 
+await check("a DM's unread mark counts each message from when the first came, and opening it clears it", async () => {
+  const people = (await request("GET", "/api/users", { cookie: state.sam })).json.users;
+  const tomasId = people.find((user) => user.name.startsWith("Tom")).id;
+  const dm = (await request("POST", "/api/directs", { cookie: state.sam, body: { userIds: [tomasId] } })).json.room.id;
+  const tomas = await tracked("/api/socket?visible=1", { cookie: state.tomas });
+  await tomas.nextOfType("welcome");
+  const sam = await roomSocket(dm, state.sam);
+  await sam.nextOfType("welcome");
+  const marks = [];
+  for (const text of ["One", "Two"]) {
+    sam.send({ type: "message.create", clientMessageId: `check-${randomBytes(4).toString("hex")}`, body: `<p>${text}</p>` });
+    marks.push(await tomas.next((frame) => frame.type === "room.unread" && frame.roomId === dm, `room.unread for ${text}`));
+  }
+  expect(marks[1].count === marks[0].count + 1 && marks[0].count >= 1, "the count goes up by one a message");
+  expect(marks[0].at === marks[1].at && Date.parse(marks[0].at) > 0, "the time stays the first unseen message's");
+  const listed = (await request("GET", "/api/sidebar", { cookie: state.tomas })).json.rooms.find((room) => room.id === dm);
+  expect(listed.unreadSince === marks[0].at && listed.unreadCount === marks[1].count, "the sidebar lists the same mark");
+  await roomSocket(dm, state.tomas);
+  await tomas.next((frame) => frame.type === "room.read" && frame.roomId === dm, "room.read once opened");
+  const read = (await request("GET", "/api/sidebar", { cookie: state.tomas })).json.rooms.find((room) => room.id === dm);
+  expect(!read.unread && read.unreadSince === undefined && read.unreadCount === undefined, "a read DM has no mark");
+});
+
 await check("a thread opens with its replies", async () => {
   const maya = await roomSocket(state.rooms.Launch, state.maya);
   const welcome = await maya.nextOfType("welcome");
@@ -644,12 +683,12 @@ await check("lengths count UTF-16 units, and boosts are trimmed", async () => {
   const maya = await roomSocket(state.rooms.Launch, state.maya);
   await maya.nextOfType("welcome");
   const wave = "\u{1F44D}";
-  maya.send({ type: "message.create", clientMessageId: "check-long", body: `<p>${wave.repeat(5001)}</p>` });
+  maya.send({ type: "message.create", clientMessageId: "check-long", body: `<p>${wave.repeat(20001)}</p>` });
   const long = await maya.nextOfType("error");
-  expect(long.failed === "message.create" && long.message === "Messages can be up to 10,000 characters.", "10,002 units are too long");
+  expect(long.failed === "message.create" && long.message === "Messages can be up to 40,000 characters.", "40,002 units are too long");
   const ok = `check-${randomBytes(4).toString("hex")}`;
-  maya.send({ type: "message.create", clientMessageId: ok, body: `<p>${wave.repeat(5000)}</p>` });
-  await maya.next((frame) => frame.type === "message.created" && frame.message.clientMessageId === ok, "10,000 units are fine");
+  maya.send({ type: "message.create", clientMessageId: ok, body: `<p>${wave.repeat(20000)}</p>` });
+  await maya.next((frame) => frame.type === "message.created" && frame.message.clientMessageId === ok, "40,000 units are fine");
   const own = `check-${randomBytes(4).toString("hex")}`;
   maya.send({ type: "message.create", clientMessageId: own, body: "<p>React to me</p>" });
   const { message } = await maya.next((frame) => frame.type === "message.created" && frame.message.clientMessageId === own, "created");
@@ -1520,7 +1559,7 @@ await check("an unknown key is 401, a bot that isn't in the room is an empty 404
 // Rooms, sidebar order, profiles, people, transfers, resets, invitations and link previews
 
 const workspaceSocket = async (cookie) => {
-  const client = await tracked("/api/socket", { cookie });
+  const client = await tracked("/api/socket?visible=1", { cookie });
   await client.nextOfType("welcome");
   return client;
 };

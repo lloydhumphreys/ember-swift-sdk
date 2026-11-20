@@ -107,7 +107,7 @@ func eventually(within timeout: Duration = .seconds(10), _ condition: @MainActor
 
     @MainActor @Test func theWorkspaceSocketWelcomes() async throws {
         let client = try await signedIn()
-        let socket = client.workspaceSocket()
+        let socket = client.workspaceSocket { client.workspaceSocketRequest() }
         var frames: [WorkspaceFrame] = []
         socket.onText = { frames.append(WorkspaceFrame(text: $0)) }
         socket.start()

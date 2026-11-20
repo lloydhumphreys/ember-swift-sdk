@@ -144,6 +144,12 @@ import Testing
             == .error(message: "No", clientMessageId: "c1", clientMessageIds: nil, failed: "message.create"))
         #expect(ServerFrame(text: #"{"type":"error","message":"No","clientMessageIds":["c1","c2"],"failed":"message.check"}"#)
             == .error(message: "No", clientMessageId: nil, clientMessageIds: ["c1", "c2"], failed: "message.check"))
+        #expect(ServerFrame(text: #"{"type":"error","message":"Blocked","clientMessageId":"c1","failed":"message.create","rewrite":true}"#)
+            == .error(message: "Blocked", clientMessageId: "c1", clientMessageIds: nil, failed: "message.create", rewrite: true))
+        #expect(ServerFrame(text: #"{"type":"error","message":"No","clientMessageId":"c1","rewrite":false}"#)
+            == .error(message: "No", clientMessageId: "c1", clientMessageIds: nil, failed: nil))
+        #expect(ServerFrame(text: #"{"type":"error","message":"No","clientMessageId":"c1","rewrite":"yes"}"#)
+            == .error(message: "No", clientMessageId: "c1", clientMessageIds: nil, failed: nil))
         #expect(ServerFrame(text: #"{"type":"error","message":"That button is no longer there","clickId":"k1"}"#)
             == .error(message: "That button is no longer there", clientMessageId: nil, clientMessageIds: nil, clickId: "k1", failed: nil))
         #expect(ServerFrame(text: #"{"type":"error","message":"That click couldn’t be delivered","clickId":"k1","failed":"card.click"}"#)
@@ -181,6 +187,10 @@ import Testing
 
     @Test func rooms() {
         #expect(WorkspaceFrame(text: #"{"type":"room.unread","roomId":"r1"}"#) == .roomUnread("r1"))
+        #expect(WorkspaceFrame(text: #"{"type":"room.unread","roomId":"r1","at":"2026-10-12T12:00:00.000Z"}"#) == .roomUnread("r1", since: noon()))
+        #expect(WorkspaceFrame(text: #"{"type":"room.unread","roomId":"d1","at":"2026-10-12T12:00:00.000Z","count":3}"#) == .roomUnread("d1", since: noon(), count: 3))
+        // A time or count it can't read is left out, and the mark still taken.
+        #expect(WorkspaceFrame(text: #"{"type":"room.unread","roomId":"d1","at":"soon","count":"3"}"#) == .roomUnread("d1"))
         #expect(WorkspaceFrame(text: #"{"type":"room.read","roomId":"r1"}"#) == .roomRead("r1"))
         #expect(WorkspaceFrame(text: #"{"type":"room.saved","room":{"id":"r1","kind":"open","name":"general","icon":null}}"#)
             == .roomSaved(Room(id: "r1", kind: .open, name: "general")))
@@ -239,5 +249,21 @@ import Testing
         #expect(String(decoding: data, as: UTF8.self) == #"["2026-10-12T12:00:00.000Z"]"#)
         #expect(try EmberJSON.decoder().decode([Date].self, from: data) == [noon()])
         #expect(throws: DecodingError.self) { try EmberJSON.decoder().decode([Date].self, from: Data(#"["soon"]"#.utf8)) }
+    }
+}
+
+@Suite struct WorkspaceClientFrameTests {
+    @Test func presence() {
+        #expect(WorkspaceClientFrame.active(true).text == #"{"active":true,"type":"presence.active"}"#)
+        #expect(WorkspaceClientFrame.active(false).text == #"{"active":false,"type":"presence.active"}"#)
+        #expect(WorkspaceClientFrame.visible(false).text == #"{"type":"presence.visible","visible":false}"#)
+        #expect(WorkspaceClientFrame.ping.text == #"{"type":"ping"}"#)
+        #expect(WorkspaceClientFrame(text: #"{"type":"presence.visible","visible":true}"#) == .visible(true))
+        #expect(WorkspaceClientFrame(text: #"{"type":"presence.active","active":"yes"}"#) == nil)
+    }
+
+    @Test func socketQuery() {
+        #expect(WorkspaceSocket.query(visible: true) == "visible=1")
+        #expect(WorkspaceSocket.query(visible: false) == "visible=0")
     }
 }

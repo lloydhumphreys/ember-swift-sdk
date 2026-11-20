@@ -19,7 +19,7 @@ import Testing
         #expect(client.origin.absoluteString == "https://chat.example.com")
         #expect(client.originHeader == "https://chat.example.com")
         #expect(client.workspaceSocketRequest().value(forHTTPHeaderField: "Origin") == "https://chat.example.com")
-        #expect(client.workspaceSocketRequest().url?.absoluteString == "wss://chat.example.com/api/socket")
+        #expect(client.workspaceSocketRequest().url?.absoluteString == "wss://chat.example.com/api/socket?visible=1")
 
         transport.stub("PUT", "/api/rooms/r1/favorite", json: #"{"favorites":{"rooms":[],"version":1}}"#)
         _ = try await client.setFavorite(true, roomID: "r1")
@@ -29,7 +29,7 @@ import Testing
     @Test func aPortThatIsntTheSchemesOwnIsKept() {
         let client = EmberClient.mock(origin: URL(string: "http://LOCALHOST:8787/")!)
         #expect(client.originHeader == "http://localhost:8787")
-        #expect(client.workspaceSocketRequest().url?.absoluteString == "ws://localhost:8787/api/socket")
+        #expect(client.workspaceSocketRequest().url?.absoluteString == "ws://localhost:8787/api/socket?visible=1")
     }
 
     @Test func anAddressWrittenDifferentlyIsStillThisServers() async throws {

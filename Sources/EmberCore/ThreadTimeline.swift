@@ -173,7 +173,7 @@ public struct ThreadTimeline: Equatable, Sendable {
                 stopTyping(user.id)
             }
 
-        case let .error(text, clientMessageId, clientMessageIds, _, failed):
+        case let .error(text, clientMessageId, clientMessageIds, _, failed, rewrite):
             switch failed {
             case "thread.open":
                 if isOpening {
@@ -188,6 +188,7 @@ public struct ThreadTimeline: Equatable, Sendable {
                 let ids = Set(clientMessageIds ?? clientMessageId.map { [$0] } ?? [])
                 for index in pending.indices where ids.contains(pending[index].clientMessageId) {
                     pending[index].failure = text
+                pending[index].toRewrite = rewrite
                 }
             }
 
@@ -224,8 +225,8 @@ public struct ThreadTimeline: Equatable, Sendable {
 
     /// Marks a pending as failed. For an upload, answers the `message.check` to send, since the file
     /// may have been posted anyway.
-    package mutating func fail(_ clientMessageId: ClientMessageID, reason: String) -> ClientFrame? {
-        pending.fail(clientMessageId, reason: reason)
+    package mutating func fail(_ clientMessageId: ClientMessageID, reason: String, toRewrite: Bool = false) -> ClientFrame? {
+        pending.fail(clientMessageId, reason: reason, toRewrite: toRewrite)
     }
 
     /// The message an upload's last part answered with: its pending goes and it shows among the
@@ -237,11 +238,11 @@ public struct ThreadTimeline: Equatable, Sendable {
     }
 
     /// Puts a failed reply on its way again, under the same id, and answers the frame that creates
-    /// it. nil when it isn't pending, and for a file, which the session uploads again. The room
+    /// it. nil when it isn't pending or is `toRewrite`, and for a file, which the session uploads again. The room
     /// doesn't de-duplicate a create, so `ThreadSession` asks it with `message.check` first and sends
     /// this only for a reply the room says is missing.
     package mutating func retry(_ clientMessageId: ClientMessageID) -> ClientFrame? {
-        guard let index = pending.firstIndex(where: { $0.clientMessageId == clientMessageId }) else { return nil }
+        guard let index = pending.firstIndex(where: { $0.clientMessageId == clientMessageId && !$0.toRewrite }) else { return nil }
         pending[index].failure = nil
         if pending[index].upload != nil {
             pending[index].upload?.sentBytes = 0

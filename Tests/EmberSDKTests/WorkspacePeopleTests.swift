@@ -3,8 +3,7 @@ import Foundation
 import Testing
 @testable import EmberSDK
 
-/// Your profile and bans as the workspace shows them: at once, before the socket says so, and the
-/// sidebar's suggestions leaving out whoever is banned, deactivated or suspended.
+/// Your profile and bans as the workspace shows them: at once, before the socket says so.
 @MainActor @Suite struct WorkspacePeopleTests {
     let transport = MockHTTPTransport()
     let connector = MockSocketConnector()
@@ -108,45 +107,8 @@ import Testing
         #expect(workspace.bannedPeople.map(\.name) == [Fixtures.alan.name, Fixtures.grace.name])
     }
 
-    // MARK: Suggestions
-
-    /// The sidebar suggests Grace and Alan; Grace has a DM already, so Alan is the one suggested.
-    func suggestingAlan() async throws {
-        try await started()
-        try #require(workspace.suggestedPeople.map(\.id) == [Fixtures.alan.id])
-    }
-
-    @Test func someoneBannedIsntSuggestedAndIsAgainOnceLetBackIn() async throws {
-        try await suggestingAlan()
-        var alan = try #require(workspace.person(Fixtures.alan.id))
-        alan.status = .banned
-        transport.stub("POST", "/api/users/user_alan/ban", json: Fixtures.changedPersonJSON(alan))
-        try await workspace.ban(Fixtures.alan.id)
-        #expect(workspace.suggestedPeople.isEmpty)
-        #expect(workspace.suggestions.map(\.id).contains(Fixtures.alan.id))
-
-        alan.status = .active
-        transport.stub("DELETE", "/api/users/user_alan/ban", json: Fixtures.changedPersonJSON(alan))
-        try await workspace.unban(Fixtures.alan.id)
-        #expect(workspace.suggestedPeople.map(\.id) == [Fixtures.alan.id])
-    }
-
-    @Test func someoneTheSocketSaysIsBannedOrDeactivatedIsntSuggested() async throws {
-        try await suggestingAlan()
-        var alan = try #require(workspace.person(Fixtures.alan.id))
-        for status: UserStatus in [.banned, .deactivated, .suspended, .unknown("frozen")] {
-            alan.status = status
-            connector.latest?.serverSends(Fixtures.WorkspaceFrames.userUpdated(alan))
-            #expect(await eventually { workspace.suggestedPeople.isEmpty }, "\(status.rawValue)")
-
-            alan.status = .active
-            connector.latest?.serverSends(Fixtures.WorkspaceFrames.userUpdated(alan))
-            #expect(await eventually { workspace.suggestedPeople.map(\.id) == [Fixtures.alan.id] })
-        }
-    }
-
     @Test func aDirectoryAnswerOnItsWayDoesntUndoWhatTheSocketSaid() async throws {
-        try await suggestingAlan()
+        try await started()
         // The answer still has Alan active.
         let gate = transport.hold("GET", "/api/users")
         let reloading = Task { await workspace.reloadDirectory() }
@@ -159,22 +121,10 @@ import Testing
         await reloading.value
         #expect(workspace.person(Fixtures.alan.id)?.status == .banned)
         #expect(workspace.bannedPeople.map(\.id) == [Fixtures.alan.id])
-        #expect(workspace.suggestedPeople.isEmpty)
     }
 
-    @Test func aSidebarSuggestingSomeoneTheDirectoryHasAsBannedLeavesThemOut() async throws {
-        var people = Fixtures.people
-        let index = try #require(people.firstIndex { $0.id == Fixtures.alan.id })
-        people[index].status = .banned
-        transport.stub("GET", "/api/users", json: Fixtures.directoryJSON(people))
+    @Test func aChangeToSomeoneDoesntSortTheSidebarAgain() async throws {
         try await started()
-        #expect(await eventually { workspace.person(Fixtures.alan.id)?.status == .banned })
-        #expect(workspace.suggestions.map(\.id).contains(Fixtures.alan.id))
-        #expect(workspace.suggestedPeople.isEmpty)
-    }
-
-    @Test func aChangeToSomeoneNotSuggestedDoesntSortTheSuggestionsAgain() async throws {
-        try await suggestingAlan()
         let sorts = workspace.sortCount
         var grace = try #require(workspace.person(Fixtures.grace.id))
         grace.bio = "Admiral"

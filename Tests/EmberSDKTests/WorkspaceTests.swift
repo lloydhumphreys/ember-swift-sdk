@@ -38,6 +38,53 @@ import Testing
         #expect(connector.connections.first?.request.url?.path == "/api/socket")
     }
 
+    // MARK: Presence
+
+    /// The presence frames the latest socket sent, in order.
+    func presenceSent() -> [String] {
+        connector.latest?.sent.filter { $0.contains(#""type":"presence."#) } ?? []
+    }
+
+    @Test func theSocketSaysWhetherItsShownAndOnceWelcomedWhetherItsInUse() async throws {
+        try await started()
+        #expect(connector.latest?.request.url?.query == "visible=1")
+        #expect(await eventually { presenceSent() == [#"{"active":true,"type":"presence.active"}"#] })
+
+        workspace.setActive(false)
+        workspace.setActive(false)
+        workspace.setVisible(false)
+        workspace.setVisible(false)
+        #expect(!workspace.isActive && !workspace.isVisible)
+        #expect(await eventually {
+            presenceSent() == [
+                #"{"active":true,"type":"presence.active"}"#, #"{"active":false,"type":"presence.active"}"#,
+                #"{"type":"presence.visible","visible":false}"#,
+            ]
+        })
+    }
+
+    @Test func aSocketOpenedAgainSaysWhatsTrueNow() async throws {
+        try await started()
+        workspace.setVisible(false)
+        workspace.setActive(false)
+        connector.latest?.serverCloses(code: SocketClose.reconnect)
+        #expect(await clock.pass(.milliseconds(250)))
+        #expect(await eventually { connector.connections.count == 2 && workspace.connection == .open })
+        // Its address says it's hidden, so only whether it's in use is sent once welcomed.
+        #expect(connector.latest?.request.url?.query == "visible=0")
+        #expect(await eventually { presenceSent() == [#"{"active":false,"type":"presence.active"}"#] })
+    }
+
+    @Test func nothingIsSaidBeforeTheWelcome() async throws {
+        connector.onConnect { _ in }
+        workspace.start()
+        #expect(await eventually { connector.latest != nil })
+        workspace.setActive(false)
+        workspace.setVisible(false)
+        await settle()
+        #expect(presenceSent().isEmpty)
+    }
+
     @Test func aFailedLoadSaysWhy() async {
         transport.stub("GET", "/api/sidebar", status: 500, json: Fixtures.errorJSON("Something went wrong."))
         await workspace.reload()

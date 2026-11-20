@@ -13,8 +13,6 @@ import Foundation
 public struct SidebarState: Equatable, Sendable {
     /// The rooms you're in.
     public private(set) var rooms: [SidebarRoom]
-    /// The people the sidebar offers DMs with.
-    public private(set) var suggestions: [User]
 
     /// The shared order as the server has given it.
     private var savedSharedOrder: [RoomID]
@@ -39,7 +37,6 @@ public struct SidebarState: Equatable, Sendable {
         rooms = []
         starred = Favorites()
         savedSharedOrder = []
-        suggestions = []
         savedInvitation = nil
     }
 
@@ -47,7 +44,6 @@ public struct SidebarState: Equatable, Sendable {
         rooms = sidebar.rooms
         starred = sidebar.favorites
         savedSharedOrder = sidebar.sharedOrder
-        suggestions = sidebar.suggestions
         savedInvitation = sidebar.invitation
     }
 
@@ -148,8 +144,8 @@ public struct SidebarState: Equatable, Sendable {
         switch frame {
         case .welcome, .roomsReordered:
             return true
-        case let .roomUnread(id): record(.marked(id, unread: true))
-        case let .roomRead(id): record(.marked(id, unread: false))
+        case let .roomUnread(id, since, count): record(.marked(id, unread: true, since: since, count: count))
+        case let .roomRead(id): record(.marked(id, unread: false, since: nil, count: nil))
         case let .roomSaved(room): record(.saved(room))
         case let .roomGone(id): record(.gone(id))
         case let .roomActive(id, at): record(.active(id, at: at))
@@ -162,22 +158,17 @@ public struct SidebarState: Equatable, Sendable {
         return false
     }
 
-    /// `apply(_:)`, knowing who's signed in and the directory as it was before the frame, which a
-    /// `user.updated` needs: a change to their own role loads their rooms again, since only
-    /// administrators get the welcome card, and so does someone coming back (active now, though the
-    /// directory lists them otherwise), since the suggestions only list people active when they loaded.
+    /// `apply(_:)`, knowing who's signed in, which a `user.updated` needs: a change to their own role
+    /// loads their rooms again, since only administrators get the welcome card.
     @discardableResult
-    package mutating func apply(_ frame: WorkspaceFrame, me: Me?, directory: [DirectoryUser]) -> Bool {
+    package mutating func apply(_ frame: WorkspaceFrame, me: Me?) -> Bool {
         guard case let .userUpdated(user) = frame else { return apply(frame) }
-        if let me, user.id == me.id {
-            return (user.role == .administrator) != me.administrator
-        }
-        let before = directory.first { $0.id == user.id }?.status ?? .active
-        return user.status == .active && before != .active
+        guard let me, user.id == me.id else { return false }
+        return (user.role == .administrator) != me.administrator
     }
 
     /// They've opened a room, or read it elsewhere.
-    package mutating func markRead(_ roomID: RoomID) { record(.marked(roomID, unread: false)) }
+    package mutating func markRead(_ roomID: RoomID) { record(.marked(roomID, unread: false, since: nil, count: nil)) }
 
     /// Sets how much of a room reaches you.
     package mutating func setInvolvement(_ involvement: Involvement, roomID: RoomID) {
@@ -218,7 +209,7 @@ public struct SidebarState: Equatable, Sendable {
     private enum Change: Equatable, Sendable {
         case saved(Room)
         case gone(RoomID)
-        case marked(RoomID, unread: Bool)
+        case marked(RoomID, unread: Bool, since: Date?, count: Int?)
         case active(RoomID, at: Date)
         case involved(RoomID, Involvement)
         case starred(Favorites)
@@ -258,8 +249,8 @@ public struct SidebarState: Equatable, Sendable {
             // A room that's gone takes its star with it, as the server's stars do.
             starred.rooms.removeAll { $0 == id }
             guesses.removeAll { $0.roomID == id }
-        case let .marked(id, unread):
-            for index in rooms.indices where rooms[index].id == id { rooms[index].unread = unread }
+        case let .marked(id, unread, since, count):
+            for index in rooms.indices where rooms[index].id == id { rooms[index].mark(unread: unread, since: since, count: count) }
         case let .active(id, at):
             for index in rooms.indices where rooms[index].id == id && rooms[index].room.isDirect {
                 if (rooms[index].room.activeAt ?? .distantPast) < at { rooms[index].room.activeAt = at }

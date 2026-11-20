@@ -92,15 +92,13 @@ public enum Fixtures {
     public static func sidebarJSON(
         rooms: [SidebarRoom] = sidebarRooms,
         favorites: Favorites = favorites,
-        sharedOrder: [RoomID] = [engines.id, general.id],
-        suggestions: [User] = [grace, alan]
+        sharedOrder: [RoomID] = [engines.id, general.id]
     ) -> String {
         json([
             "rooms": rooms.map(sidebarRoomObject),
             "favorites": value(favorites),
             "sharedOrder": sharedOrder.map(\.rawValue),
             "invitation": NSNull(),
-            "suggestions": suggestions.map { value($0) },
         ])
     }
 
@@ -197,9 +195,12 @@ public enum Fixtures {
         }
 
         /// A refusal; with a `clientMessageId` it's a message's, with a `clickId` a click's, otherwise
-        /// something else's.
-        public static func error(_ message: String, clientMessageId: ClientMessageID? = nil, clickId: ClickID? = nil, failed: String? = nil) -> String {
+        /// something else's. `rewrite` refuses a message for what it says.
+        public static func error(
+            _ message: String, clientMessageId: ClientMessageID? = nil, clickId: ClickID? = nil, failed: String? = nil, rewrite: Bool = false
+        ) -> String {
             var object: [String: Any] = ["type": "error", "message": message]
+            if rewrite { object["rewrite"] = true }
             if let clientMessageId { object["clientMessageId"] = clientMessageId.rawValue }
             if let clickId { object["clickId"] = clickId.rawValue }
             if let failed { object["failed"] = failed }
@@ -222,8 +223,12 @@ public enum Fixtures {
             json(["type": "welcome", "you": value(you), "account": accountObject(account)])
         }
 
-        public static func roomUnread(_ roomID: RoomID) -> String {
-            json(["type": "room.unread", "roomId": roomID.rawValue])
+        /// A mark as of `at`; `count` for a DM's.
+        public static func roomUnread(_ roomID: RoomID, at: Date? = nil, count: Int? = nil) -> String {
+            let at = at ?? date("2026-11-20T09:00:00.000Z")
+            var object: [String: Any] = ["type": "room.unread", "roomId": roomID.rawValue, "at": EmberJSON.string(from: at)]
+            if let count { object["count"] = count }
+            return json(object)
         }
 
         public static func roomRead(_ roomID: RoomID) -> String {
@@ -306,6 +311,8 @@ public enum Fixtures {
     static func sidebarRoomObject(_ room: SidebarRoom) -> [String: Any] {
         var object = value(room.room) as? [String: Any] ?? [:]
         object["unread"] = room.unread
+        if let unreadSince = room.unreadSince { object["unreadSince"] = EmberJSON.string(from: unreadSince) }
+        if let unreadCount = room.unreadCount { object["unreadCount"] = unreadCount }
         object["involvement"] = room.involvement.rawValue
         return object
     }

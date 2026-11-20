@@ -361,7 +361,8 @@ import Testing
         transport.stub("POST", "/api/session", json: Fixtures.meJSON(), headers: Fixtures.sessionCookieHeaders)
         _ = try await client.signIn(emailAddress: "ada@example.com", password: "not-a-real-password")
         let request = client.workspaceSocketRequest()
-        #expect(request.url?.absoluteString == "wss://ember.test/api/socket")
+        #expect(request.url?.absoluteString == "wss://ember.test/api/socket?visible=1")
+        #expect(client.workspaceSocketRequest(visible: false).url?.absoluteString == "wss://ember.test/api/socket?visible=0")
         #expect(request.value(forHTTPHeaderField: "Origin") == "https://ember.test")
         #expect(request.value(forHTTPHeaderField: "Cookie") == "session_token=test-session")
     }
@@ -369,7 +370,7 @@ import Testing
     @Test func plainHTTPIsWS() {
         let client = EmberClient.mock(origin: URL(string: "http://127.0.0.1:8791")!)
         let request = client.workspaceSocketRequest()
-        #expect(request.url?.absoluteString == "ws://127.0.0.1:8791/api/socket")
+        #expect(request.url?.absoluteString == "ws://127.0.0.1:8791/api/socket?visible=1")
         #expect(request.value(forHTTPHeaderField: "Origin") == "http://127.0.0.1:8791")
         #expect(request.value(forHTTPHeaderField: "Cookie") == nil)
     }

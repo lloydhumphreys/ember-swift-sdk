@@ -12,9 +12,6 @@ import Foundation
 /// latest first. The rooms someone has hidden are listed too, for them to open, but their sidebar
 /// leaves them out.
 public enum RoomList {
-    /// How many people the sidebar suggests for DMs, you included (`SUGGESTED_PEOPLE`).
-    public static let suggestedPeopleCount = 20
-
     /// Whether someone has hidden the room, which leaves it out of the sidebar but not out of the list.
     public static func isHidden(_ room: SidebarRoom) -> Bool { room.involvement == .invisible }
 
@@ -87,22 +84,6 @@ public enum RoomList {
             .map(\.element)
     }
 
-    /// The people the sidebar suggests for DMs: everyone listed but the people in their DMs, as many
-    /// as there's room for beside those people and them. Anyone `people` (the directory) has as other
-    /// than active, as banned, deactivated or suspended since the list arrived, is left out; someone
-    /// the directory doesn't have counts as active.
-    public static func suggestedPeople(_ suggestions: [User], rooms: [SidebarRoom], people: [UserID: DirectoryUser] = [:]) -> [User] {
-        let inDirects = Set(rooms.filter(\.room.isDirect).flatMap { $0.room.members ?? [] }.map(\.id))
-        let count = max(0, suggestedPeopleCount - inDirects.count - 1)
-        let active = suggestions.filter { isSuggestable($0.id, people: people) }
-        return Array(active.filter { !inDirects.contains($0.id) }.prefix(count))
-    }
-
-    /// Whether the sidebar may suggest someone: they're active in `people`, or `people` doesn't have them.
-    public static func isSuggestable(_ id: UserID, people: [UserID: DirectoryUser]) -> Bool {
-        (people[id]?.status ?? .active) == .active
-    }
-
     /// Whether the sidebar marks the room unread: never the room on screen, which counts as read while
     /// it's open, nor one hidden after it was marked.
     public static func isMarkedUnread(_ room: SidebarRoom, currentRoomID: RoomID?) -> Bool {
@@ -124,7 +105,9 @@ public enum RoomList {
         if listed.room.isDirect, room.isDirect, let before = listed.room.activeAt, before > room.activeAt ?? .distantPast {
             saved.activeAt = before
         }
-        rooms[index] = SidebarRoom(room: saved, unread: listed.unread, involvement: listed.involvement)
+        rooms[index] = SidebarRoom(
+            room: saved, unread: listed.unread, unreadSince: listed.unreadSince, unreadCount: listed.unreadCount, involvement: listed.involvement
+        )
         return rooms
     }
 

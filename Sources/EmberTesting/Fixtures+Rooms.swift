@@ -14,7 +14,6 @@ extension Fixtures {
             "favorites": value(favorites),
             "sharedOrder": sharedOrder.map(\.rawValue),
             "invitation": value(invitation),
-            "suggestions": [grace, alan].map { value($0) },
         ])
     }
 

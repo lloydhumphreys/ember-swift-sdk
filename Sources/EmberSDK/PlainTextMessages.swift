@@ -8,7 +8,7 @@ struct PlainTextMessage {
     let plainText: String
 
     /// What a message over `Limits.message` is refused with, as the room words it.
-    static let tooLong = "Messages can be up to 10,000 characters."
+    static let tooLong = "Messages can be up to 40,000 characters."
     /// What a message with nothing in it is refused with.
     static let empty = "Write something first."
 

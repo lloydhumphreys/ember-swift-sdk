@@ -12,6 +12,9 @@ public struct PendingMessage: Hashable, Identifiable, Sendable {
     public var createdAt: Date
     /// Why the room refused it; nil while it's on its way.
     public var failure: String?
+    /// Set with `failure` when the room won't take it for what it says: it's for its writer to change
+    /// and send as a new message, and `retry` won't send it as it is.
+    public var toRewrite: Bool
     /// The thread it replies in; nil for a room message.
     public var parentId: MessageID?
     /// Where a reply goes. Always `.threadOnly` without `parentId`.
@@ -22,13 +25,14 @@ public struct PendingMessage: Hashable, Identifiable, Sendable {
 
     public init(
         clientMessageId: ClientMessageID, body: String, plainText: String, createdAt: Date, failure: String? = nil,
-        parentId: MessageID? = nil, delivery: ReplyDelivery = .threadOnly, upload: PendingUpload? = nil
+        toRewrite: Bool = false, parentId: MessageID? = nil, delivery: ReplyDelivery = .threadOnly, upload: PendingUpload? = nil
     ) {
         self.clientMessageId = clientMessageId
         self.body = body
         self.plainText = plainText
         self.createdAt = createdAt
         self.failure = failure
+        self.toRewrite = failure != nil && toRewrite
         self.parentId = parentId
         self.delivery = parentId == nil ? .threadOnly : delivery
         self.upload = upload
@@ -291,7 +295,7 @@ public struct Timeline: Equatable, Sendable {
         case .threadOpened, .threadHistory:
             break
 
-        case let .error(text, clientMessageId, clientMessageIds, _, failed):
+        case let .error(text, clientMessageId, clientMessageIds, _, failed, rewrite):
             switch failed {
             case "history.before":
                 isLoadingOlder = false
@@ -306,6 +310,7 @@ public struct Timeline: Equatable, Sendable {
             let ids = Set(clientMessageIds ?? clientMessageId.map { [$0] } ?? [])
             for index in pending.indices where ids.contains(pending[index].clientMessageId) {
                 pending[index].failure = text
+                pending[index].toRewrite = rewrite
             }
 
         case .cardClicked, .pong, .unknown:
@@ -321,11 +326,11 @@ public struct Timeline: Equatable, Sendable {
     }
 
     /// Puts a failed message on its way again, under the same id, and answers the frame that creates
-    /// it. nil when it isn't pending, and for a file, which the session uploads again. The room
+    /// it. nil when it isn't pending or is `toRewrite`, and for a file, which the session uploads again. The room
     /// doesn't de-duplicate a create, so `RoomSession` asks it with `message.check` first and sends
     /// this only for a message the room says is missing.
     package mutating func retry(_ clientMessageId: ClientMessageID) -> ClientFrame? {
-        guard let index = pending.firstIndex(where: { $0.clientMessageId == clientMessageId }) else { return nil }
+        guard let index = pending.firstIndex(where: { $0.clientMessageId == clientMessageId && !$0.toRewrite }) else { return nil }
         pending[index].failure = nil
         if pending[index].upload != nil {
             pending[index].upload?.sentBytes = 0
@@ -346,8 +351,8 @@ public struct Timeline: Equatable, Sendable {
 
     /// Marks a pending as failed. For an upload, answers the `message.check` to send, since the
     /// file may have been posted anyway.
-    package mutating func fail(_ clientMessageId: ClientMessageID, reason: String) -> ClientFrame? {
-        pending.fail(clientMessageId, reason: reason)
+    package mutating func fail(_ clientMessageId: ClientMessageID, reason: String, toRewrite: Bool = false) -> ClientFrame? {
+        pending.fail(clientMessageId, reason: reason, toRewrite: toRewrite)
     }
 
     /// The message an upload's last part answered with. The pending with its `clientMessageId`
@@ -595,9 +600,10 @@ extension [PendingMessage] {
         self[index].upload?.sentBytes = Swift.max(upload.sentBytes, Swift.min(Swift.max(0, sentBytes), upload.byteSize))
     }
 
-    mutating func fail(_ clientMessageId: ClientMessageID, reason: String) -> ClientFrame? {
+    mutating func fail(_ clientMessageId: ClientMessageID, reason: String, toRewrite: Bool = false) -> ClientFrame? {
         guard let index = firstIndex(where: { $0.clientMessageId == clientMessageId }) else { return nil }
         self[index].failure = reason
+        self[index].toRewrite = toRewrite
         return self[index].upload == nil ? nil : .checkMessages(clientMessageIds: [clientMessageId])
     }
 }

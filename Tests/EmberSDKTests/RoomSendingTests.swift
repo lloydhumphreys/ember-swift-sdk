@@ -554,7 +554,7 @@ import Testing
     @Test func plainTextOverTheLimitIsRefusedBeforeSending() async throws {
         let session = session()
         _ = try await opened(session)
-        #expect(throws: EmberError(kind: .invalid, message: "Messages can be up to 10,000 characters.")) {
+        #expect(throws: EmberError(kind: .invalid, message: "Messages can be up to 40,000 characters.")) {
             try session.send(text: String(repeating: "a", count: Limits.message + 1))
         }
         #expect(throws: EmberError.self) { try session.send(text: " \n ") }

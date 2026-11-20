@@ -206,23 +206,45 @@ public enum Involvement: OpenEnum, CaseIterable {
 public struct SidebarRoom: Decodable, Hashable, Identifiable, Sendable {
     public var room: Room
     public var unread: Bool
+    /// While it's marked unread, when the first message they haven't seen came. A room view can
+    /// mark what's new from there.
+    public var unreadSince: Date?
+    /// While a DM is marked unread, how many messages have come since `unreadSince`. Nil elsewhere.
+    public var unreadCount: Int?
     public var involvement: Involvement
 
     public var id: RoomID { room.id }
 
-    public init(room: Room, unread: Bool = false, involvement: Involvement? = nil) {
+    public init(room: Room, unread: Bool = false, unreadSince: Date? = nil, unreadCount: Int? = nil, involvement: Involvement? = nil) {
         self.room = room
         self.unread = unread
+        self.unreadSince = unread ? unreadSince : nil
+        self.unreadCount = unread ? unreadCount : nil
         self.involvement = involvement ?? .starting(for: room.kind)
     }
 
-    private enum CodingKeys: String, CodingKey { case unread, involvement }
+    private enum CodingKeys: String, CodingKey { case unread, unreadSince, unreadCount, involvement }
 
     public init(from decoder: Decoder) throws {
-        room = try Room(from: decoder)
+        let room = try Room(from: decoder)
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        unread = try container.decodeIfPresent(Bool.self, forKey: .unread) ?? false
-        involvement = try container.decodeIfPresent(Involvement.self, forKey: .involvement) ?? .starting(for: room.kind)
+        self.init(
+            room: room,
+            unread: try container.decodeIfPresent(Bool.self, forKey: .unread) ?? false,
+            unreadSince: try? container.decodeIfPresent(Date.self, forKey: .unreadSince),
+            unreadCount: try? container.decodeIfPresent(Int.self, forKey: .unreadCount),
+            involvement: try container.decodeIfPresent(Involvement.self, forKey: .involvement)
+        )
+    }
+
+    /// Marked unread as of `since`, with `count` messages in a DM, or read. A room marked already
+    /// takes the new time, as the server tells of a mark only as it makes one; a mark that names
+    /// no time keeps the one it had.
+    mutating func mark(unread: Bool, since: Date?, count: Int?) {
+        let wasUnread = self.unread
+        self.unread = unread
+        unreadSince = unread ? since ?? (wasUnread ? unreadSince : nil) : nil
+        unreadCount = unread ? count : nil
     }
 }
 
@@ -247,17 +269,15 @@ public struct Sidebar: Decodable, Sendable {
     public var favorites: Favorites
     public var sharedOrder: [RoomID]
     public var invitation: Invitation?
-    public var suggestions: [User]
 
-    private enum CodingKeys: String, CodingKey { case rooms, favorites, sharedOrder, invitation, suggestions }
+    private enum CodingKeys: String, CodingKey { case rooms, favorites, sharedOrder, invitation }
 
     /// A sidebar as given, for tests and previews.
-    public init(rooms: [SidebarRoom] = [], favorites: Favorites = Favorites(), sharedOrder: [RoomID] = [], invitation: Invitation? = nil, suggestions: [User] = []) {
+    public init(rooms: [SidebarRoom] = [], favorites: Favorites = Favorites(), sharedOrder: [RoomID] = [], invitation: Invitation? = nil) {
         self.rooms = rooms
         self.favorites = favorites
         self.sharedOrder = sharedOrder
         self.invitation = invitation
-        self.suggestions = suggestions
     }
 
     public init(from decoder: Decoder) throws {
@@ -266,7 +286,6 @@ public struct Sidebar: Decodable, Sendable {
         favorites = try container.decodeIfPresent(Favorites.self, forKey: .favorites) ?? Favorites()
         sharedOrder = try container.decodeIfPresent([RoomID].self, forKey: .sharedOrder) ?? []
         invitation = try container.decodeIfPresent(Invitation.self, forKey: .invitation)
-        suggestions = try container.decodeIfPresent([User].self, forKey: .suggestions) ?? []
     }
 }
 
@@ -523,7 +542,7 @@ public enum Reactions {
 
 public enum Limits {
     /// The longest message, in UTF-16 code units of its text.
-    public static let message = 10_000
+    public static let message = 40_000
     /// The longest boost, in UTF-16 code units once trimmed, as the server counts it.
     public static let boost = 16
     public static let historyPage = 40

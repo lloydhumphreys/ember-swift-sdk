@@ -25,7 +25,7 @@ private func sidebar(_ rooms: [SidebarRoom], favorites: Favorites = Favorites(),
 }
 
 private func sidebarJSON(_ rooms: String, favorites: String = #"{"rooms":[],"version":0}"#, invitation: String = "null") throws -> Sidebar {
-    let text = #"{"rooms":\#(rooms),"favorites":\#(favorites),"sharedOrder":[],"invitation":\#(invitation),"suggestions":[]}"#
+    let text = #"{"rooms":\#(rooms),"favorites":\#(favorites),"sharedOrder":[],"invitation":\#(invitation)}"#
     return try EmberJSON.decoder().decode(Sidebar.self, from: Data(text.utf8))
 }
 
@@ -103,30 +103,11 @@ private func sidebarJSON(_ rooms: String, favorites: String = #"{"rooms":[],"ver
         let marked = [direct("d1", "Ada", minutes: 5, unread: true)]
         #expect(RoomList.withRoom(marked, directRoom("d1", ["Ada"], minutes: 1)) == marked)
         #expect(RoomList.withRoom(marked, directRoom("d1", ["Ada"], minutes: 7)) == [direct("d1", "Ada", minutes: 7, unread: true)])
-    }
-
-    @Test func suggestedPeople() {
-        let people = ["Grace", "Linus", "Alan"].map { User(id: UserID($0.lowercased()), name: $0) }
-        let many = (0 ..< 20).map { User(id: "p\($0)", name: "Person \($0)") }
-        #expect(RoomList.suggestedPeople(people, rooms: [room("r1", "Design")]) == people)
-        #expect(RoomList.suggestedPeople(people, rooms: [room("r1", "Design"), direct("d1", "Ada", "Linus")]) == [people[0], people[2]])
-        #expect(RoomList.suggestedPeople(many, rooms: []).count == 19)
-        #expect(RoomList.suggestedPeople(many, rooms: [direct("d1", "Ada")]).count == 18)
-        #expect(RoomList.suggestedPeople(many, rooms: [direct("d1", "Ada", "Grace"), direct("d2", "Ada", "Grace", "Linus")]).count == 16)
-    }
-
-    @Test func suggestedPeopleLeaveOutAnyoneTheDirectoryHasAsNotActive() {
-        let people = ["Grace", "Linus", "Alan", "Edsger", "Barbara"].map { User(id: UserID($0.lowercased()), name: $0) }
-        let statuses: [UserStatus] = [.active, .banned, .deactivated, .suspended, .unknown("frozen")]
-        let directory = Dictionary(uniqueKeysWithValues: zip(people, statuses).map { ($0.id, DirectoryUser(id: $0.id, name: $0.name, status: $1, avatarUrl: "")) })
-        #expect(RoomList.suggestedPeople(people, rooms: [], people: directory) == [people[0]])
-        // Someone the directory doesn't have yet counts as active.
-        #expect(RoomList.suggestedPeople(people, rooms: [], people: [:]) == people)
-
-        // Those left out don't take up the places of those suggested.
-        let many = (0 ..< 25).map { User(id: "p\($0)", name: "Person \($0)") }
-        let banned = Dictionary(uniqueKeysWithValues: many.prefix(5).map { ($0.id, DirectoryUser(id: $0.id, name: $0.name, status: .banned, avatarUrl: "")) })
-        #expect(RoomList.suggestedPeople(many, rooms: [], people: banned) == Array(many[5 ..< 24]))
+        var counted = direct("d1", "Ada", minutes: 5, unread: true)
+        counted.unreadSince = noon(2)
+        counted.unreadCount = 4
+        let saved = RoomList.withRoom([counted], directRoom("d1", ["Ada"], minutes: 7)).first
+        #expect(saved?.unreadSince == noon(2) && saved?.unreadCount == 4)
     }
 }
 
@@ -279,30 +260,19 @@ private func sidebarJSON(_ rooms: String, favorites: String = #"{"rooms":[],"ver
         #expect(state.rooms == four)
     }
 
-    @Test func userUpdatedFetchesForMyNewRoleOrSomeoneBack() {
+    @Test func userUpdatedFetchesOnlyForMyNewRole() {
         var state = sidebar(four)
         let me = Me(id: "u1", name: "Ada", administrator: false)
-        let directory = [
-            DirectoryUser(id: "u1", name: "Ada", avatarUrl: ""),
-            DirectoryUser(id: "u2", name: "Grace", status: .suspended, avatarUrl: ""),
-            DirectoryUser(id: "u3", name: "Linus", avatarUrl: ""),
-        ]
-        let fetched12 = state.apply(.userUpdated(DirectoryUser(id: "u1", name: "Ada", role: .administrator, avatarUrl: "")), me: me, directory: directory)
-        #expect(fetched12)
-        let fetched13 = state.apply(.userUpdated(DirectoryUser(id: "u1", name: "Ada L", avatarUrl: "")), me: me, directory: directory)
-        #expect(!fetched13)
-        let fetched14 = state.apply(.userUpdated(DirectoryUser(id: "u1", name: "Ada", avatarUrl: "")), me: Me(id: "u1", name: "Ada", administrator: true), directory: directory)
-        #expect(fetched14)
-        let fetched15 = state.apply(.userUpdated(DirectoryUser(id: "u2", name: "Grace", avatarUrl: "")), me: me, directory: directory)
-        #expect(fetched15)
-        let fetched16 = state.apply(.userUpdated(DirectoryUser(id: "u3", name: "Linus T", avatarUrl: "")), me: me, directory: directory)
-        #expect(!fetched16)
-        let fetched17 = state.apply(.userUpdated(DirectoryUser(id: "u9", name: "New", avatarUrl: "")), me: me, directory: directory)
-        #expect(!fetched17)
-        let fetched18 = state.apply(.userUpdated(DirectoryUser(id: "u3", name: "Linus", status: .banned, avatarUrl: "")), me: me, directory: directory)
-        #expect(!fetched18)
-        let fetched19 = state.apply(.roomsReordered, me: me, directory: directory)
-        #expect(fetched19)
+        func fetches(_ frame: WorkspaceFrame, me: Me = me) -> Bool { state.apply(frame, me: me) }
+        #expect(fetches(.userUpdated(DirectoryUser(id: "u1", name: "Ada", role: .administrator, avatarUrl: ""))))
+        #expect(!fetches(.userUpdated(DirectoryUser(id: "u1", name: "Ada L", avatarUrl: ""))))
+        #expect(fetches(.userUpdated(DirectoryUser(id: "u1", name: "Ada", avatarUrl: "")), me: Me(id: "u1", name: "Ada", administrator: true)))
+        // Someone else back, renamed, new or banned changes nothing the sidebar lists.
+        #expect(!fetches(.userUpdated(DirectoryUser(id: "u2", name: "Grace", avatarUrl: ""))))
+        #expect(!fetches(.userUpdated(DirectoryUser(id: "u3", name: "Linus T", avatarUrl: ""))))
+        #expect(!fetches(.userUpdated(DirectoryUser(id: "u9", name: "New", avatarUrl: ""))))
+        #expect(!fetches(.userUpdated(DirectoryUser(id: "u3", name: "Linus", status: .banned, avatarUrl: ""))))
+        #expect(fetches(.roomsReordered))
         #expect(state.rooms == four)
     }
 
@@ -366,6 +336,23 @@ private func sidebarJSON(_ rooms: String, favorites: String = #"{"rooms":[],"ver
         let asksAgainWithout = state.loaded(Sidebar(rooms: [room("r1", "general")]))
         #expect(!asksAgainWithout)
         #expect(state.rooms == now)
+    }
+
+    @Test func aMarkKeepsWhenAndHowMany() {
+        var state = sidebar([room("r1", "Design"), direct("d1", "Ada")])
+        state.apply(.roomUnread("r1", since: noon()))
+        state.apply(.roomUnread("d1", since: noon(1), count: 1))
+        state.apply(.roomUnread("d1", since: noon(1), count: 2))
+        let marked = state.rooms.first { $0.id == "r1" }
+        #expect(marked?.unreadSince == noon() && marked?.unreadCount == nil)
+        let dm = state.rooms.first { $0.id == "d1" }
+        #expect(dm?.unreadSince == noon(1) && dm?.unreadCount == 2)
+        // A mark that names no time keeps the one there was.
+        state.apply(.roomUnread("r1"))
+        #expect(state.rooms.first { $0.id == "r1" }?.unreadSince == noon())
+        state.apply(.roomRead("d1"))
+        let read = state.rooms.first { $0.id == "d1" }
+        #expect(read?.unread == false && read?.unreadSince == nil && read?.unreadCount == nil)
     }
 
     @Test func aSidebarThatDoesntArriveKeepsTheOneThereIs() {

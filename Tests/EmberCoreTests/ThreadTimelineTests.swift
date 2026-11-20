@@ -328,6 +328,18 @@ private func ids(_ thread: ThreadTimeline) -> [MessageID] { thread.replies.map(\
         #expect(checks.isEmpty && state.pending.isEmpty)
     }
 
+    @Test func aReplyRefusedForWhatItSaysIsToRewriteAndCantBeRetried() {
+        var state = thread()
+        open(&state, [reply("r1")])
+        _ = state.reply(body: "A", plainText: "A", delivery: .threadOnly, clientMessageId: "c2", now: noon())
+        _ = state.apply(.error(message: "Blocked", clientMessageId: "c2", clientMessageIds: nil, failed: "message.create", rewrite: true))
+        #expect(state.pending.map(\.toRewrite) == [true])
+        #expect(state.retry("c2") == nil)
+        #expect(state.pending.map(\.failure) == ["Blocked"])
+        state.discard("c2")
+        #expect(state.pending.isEmpty)
+    }
+
     @Test func errorsByIdFailTheThreadsReplies() {
         var state = thread()
         open(&state, [reply("r1")])

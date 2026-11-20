@@ -4,7 +4,7 @@
 import { createHash, randomBytes } from "node:crypto";
 
 export const HISTORY_PAGE_SIZE = 40;
-export const MAX_MESSAGE_LENGTH = 10_000;
+export const MAX_MESSAGE_LENGTH = 40_000;
 export const MAX_MESSAGE_HTML_LENGTH = 100_000;
 export const MAX_BOOST_LENGTH = 16;
 export const MAX_SEARCH_LENGTH = 1000;
@@ -16,7 +16,6 @@ export const CHANGES_KEPT = 100;
 export const ASSISTANT_ID = "ember";
 const SEARCH_LIMIT = Number(process.env.EMBER_SEARCH_PAGE) > 0 ? Number(process.env.EMBER_SEARCH_PAGE) : 100;
 const STAR_LIMIT = 20;
-const SUGGESTED_PEOPLE = 20;
 
 const BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz";
 
@@ -248,31 +247,22 @@ export class Store {
   sidebar(userId) {
     const rooms = this.roomsOf(userId);
     const favourites = this.favouritesOf(userId);
-    const directMembers = new Set();
-    const talkedTo = new Set();
-    for (const room of rooms) {
-      if (room.kind !== "direct") continue;
-      for (const id of room.members.keys()) {
-        directMembers.add(id);
-        talkedTo.add(id);
-      }
-    }
-    const suggestions = [...this.users.values()]
-      .filter((user) => user.role !== "bot" && user.status === "active" && user.id !== userId && !talkedTo.has(user.id))
-      .sort((a, b) => a.createdAt - b.createdAt || (a.id < b.id ? -1 : 1))
-      .slice(0, Math.max(0, SUGGESTED_PEOPLE - directMembers.size - 1))
-      .map((user) => this.ref(user.id));
     const invitation = this.users.get(userId)?.role === "administrator" && !this.invitations.get(userId) ? { roomId: this.originalRoom().id, joinCode: this.joinCode } : null;
     return {
       rooms: rooms.map((room) => {
         const state = room.members.get(userId);
-        return { ...this.roomWire(room), unread: state.unread, involvement: state.involvement };
+        return { ...this.roomWire(room), ...this.markOf(room, state), involvement: state.involvement };
       }),
       favorites: { rooms: [...favourites.rooms], version: favourites.version },
       sharedOrder: this.sharedOrder.filter((id) => rooms.some((room) => room.id === id)),
       invitation,
-      suggestions,
     };
+  }
+
+  /// A member's unread mark as the sidebar lists it: when the first message they haven't seen came and, in a DM, how many have come since.
+  markOf(room, state) {
+    if (!state.unread) return { unread: false };
+    return { unread: true, ...(state.unreadAt !== undefined && { unreadSince: iso(state.unreadAt) }), ...(room.kind === "direct" && { unreadCount: Math.max(state.unreadCount ?? 0, 1) }) };
   }
 
   /// Everyone active, by name, as a room's settings list them.
@@ -552,9 +542,12 @@ export class Store {
     if (inRoom) {
       const viewers = this.hub.viewers(room.id);
       for (const [memberId, state] of room.members) {
-        if (memberId === message.creatorId || viewers.has(memberId) || state.unread || state.involvement === "invisible") continue;
-        state.unread = true;
-        this.hub.workspace(memberId, { type: "room.unread", roomId: room.id });
+        // A room is marked once; a DM counts every message, as on the real server.
+        if (memberId === message.creatorId || viewers.has(memberId) || (state.unread && room.kind !== "direct") || state.involvement === "invisible") continue;
+        if (!state.unread) Object.assign(state, { unread: true, unreadAt: message.createdAt, unreadCount: 0 });
+        state.unreadCount = (state.unreadCount ?? 0) + 1;
+        const { unreadSince, unreadCount } = this.markOf(room, state);
+        this.hub.workspace(memberId, { type: "room.unread", roomId: room.id, at: unreadSince, ...(unreadCount !== undefined && { count: unreadCount }) });
       }
     }
     if (room.kind === "direct" && inRoom) {
@@ -567,7 +560,7 @@ export class Store {
   markRead(room, userId) {
     const state = room.members.get(userId);
     if (state?.unread) {
-      state.unread = false;
+      Object.assign(state, { unread: false, unreadAt: undefined, unreadCount: 0 });
       this.hub.workspace(userId, { type: "room.read", roomId: room.id });
     }
   }

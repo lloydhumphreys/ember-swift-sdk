@@ -14,16 +14,7 @@ import Observation
     /// The workspace's name and switches.
     public private(set) var account: Account
     /// The directory, by id.
-    public private(set) var people: [UserID: DirectoryUser] = [:] {
-        didSet {
-            directory = Array(people.values)
-            // Someone suggested who's been banned or let back in since is left out or back.
-            if suggestions.contains(where: { RoomList.isSuggestable($0.id, people: oldValue) != RoomList.isSuggestable($0.id, people: people) }) {
-                sortCount += 1
-                publishSuggestedPeople()
-            }
-        }
-    }
+    public private(set) var people: [UserID: DirectoryUser] = [:]
     /// Whether the first sidebar has arrived.
     public private(set) var isLoaded = false
     /// Why the latest sidebar didn't arrive; nil once one does.
@@ -34,6 +25,12 @@ import Observation
     public var notice: String?
     /// Where the directory is: `people` is empty until it has loaded once.
     public private(set) var directoryStatus: DirectoryStatus = .loading
+    /// Whether the app is in front, which the Workspace counts in telling whether you have Ember in
+    /// view anywhere. `setVisible(_:)` changes it.
+    public private(set) var isVisible = true
+    /// Whether you're using the app, which the Workspace shows others as active or away.
+    /// `setActive(_:)` changes it.
+    public private(set) var isActive = true
     /// Whether the workspace socket last heard there's a network. Its sockets try again as soon as
     /// it's back.
     public private(set) var isNetworkAvailable = true
@@ -70,12 +67,14 @@ import Observation
     }
     /// The position of each room in `rooms`.
     @ObservationIgnored private var roomIndex: [RoomID: Int] = [:]
-    /// `people`'s values, for the frames that look someone up.
-    @ObservationIgnored private var directory: [DirectoryUser] = []
     /// How many times the sidebar's lists have been sorted.
     @ObservationIgnored private(set) var sortCount = 0
 
     @ObservationIgnored private var socket: ReconnectingSocket?
+    /// Whether the Workspace has welcomed the socket since it last opened. Presence waits for it.
+    @ObservationIgnored private var welcomed = false
+    /// What the socket's address, or the latest `presence.visible`, told the Workspace.
+    @ObservationIgnored private var toldVisible: Bool?
     @ObservationIgnored private var sessions: [RoomID: RoomSession] = [:]
     /// The rooms in `sessions`, least recently used first.
     @ObservationIgnored private var recency: [RoomID] = []
@@ -143,8 +142,6 @@ import Observation
     public private(set) var favorites = Favorites(rooms: [], version: 0)
     /// The workspace's order for shared rooms.
     public private(set) var sharedOrder: [RoomID] = []
-    /// The people the sidebar offers DMs with.
-    public private(set) var suggestions: [User] = []
     /// An invitation an administrator hasn't dismissed yet.
     public private(set) var invitation: Invitation?
 
@@ -159,10 +156,6 @@ import Observation
 
     /// DMs, none hidden, latest active first.
     public private(set) var directRooms: [SidebarRoom] = []
-
-    /// The people to suggest DMs with, leaving out those you have DMs with and anyone the directory
-    /// has as banned, deactivated or suspended. It changes as they're banned or let back in.
-    public private(set) var suggestedPeople: [User] = []
 
     /// The rooms marked unread, shared then DMs. The room on screen never is.
     public private(set) var unreadRooms: [SidebarRoom] = []
@@ -188,16 +181,14 @@ import Observation
         let roomsChanged = state.rooms != rooms
         let favoritesChanged = state.favorites != favorites
         let orderChanged = state.sharedOrder != sharedOrder
-        let suggestionsChanged = state.suggestions != suggestions
         if roomsChanged {
             rooms = state.rooms
             roomIndex = Dictionary(rooms.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
         }
         if favoritesChanged { favorites = state.favorites }
         if orderChanged { sharedOrder = state.sharedOrder }
-        if suggestionsChanged { suggestions = state.suggestions }
         if state.invitation != invitation { invitation = state.invitation }
-        guard roomsChanged || favoritesChanged || orderChanged || suggestionsChanged else { return }
+        guard roomsChanged || favoritesChanged || orderChanged else { return }
         sortCount += 1
         if roomsChanged || favoritesChanged || orderChanged {
             assign(\.sharedRooms, RoomList.shared(rooms, favorites: favorites.rooms, sharedOrder: sharedOrder))
@@ -206,12 +197,7 @@ import Observation
             assign(\.roomsInSharedOrder, RoomList.inSharedOrder(rooms, sharedOrder: sharedOrder))
         }
         if roomsChanged { assign(\.directRooms, RoomList.directs(rooms)) }
-        if roomsChanged || suggestionsChanged { publishSuggestedPeople() }
         publishUnread()
-    }
-
-    private func publishSuggestedPeople() {
-        assign(\.suggestedPeople, RoomList.suggestedPeople(suggestions, rooms: rooms, people: people))
     }
 
     private func publishUnread() {
@@ -659,10 +645,35 @@ import Observation
         released = released.filter { $0.value.session != nil }
     }
 
+    /// Tells the Workspace whether the app is in front (`presence.visible`), as the scene's phase
+    /// changes while the workspace is started.
+    public func setVisible(_ visible: Bool) {
+        guard visible != isVisible else { return }
+        isVisible = visible
+        tellVisibility()
+    }
+
+    /// Tells the Workspace whether you're using the app (`presence.active`), so others see you active
+    /// or away. Starts true.
+    public func setActive(_ active: Bool) {
+        guard active != isActive else { return }
+        isActive = active
+        if welcomed { socket?.send(WorkspaceClientFrame.active(active).text) }
+    }
+
     // MARK: The socket
 
+    private func tellVisibility() {
+        guard welcomed, isVisible != toldVisible, socket?.send(WorkspaceClientFrame.visible(isVisible).text) == true else { return }
+        toldVisible = isVisible
+    }
+
     private func makeSocket() -> ReconnectingSocket {
-        let socket = client.workspaceSocket()
+        let socket = client.workspaceSocket { [client, weak self] in
+            let visible = self?.isVisible ?? false
+            self?.toldVisible = visible
+            return client.workspaceSocketRequest(visible: visible)
+        }
         socket.onStatus = { [weak self] status in self?.socketChanged(status) }
         socket.onText = { [weak self] text in self?.handle(WorkspaceFrame(text: text)) }
         socket.onNetwork = { [weak self] available in self?.isNetworkAvailable = available }
@@ -671,6 +682,7 @@ import Observation
 
     private func socketChanged(_ status: ConnectionStatus) {
         connection = status
+        if status != .open { welcomed = false }
         if case .stopped(.signedOut) = status { confirmSignedOut() }
     }
 
@@ -680,24 +692,27 @@ import Observation
         case let .welcome(you, account):
             me = you
             self.account = account
+            welcomed = true
+            socket?.send(WorkspaceClientFrame.active(isActive).text)
+            tellVisibility()
             refreshAfterWelcome()
         case let .accountUpdated(account):
             self.account = account
         case let .userUpdated(user):
-            let refetch = state.apply(frame, me: me, directory: directory)
+            let refetch = state.apply(frame, me: me)
             heard(user)
             if user.id == me.id {
                 me = Me(id: me.id, name: user.name, administrator: user.role == .administrator)
             }
             if refetch { Task { await reload() } }
-        case let .roomUnread(id) where id == currentRoomID:
+        case let .roomUnread(id, _, _) where id == currentRoomID:
             // The room on screen is being read.
             state.apply(frame)
             state.markRead(id)
         case let .error(message):
             if !message.isEmpty { notice = message }
         default:
-            if state.apply(frame, me: me, directory: directory) { Task { await reload() } }
+            if state.apply(frame, me: me) { Task { await reload() } }
         }
     }
 

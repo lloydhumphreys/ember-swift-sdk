@@ -64,6 +64,18 @@ import Testing
         #expect(room.room.name == "General")
         #expect(room.unread)
         #expect(room.involvement == .everything)
+        #expect(room.unreadSince == nil && room.unreadCount == nil)
+    }
+
+    @Test func aSidebarRoomsMarkSaysSinceWhenAndHowMany() throws {
+        let decode = { (json: String) in try EmberJSON.decoder().decode(SidebarRoom.self, from: Data(json.utf8)) }
+        let dm = try decode(#"{"id":"d1","kind":"direct","name":"","unread":true,"unreadSince":"2026-10-12T12:00:00.000Z","unreadCount":2,"involvement":"everything"}"#)
+        #expect(dm.unreadSince == noon() && dm.unreadCount == 2)
+        // One it can't read is left out; a read room keeps no mark whatever it says.
+        let odd = try decode(#"{"id":"d1","kind":"direct","name":"","unread":true,"unreadSince":5,"unreadCount":"2"}"#)
+        #expect(odd.unread && odd.unreadSince == nil && odd.unreadCount == nil)
+        let read = try decode(#"{"id":"r1","kind":"open","name":"General","unread":false,"unreadSince":"2026-10-12T12:00:00.000Z","unreadCount":2}"#)
+        #expect(read.unreadSince == nil && read.unreadCount == nil)
     }
 }
 

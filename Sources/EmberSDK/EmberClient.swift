@@ -225,10 +225,10 @@ public final class EmberClient: Sendable {
 
     // MARK: Sockets
 
-    /// The workspace socket's request: wss (or ws) to `/api/socket`, `Origin` set to the server's
-    /// origin, and the session cookie attached.
-    package func workspaceSocketRequest() -> URLRequest {
-        socketRequest("/api/socket")
+    /// The workspace socket's request: wss (or ws) to `/api/socket?visible=0|1`, `Origin` set to the
+    /// server's origin, and the session cookie attached.
+    package func workspaceSocketRequest(visible: Bool = true) -> URLRequest {
+        socketRequest("/api/socket?\(WorkspaceSocket.query(visible: visible))")
     }
 
     /// A room socket's request, as `RoomSocket.query` names what it asks for.
@@ -236,9 +236,10 @@ public final class EmberClient: Sendable {
         socketRequest("/api/rooms/\(Self.segment(roomID))/socket?\(RoomSocket.query(visible: visible, since: since, around: around))")
     }
 
-    /// The workspace socket, keeping itself connected on this client's connector and network.
-    @MainActor package func workspaceSocket() -> ReconnectingSocket {
-        ReconnectingSocket(connector: connector, timing: timing, network: network) { [self] in workspaceSocketRequest() }
+    /// The workspace socket, keeping itself connected on this client's connector and network;
+    /// `request` is asked again for each attempt.
+    @MainActor package func workspaceSocket(request: @escaping @MainActor () -> URLRequest) -> ReconnectingSocket {
+        ReconnectingSocket(connector: connector, timing: timing, network: network, request: request)
     }
 
     /// A room's socket, keeping itself connected; `request` is asked again for each attempt.

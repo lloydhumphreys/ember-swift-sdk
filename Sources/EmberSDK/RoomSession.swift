@@ -528,7 +528,7 @@ import Observation
         for message in unknown where message.parentId == nil {
             _ = timeline.send(body: message.body, plainText: message.plainText, clientMessageId: message.clientMessageId, now: message.createdAt)
             if let failure = message.failure {
-                _ = timeline.fail(message.clientMessageId, reason: failure)
+                _ = timeline.fail(message.clientMessageId, reason: failure, toRewrite: message.toRewrite)
             } else if admitted {
                 checkAgain(message.clientMessageId)
             }
@@ -823,7 +823,7 @@ import Observation
             clicksLost(Self.clickLost)
             admitted = true
             if phase != .admitted { phase = .admitted }
-        case let .error(message, clientMessageId, clientMessageIds, _, failed) where !isClick:
+        case let .error(message, clientMessageId, clientMessageIds, _, failed, _) where !isClick:
             let ids = Set(clientMessageIds ?? clientMessageId.map { [$0] } ?? [])
             // A reply's refusal is its thread's to show, as a message's is the timeline's.
             let isPending = timeline.pending.contains { ids.contains($0.clientMessageId) }

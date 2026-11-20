@@ -140,7 +140,7 @@ import Observation
     func restore(_ replies: [UnsentMessage]) {
         for reply in replies where !timeline.pending.contains(where: { $0.clientMessageId == reply.clientMessageId }) {
             _ = timeline.reply(body: reply.body, plainText: reply.plainText, delivery: reply.delivery, clientMessageId: reply.clientMessageId, now: reply.createdAt)
-            if let failure = reply.failure { _ = timeline.fail(reply.clientMessageId, reason: failure) }
+            if let failure = reply.failure { _ = timeline.fail(reply.clientMessageId, reason: failure, toRewrite: reply.toRewrite) }
         }
     }
 

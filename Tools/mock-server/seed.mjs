@@ -357,7 +357,7 @@ export function seed(store, now = Date.now(), { mediaOrigin = "http://media.loca
       },
     ],
   });
-  rooms.engineering.members.get(people.maya.id).unread = true;
+  Object.assign(rooms.engineering.members.get(people.maya.id), { unread: true, unreadAt: rooms.engineering.messages.at(-1).createdAt });
 
   // Support and the rest.
   say(rooms.support, "amara", p("Three tickets about password resets this morning, all the same cause."), now - 26 * HOUR);
@@ -375,7 +375,7 @@ export function seed(store, now = Date.now(), { mediaOrigin = "http://media.loca
   say(rooms.samAndMaya, "sam", p("Sure, after lunch?"), now - 2 * DAY + 3 * MINUTE);
   say(rooms.samAndMaya, "maya", p("Perfect."), now - 2 * DAY + 4 * MINUTE);
   say(rooms.samAndMaya, "sam", p("Notes from the review are in the wiki. One follow-up for you."), now - 90 * MINUTE);
-  rooms.samAndMaya.members.get(people.maya.id).unread = true;
+  Object.assign(rooms.samAndMaya.members.get(people.maya.id), { unread: true, unreadAt: rooms.samAndMaya.messages.at(-1).createdAt, unreadCount: 1 });
   rooms.samAndMaya.activeAt = rooms.samAndMaya.messages.at(-1).createdAt;
   say(rooms.priyaAndMaya, "priya", p("Sent you the revised moodboard."), now - 4 * HOUR);
   say(rooms.priyaAndMaya, "maya", p("Looks lovely. Let’s use the second one."), now - 3 * HOUR);

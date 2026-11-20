@@ -602,14 +602,15 @@ server.on("upgrade", (req, socket) => {
   const conn = acceptWebSocket(req, socket);
   if (!conn) return;
   const token = sessionToken(req);
-  if (roomId === null) return workspaceSocket(conn, user, token);
+  if (roomId === null) return workspaceSocket(conn, user, token, url.searchParams);
   const room = store.rooms.get(roomId);
   if (!room || !room.members.has(user.id)) return conn.close(4004, "NotFound");
   roomSocket(conn, user, token, room, url.searchParams);
 });
 
-function workspaceSocket(conn, user, token) {
-  const socket = { conn, userId: user.id, token };
+function workspaceSocket(conn, user, token, params) {
+  // `visible` is whether the tab is shown, missing counting as hidden; `active`, null until the client says, whether it's in use.
+  const socket = { conn, userId: user.id, token, visible: params.get("visible") === "1", active: null };
   workspaceSockets.add(socket);
   conn.onClose = () => workspaceSockets.delete(socket);
   conn.onText = (text) => {
@@ -620,6 +621,8 @@ function workspaceSocket(conn, user, token) {
       frame = null;
     }
     if (frame?.type === "ping") send(conn, { type: "pong" });
+    else if (frame?.type === "presence.active" && typeof frame.active === "boolean") socket.active = frame.active;
+    else if (frame?.type === "presence.visible" && typeof frame.visible === "boolean") socket.visible = frame.visible;
     else send(conn, { type: "error", message: "Unrecognized frame" });
   };
   send(conn, { type: "welcome", you: store.me(user), account: accountWire() });

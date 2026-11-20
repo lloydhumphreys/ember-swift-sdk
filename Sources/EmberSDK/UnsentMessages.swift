@@ -28,6 +28,8 @@ public struct UnsentMessage: Codable, Hashable, Sendable {
     public var createdAt: Date
     /// Why it failed, for one that did; it comes back failed, for a retry or a discard.
     public var failure: String?
+    /// Whether it failed as one the room won't take for what it says (`PendingMessage.toRewrite`).
+    public var toRewrite: Bool
     /// The message it replies to, for a thread reply; nil for a room message.
     public var parentId: MessageID?
     /// Where a reply goes. Always `.threadOnly` without `parentId`.
@@ -35,20 +37,21 @@ public struct UnsentMessage: Codable, Hashable, Sendable {
 
     public init(
         clientMessageId: ClientMessageID, body: String, plainText: String, createdAt: Date, failure: String? = nil,
-        parentId: MessageID? = nil, delivery: ReplyDelivery = .threadOnly
+        toRewrite: Bool = false, parentId: MessageID? = nil, delivery: ReplyDelivery = .threadOnly
     ) {
         self.clientMessageId = clientMessageId
         self.body = body
         self.plainText = plainText
         self.createdAt = createdAt
         self.failure = failure
+        self.toRewrite = failure != nil && toRewrite
         self.parentId = parentId
         self.delivery = parentId == nil ? .threadOnly : delivery
     }
 
     // Saved files keep the shape they had when `delivery` was the Bool `alsoSend`, so files already
     // on disk still read, and a file without the key reads as thread-only.
-    private enum CodingKeys: String, CodingKey { case clientMessageId, body, plainText, createdAt, failure, parentId, alsoSend }
+    private enum CodingKeys: String, CodingKey { case clientMessageId, body, plainText, createdAt, failure, rewrite, parentId, alsoSend }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -60,6 +63,7 @@ public struct UnsentMessage: Codable, Hashable, Sendable {
             plainText: try container.decode(String.self, forKey: .plainText),
             createdAt: try container.decode(Date.self, forKey: .createdAt),
             failure: try container.decodeIfPresent(String.self, forKey: .failure),
+            toRewrite: try container.decodeIfPresent(Bool.self, forKey: .rewrite) ?? false,
             parentId: parentId,
             delivery: alsoSend ? .threadAndRoom : .threadOnly
         )
@@ -72,6 +76,7 @@ public struct UnsentMessage: Codable, Hashable, Sendable {
         try container.encode(plainText, forKey: .plainText)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encodeIfPresent(failure, forKey: .failure)
+        if toRewrite { try container.encode(true, forKey: .rewrite) }
         try container.encodeIfPresent(parentId, forKey: .parentId)
         try container.encode(delivery == .threadAndRoom, forKey: .alsoSend)
     }
@@ -79,7 +84,7 @@ public struct UnsentMessage: Codable, Hashable, Sendable {
     init(_ pending: PendingMessage) {
         self.init(
             clientMessageId: pending.clientMessageId, body: pending.body, plainText: pending.plainText, createdAt: pending.createdAt,
-            failure: pending.failure, parentId: pending.parentId, delivery: pending.delivery
+            failure: pending.failure, toRewrite: pending.toRewrite, parentId: pending.parentId, delivery: pending.delivery
         )
     }
 }

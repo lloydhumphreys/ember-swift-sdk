@@ -246,8 +246,10 @@ package enum ServerFrame: Equatable, Sendable {
     /// The bot took the click `clickId` names.
     case cardClicked(clickId: ClickID)
     /// `failed` names the request that went wrong (a `ClientFrame.type`), `clientMessageId` or
-    /// `clientMessageIds` the messages it was about, and `clickId` the click.
-    case error(message: String, clientMessageId: ClientMessageID?, clientMessageIds: [ClientMessageID]?, clickId: ClickID? = nil, failed: String?)
+    /// `clientMessageIds` the messages it was about, and `clickId` the click. `rewrite` says the room
+    /// won't take the message for what it says (a word Blocked words keeps out): it's for its writer
+    /// to change and send again, not to retry as it is.
+    case error(message: String, clientMessageId: ClientMessageID?, clientMessageIds: [ClientMessageID]?, clickId: ClickID? = nil, failed: String?, rewrite: Bool = false)
     case pong
     case unknown(String)
 
@@ -315,7 +317,7 @@ package enum ServerFrame: Equatable, Sendable {
             return .threadHistory(parentId: f.parentId, before: f.before, messages: f.messages?.elements ?? [], hasMore: f.hasMore ?? false)
         case "error":
             let f = try read(ErrorFrame.self)
-            return .error(message: f.message ?? "", clientMessageId: f.clientMessageId, clientMessageIds: f.clientMessageIds, clickId: f.clickId, failed: f.failed)
+            return .error(message: f.message ?? "", clientMessageId: f.clientMessageId, clientMessageIds: f.clientMessageIds, clickId: f.clickId, failed: f.failed, rewrite: f.rewrite?.value ?? false)
         case "card.clicked":
             return .cardClicked(clickId: try read(CardClicked.self).clickId)
         case "pong":
@@ -341,7 +343,7 @@ package enum ServerFrame: Equatable, Sendable {
     private struct ThreadOpened: Decodable { var parentId: MessageID; var parent: Lenient<Message>?; var messages: Lossy<Message>?; var hasMore: Bool? }
     private struct ThreadHistory: Decodable { var parentId: MessageID; var before: MessageID; var messages: Lossy<Message>?; var hasMore: Bool? }
     private struct CardClicked: Decodable { var clickId: ClickID }
-    private struct ErrorFrame: Decodable { var message: String?; var clientMessageId: ClientMessageID?; var clientMessageIds: [ClientMessageID]?; var clickId: ClickID?; var failed: String? }
+    private struct ErrorFrame: Decodable { var message: String?; var clientMessageId: ClientMessageID?; var clientMessageIds: [ClientMessageID]?; var clickId: ClickID?; var failed: String?; var rewrite: Lenient<Bool>? }
 }
 
 /// A frame's `type`, read before the rest.
@@ -351,8 +353,9 @@ private struct FrameType: Decodable { var type: String }
 private struct Lenient<Value: Decodable>: Decodable {
     var value: Value?
 
+    // Through a container, so the decoder's date strategy reads a date as it does elsewhere.
     init(from decoder: Decoder) throws {
-        value = try? Value(from: decoder)
+        value = try? decoder.singleValueContainer().decode(Value.self)
     }
 }
 
@@ -363,8 +366,10 @@ private struct Lenient<Value: Decodable>: Decodable {
 package enum WorkspaceFrame: Equatable, Sendable {
     /// Sent as the socket opens: who its session signs in, and the workspace as it is then.
     case welcome(you: Me, account: Account)
-    /// A room of theirs has a message they haven't seen.
-    case roomUnread(RoomID)
+    /// A room of theirs has a message they haven't seen, which marks it unread as of `since`, when
+    /// the first of those came. In a DM it comes with each message, and `count` says how many there
+    /// are now.
+    case roomUnread(RoomID, since: Date? = nil, count: Int? = nil)
     /// They've read a room marked unread, here or elsewhere.
     case roomRead(RoomID)
     /// Someone changed, as the directory now lists them.
@@ -408,7 +413,9 @@ package enum WorkspaceFrame: Equatable, Sendable {
         case "welcome":
             let f = try read(Welcome.self)
             return .welcome(you: f.you, account: f.account)
-        case "room.unread": return .roomUnread(try read(RoomOnly.self).roomId)
+        case "room.unread":
+            let f = try read(RoomUnread.self)
+            return .roomUnread(f.roomId, since: f.at?.value, count: f.count?.value)
         case "room.read": return .roomRead(try read(RoomOnly.self).roomId)
         case "user.updated": return .userUpdated(try read(UserUpdated.self).user)
         case "room.saved": return .roomSaved(try read(RoomSaved.self).room)
@@ -431,6 +438,7 @@ package enum WorkspaceFrame: Equatable, Sendable {
 
     private struct Welcome: Decodable { var you: Me; var account: Account }
     private struct RoomOnly: Decodable { var roomId: RoomID }
+    private struct RoomUnread: Decodable { var roomId: RoomID; var at: Lenient<Date>?; var count: Lenient<Int>? }
     private struct UserUpdated: Decodable { var user: DirectoryUser }
     private struct RoomSaved: Decodable { var room: Room }
     private struct RoomActive: Decodable { var roomId: RoomID; var at: Date }
@@ -453,6 +461,44 @@ package enum RoomSocket {
         if let since { query += "&since=\(since)" }
         if let around { query += "&around=\(encodeURIComponent(around.rawValue))" }
         return query
+    }
+}
+
+/// The query of the workspace socket's address, as `workspaceSocketQuery` writes it, without its `?`:
+/// `visible=0|1`. The Workspace counts an address without it as hidden.
+package enum WorkspaceSocket {
+    package static func query(visible: Bool) -> String { "visible=\(visible ? 1 : 0)" }
+}
+
+/// What the app sends on its workspace socket (`WorkspaceClientFrame` upstream).
+package enum WorkspaceClientFrame: Equatable, Sendable {
+    /// `presence.active`: whether its person is using the app, sent once the socket is welcomed and
+    /// as that changes. The Workspace sends `presence` only to a socket that has said.
+    case active(Bool)
+    /// `presence.visible`: whether the app is in front, as that changes since the address said.
+    case visible(Bool)
+    case ping
+
+    /// The frame as the JSON text the socket sends.
+    package var text: String {
+        switch self {
+        case let .active(active): #"{"active":\#(active),"type":"presence.active"}"#
+        case let .visible(visible): #"{"type":"presence.visible","visible":\#(visible)}"#
+        case .ping: #"{"type":"ping"}"#
+        }
+    }
+
+    /// Reads a frame a client sent, as the Workspace would: nil for anything it wouldn't take. For
+    /// tests and stand-in servers.
+    package init?(text: String) {
+        guard let value = try? EmberJSON.decoder().decode(JSONValue.self, from: Data(text.utf8)),
+              case let .object(f) = value, case let .string(type)? = f["type"] else { return nil }
+        switch (type, f["active"], f["visible"]) {
+        case let ("presence.active", .bool(active)?, _): self = .active(active)
+        case let ("presence.visible", _, .bool(visible)?): self = .visible(visible)
+        case ("ping", _, _): self = .ping
+        default: return nil
+        }
     }
 }
 

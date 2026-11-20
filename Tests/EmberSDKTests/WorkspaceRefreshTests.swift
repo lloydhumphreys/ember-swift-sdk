@@ -98,7 +98,6 @@ import Testing
             _ = workspace.sharedRooms
             _ = workspace.directRooms
             _ = workspace.unreadRooms
-            _ = workspace.suggestedPeople
             _ = workspace.isFavorite(Fixtures.general.id)
         }
         #expect(workspace.sortCount == sorts)
