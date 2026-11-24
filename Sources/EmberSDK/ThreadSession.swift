@@ -97,6 +97,20 @@ import Observation
         return id
     }
 
+    /// The replies you've scheduled in the thread, soonest first, which the room's
+    /// `edit(scheduled:body:)`, `reschedule(scheduled:to:)`, `sendNow(scheduled:)` and
+    /// `delete(scheduled:)` change.
+    public var scheduled: [ScheduledMessage] { room.timeline.scheduled(in: parentID) }
+
+    /// Schedules a reply for `sendAt`, into the thread only or, with `.threadAndRoom`, into the room
+    /// too, returning once the room has it, as `RoomSession.schedule(body:at:previews:)` does.
+    @discardableResult
+    public func schedule(
+        body: String, at sendAt: Date, delivery: ReplyDelivery = .threadOnly, previews: [LinkPreview] = []
+    ) async throws -> ClientMessageID {
+        try await room.schedule(body: withPreviews(body, previews), at: sendAt, parentId: parentID, alsoSend: delivery == .threadAndRoom)
+    }
+
     /// Files then text, as `RoomSession.send(files:…)`, into the thread. A refused file's notice is
     /// the thread's `notice`.
     @discardableResult

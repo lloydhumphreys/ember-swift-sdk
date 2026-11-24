@@ -4,6 +4,30 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+Tracks upstream Ember `v0.5.0` (commit `2e6c7886`).
+
+### Added
+
+- Sections. `Workspace.sections` is the sections shared rooms are listed under, and `Workspace.sectionedRooms` is `sharedRooms` under them: the ones in none first, a starred room among them, then each section that has one. `Workspace.makeSection(named:)`, `renameSection(_:to:)` and `deleteSection(_:)` change them, and `saveRoomLayout(_:)` saves the rooms' order, the sections' order and which rooms are in each, at once, for everyone. `EmberClient` has the same, with `setRoomLayout(_:)`. `RoomSection`, `SidebarSection`, `SectionOption`, `SectionChoice`, `RoomLayout`, `SavedRoomLayout`, `SectionedRooms`, `ListedSection` and `SectionID` are what they take and give, `Sidebar.sections` is what the server lists, and `RoomList.inSections(_:sections:starred:)` does the listing. `Limits.sections` and `Limits.sectionName` are both 100.
+- A room chooses its section: `NewRoom.section` and `RoomChanges.section` take `.section(id)`, `.noSection` or, from an administrator, `.new(name:)`. `NewRoomForm.sections`, `RoomSettings.section` and `RoomSettings.sections` say what there is to choose from. `room.saved` carries the room's `section`, and `rooms.reordered` comes for a change to the sections too.
+- `EmberClient.changeMembers(of:adding:removing:)` and `Workspace.changeMembers(of:adding:removing:)` put people in a closed room and take people out, leaving everyone else as they are (`PATCH /api/rooms/:id/members`).
+- Mentions of everyone. `SpecialMention` is `.here`, `.channel` or `.everyone`, and `Message.notifies` is the one a message notified with. `ComposeSegment.specialMention(_:)` writes one, `RichInline.special` reads one, and `RichText.segments` and `mentionRanges` take `specialMentions` to find them in typed text. `Room.channelMentions` and `Room.allowsChannelMentions` say whether a room takes them, `RoomChanges.channelMentions` and `RoomSettings.canChangeChannelMentions` change that, and `Account.restrictChannelMentions` and `restrictEveryoneMention` say whether only administrators may.
+- Asking before a message notifies a whole room. `EmberClient.notified(in:)` answers `NotifiedCounts`, how many people are in a room and how many each mention would reach, and `NotifiedCounts.notifying(_:)` gives the `Notifying` to ask about, or nil for a room of fewer than `Limits.warnedRoom` people. `RichText.specialMentions(in:)` lists the ones a message makes, and `Account.warnBeforeNotifying` says whether the workspace asks at all.
+- Mentions of rooms. `ComposeSegment.roomMention(_:name:)` writes one and `RichInline.roomID` reads one, `RichText.segments` and `mentionRanges` take `rooms` to find "#" and a room's name in typed text, and `EditableBody(body:mentionNames:roomNames:)` keeps them through an edit. `RichText.privateRoomName` is what a room shows as to someone who isn't in it.
+- `SidebarRoom.mentionCount`, how many unread messages in a room mention you. `room.unread` carries it as `mentions`, and reading the room clears it.
+- Scheduled messages. `RoomSession.schedule(body:at:previews:)` and `ThreadSession.schedule(body:at:delivery:previews:)` keep a message to send later, returning once the room has it, and `RoomSession.edit(scheduled:body:)`, `reschedule(scheduled:to:)`, `sendNow(scheduled:)` and `delete(scheduled:)` change one. `Timeline.scheduled` is yours in the room, soonest first, with `scheduledForRoom` and `scheduled(in:)`, and `ThreadSession.scheduled` is the thread's. A `ScheduledMessage` that couldn't be sent says why in `failure`. `Limits.scheduledMessages` is 30 and `Limits.scheduleAhead` is 120 days. The room socket sends `message.schedule`, `scheduled.edit`, `scheduled.reschedule`, `scheduled.send` and `scheduled.delete`, and reads `scheduled`.
+- Messages only you see. `Timeline.ephemeral` and `ThreadTimeline.ephemeral` hold each `EphemeralMessage` a bot has shown you alone (`message.ephemeral`, and `ephemeral` in `welcome`, `resumed` and `thread.opened`). Its cards' buttons are clicked with `click(_:on:)` like any message's.
+- Pausing notifications. `Workspace.pauseNotifications(until:)` and `EmberClient.pauseNotifications(until:)` pause yours until a time at most `Limits.longestPause` ahead, or resume them with nil. `DirectoryUser.pausedUntil` is when anyone's pause ends, and `pause(at:)` is that while it hasn't.
+- EmberTesting: `Fixtures.product`, `company`, `sidebarSections`, `sectionOptions`, `sectionJSON(_:)`, `notifiedJSON(members:mentions:)`, `paused(_:until:)`, `scheduled(...)` and `ephemeral(...)`, `Fixtures.RoomFrames.scheduled(_:edited:)` and `messageEphemeral(_:)`, and `Fixtures.WorkspaceFrames.roomSaved(_:section:)`. `welcome`, `resumed` and `threadOpened` take `scheduled` and `ephemeral`, `roomUnread` takes `mentions`, and `newRoomFormJSON`, `roomSettingsJSON` and `sharedOrderJSON` take sections.
+- The stand-in server has sections, with Product and Company seeded, room-wide and room mentions with `notified` and mention counts, scheduled messages, Deploy Bot's card only its asker sees, a closed room's members changed alone, and pausing notifications. `Tools/mock-server/check.mjs` checks them, and its README has the details.
+
+### Changed
+
+- **Breaking:** `RichInline` has the cases `.specialMention(_:)` and `.roomMention(roomId:)`, and `ComposeSegment` has `.specialMention(_:)` and `.roomMention(roomId:name:)`. A `switch` over either needs them.
+- The room socket opens with `protocol=5`, as upstream's `ROOM_PROTOCOL`. The stand-in server tells a socket that names an older one to reload.
+- `Workspace.createRoom` and `changeRoom` list the room under the section chosen for it.
+- The stand-in server gives two rooms made in the same millisecond ids in the order they were made, so a sidebar lists them in it.
+
 ## [0.3.0] - 2026-11-20
 
 Tracks upstream Ember `v0.5.0-beta.12` (commit `30755b2a`), rather than `main`.

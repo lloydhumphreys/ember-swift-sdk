@@ -33,7 +33,7 @@ import Testing
         let connection = try #require(connector.latest)
         #expect(connector.connections.count == 1)
         #expect(connection.request.url?.path == "/api/rooms/room-general/socket")
-        #expect(connection.request.query == "visible=0&protocol=4&around=m002")
+        #expect(connection.request.query == "visible=0&protocol=5&around=m002")
         #expect(connection.isClosedByClient)
         #expect(connection.sent.isEmpty)
     }

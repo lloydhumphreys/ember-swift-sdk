@@ -29,13 +29,15 @@ const BOT_DELAY = delayOf("EMBER_BOT_DELAY", 1500);
 const BOT_REPLACE_DELAY = delayOf("EMBER_BOT_REPLACE_DELAY", 6000);
 /// How long a card's bot takes to answer a click on one of its buttons.
 const CLICK_DELAY = delayOf("EMBER_CLICK_DELAY", 300);
+/// How often the scheduled messages that have come due are sent, which the real server's alarms do on time.
+const SCHEDULE_TICK = 250;
 /// The clicks one person may have waiting for their bots at once, as on the real server.
 const MAX_WAITING_CLICKS = 3;
 const BUTTON_GONE = "That button is no longer there";
 const TOO_MANY_CLICKS = "Wait for your earlier clicks to be answered";
 const COOKIE = "session_token";
 const COOKIE_MAX_AGE = 400 * 24 * 60 * 60;
-const ROOM_PROTOCOL = 4;
+const ROOM_PROTOCOL = 5;
 const ROOM_ID = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const MAX_LISTED_USERS = 1000;
 const OUTDATED = "Ember has been updated. Reload the page to keep chatting.";
@@ -74,7 +76,7 @@ const avatarTokenUser = (token) => {
 
 /// A workspace socket: { conn, userId, token }.
 const workspaceSockets = new Set();
-/// A room socket: { conn, userId, token, roomId, visible }.
+/// A room socket: { conn, userId, token, roomId, visible, thread, outdated }.
 const roomSockets = new Set();
 const typingIn = new Map();
 
@@ -88,6 +90,11 @@ store.hub = {
   workspace(userId, frame) {
     const text = JSON.stringify(frame);
     for (const socket of workspaceSockets) if (socket.userId === userId) socket.conn.send(text);
+  },
+  /// One person's sockets in a room, but the ones too old to know of what only they are sent.
+  person(roomId, userId, frame) {
+    const text = JSON.stringify(frame);
+    for (const socket of roomSockets) if (socket.roomId === roomId && socket.userId === userId && !socket.outdated) socket.conn.send(text);
   },
   /// Everyone with a workspace socket open, as the real server tells everyone of a change to a person or to the shared order.
   everyone(frame) {
@@ -107,6 +114,12 @@ store.hub = {
     const present = [];
     for (const socket of roomSockets) if (socket.roomId === roomId && !present.includes(socket.userId)) present.push(socket.userId);
     return present;
+  },
+  /// Who's active now, as @here notifies: everyone with a workspace socket open that hasn't said it's not in use.
+  active() {
+    const active = new Set();
+    for (const socket of workspaceSockets) if (socket.active !== false) active.add(socket.userId);
+    return [...active];
   },
   typing(roomId, userId, typing) {
     let set = typingIn.get(roomId);
@@ -207,6 +220,9 @@ const accountWire = () => ({
   openSignUp: false,
   restrictRoomCreation: false,
   hideTranslationButtons: false,
+  restrictChannelMentions: false,
+  restrictEveryoneMention: false,
+  warnBeforeNotifying: true,
   customStyles: "",
 });
 
@@ -637,23 +653,43 @@ installAccountRoutes({
 });
 /// The real parser's page size: a number, floored and held to 1..100, or else the default.
 const limitOf = (value) => (typeof value === "number" ? Math.min(Math.max(1, Math.floor(value)), 100) : HISTORY_PAGE_SIZE);
+/// The time a frame's `sendAt` names, in milliseconds, or null: a string of at most 30 characters that reads as a time, as the real parser has it.
+const sendTimeOf = (value) => (typeof value === "string" && value.length <= 30 && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null);
+
+/// Sends everyone of `userId`'s sockets in `room` what they have scheduled there. `edited` is the socket whose edit
+/// was just kept, which hears which message it was: `{ conn, scheduledId }`.
+function tellScheduled(room, userId, edited = null) {
+  const messages = store.scheduledOf(room, userId);
+  for (const socket of roomSockets) {
+    if (socket.roomId !== room.id || socket.userId !== userId) continue;
+    send(socket.conn, { type: "scheduled", messages, ...(edited?.conn === socket.conn && { edited: edited.scheduledId }) });
+  }
+}
+
+setInterval(() => {
+  for (const [room, userId] of store.sendDue()) tellScheduled(room, userId);
+}, SCHEDULE_TICK);
 
 function roomSocket(conn, user, token, room, params) {
+  // A missing or unreadable protocol counts as 1, as on the real server.
+  const outdated = (Number(params.get("protocol")) || 1) < ROOM_PROTOCOL;
   // `thread` is the one thread this socket has open. Opening another replaces it, and closing clears it only for the same parent.
-  const socket = { conn, userId: user.id, token, roomId: room.id, visible: params.get("visible") !== "0", thread: null };
+  const socket = { conn, userId: user.id, token, roomId: room.id, visible: params.get("visible") !== "0", thread: null, outdated };
   const hadOtherSocket = [...roomSockets].some((other) => other.roomId === room.id && other.userId === user.id);
   roomSockets.add(socket);
   const you = store.ref(user.id);
   const present = () => store.hub.present(room.id).map(store.ref);
+  // What only they see in the room's timeline, which a socket too old to know of it isn't sent, and what they have scheduled here.
+  const ephemeral = outdated ? [] : store.ephemeralOf(room, user.id, undefined);
+  const scheduled = store.scheduledOf(room, user.id);
+  const theirs = { ...(ephemeral.length > 0 && { ephemeral }), ...(scheduled.length > 0 && { scheduled }) };
   const since = params.has("since") ? Number(params.get("since")) : null;
   const resumed = since === null ? null : store.resumedSince(room, since);
-  if (resumed) send(conn, { type: "resumed", you, ...resumed, present: present(), seq: room.seq });
+  if (resumed) send(conn, { type: "resumed", you, ...resumed, present: present(), seq: room.seq, ...theirs });
   else {
     const page = params.get("around") ? store.aroundPage(room, params.get("around")) : store.newestPage(room);
-    send(conn, { type: "welcome", you, present: present(), seq: room.seq, ...page });
+    send(conn, { type: "welcome", you, present: present(), seq: room.seq, ...page, ...theirs });
   }
-  // A missing or unreadable protocol counts as 1, as on the real server.
-  const outdated = (Number(params.get("protocol")) || 1) < ROOM_PROTOCOL;
   if (outdated) send(conn, { type: "error", message: OUTDATED });
   if (!hadOtherSocket) store.hub.room(room.id, { type: "presence.joined", user: you }, { exceptUser: user.id });
   if (socket.visible) store.markRead(room, user.id);
@@ -694,6 +730,33 @@ function roomSocket(conn, user, token, room, params) {
           cardBots(room, result.message);
           scriptedReply(room, result.message);
         }
+        if (REPLIER) askFirst(room, result.message);
+        return;
+      }
+      case "message.schedule": {
+        const sendAt = sendTimeOf(frame.sendAt);
+        if (!isId(frame.clientMessageId) || typeof frame.body !== "string" || sendAt === null) return unrecognised(conn);
+        if (frame.parentId !== undefined && !isId(frame.parentId)) return unrecognised(conn);
+        const failed = (message) => send(conn, { type: "error", message, clientMessageId: frame.clientMessageId, failed: frame.type });
+        if (outdated) return failed(OUTDATED);
+        const refusal = store.schedule(room, user.id, { ...frame, sendAt });
+        if (refusal !== null) return failed(refusal);
+        return tellScheduled(room, user.id);
+      }
+      case "scheduled.edit":
+      case "scheduled.reschedule":
+      case "scheduled.send":
+      case "scheduled.delete": {
+        if (!isId(frame.scheduledId)) return unrecognised(conn);
+        if (frame.type === "scheduled.edit" && typeof frame.body !== "string") return unrecognised(conn);
+        const sendAt = frame.type === "scheduled.reschedule" ? sendTimeOf(frame.sendAt) : undefined;
+        if (sendAt === null) return unrecognised(conn);
+        const failed = (message) => send(conn, { type: "error", message, scheduledId: frame.scheduledId, failed: frame.type });
+        if (frame.type === "scheduled.edit" && outdated) return failed(OUTDATED);
+        const refusal = store.changeScheduled(room, user.id, { ...frame, sendAt });
+        // The list first, as it is now, then why nothing came of the frame, if nothing did.
+        tellScheduled(room, user.id, frame.type === "scheduled.edit" && refusal === null ? { conn, scheduledId: frame.scheduledId } : null);
+        if (refusal !== null) failed(refusal);
         return;
       }
       case "message.update":
@@ -741,7 +804,7 @@ function roomSocket(conn, user, token, room, params) {
       case "thread.open":
         if (!isId(frame.parentId)) return unrecognised(conn);
         socket.thread = frame.parentId;
-        return send(conn, store.threadOpened(room, frame.parentId));
+        return send(conn, store.threadOpened(room, frame.parentId, outdated ? undefined : user.id));
       case "thread.close":
         if (!isId(frame.parentId)) return unrecognised(conn);
         if (socket.thread === frame.parentId) socket.thread = null;
@@ -764,15 +827,18 @@ function roomSocket(conn, user, token, room, params) {
   };
 }
 
-// Clicks: the button must still be on an undeleted message in the room. The card's bot takes the click after
-// `EMBER_CLICK_DELAY`, posts a line in the room saying who clicked what, and the clicker hears `card.clicked`.
+// Clicks: the button must still be on an undeleted message in the room, or on a card only the clicker sees. The card's
+// bot takes the click after `EMBER_CLICK_DELAY`, and the clicker hears `card.clicked`. For a message in the room it
+// posts a line saying who clicked what. For a card only they see, the card says what was decided in place of its
+// buttons, and Deploy Bot posts that it's rolling back when that was allowed.
 
 const waitingClicks = new Map();
 
 function click(conn, user, room, { clickId, messageId, actionId, blockId, value }) {
   const refuse = (message) => send(conn, { type: "error", message, clickId, failed: "card.click" });
   const message = room.messages.find((candidate) => candidate.id === messageId && !candidate.deleted);
-  const button = message && actingButton(message.cards, { actionId, blockId, value });
+  const asked = message ? null : store.keptEphemeral(room, user.id, messageId);
+  const button = actingButton((message ?? asked?.message)?.cards, { actionId, blockId, value });
   if (!button) return refuse(BUTTON_GONE);
   const waiting = waitingClicks.get(user.id) ?? 0;
   if (waiting >= MAX_WAITING_CLICKS) return refuse(TOO_MANY_CLICKS);
@@ -781,7 +847,15 @@ function click(conn, user, room, { clickId, messageId, actionId, blockId, value 
     const left = (waitingClicks.get(user.id) ?? 1) - 1;
     if (left > 0) waitingClicks.set(user.id, left);
     else waitingClicks.delete(user.id);
-    store.createMessage(room, message.creatorId, { clientMessageId: sortableId(), body: `<p>${escapeHtml(user.name)} clicked ${escapeHtml(button.text)}.</p>` });
+    if (message) store.createMessage(room, message.creatorId, { clientMessageId: sortableId(), body: `<p>${escapeHtml(user.name)} clicked ${escapeHtml(button.text)}.</p>` });
+    else {
+      // Answered meanwhile by another click, or gone with its asker.
+      if (store.keptEphemeral(room, user.id, messageId) !== asked) return refuse(BUTTON_GONE);
+      const allowed = button.action.id === "rollback";
+      const kept = keptCards(rollbackCards(allowed ? "You allowed this." : "You cancelled this."));
+      store.decideEphemeral(room, asked, { cards: kept.cards, cardsText: kept.plainText });
+      if (allowed) store.createMessage(room, asked.message.creator.id, { clientMessageId: sortableId(), body: `<p>Rolling message-api back to <code>${ROLLBACK_VERSION}</code>, as ${escapeHtml(user.name)} asked.</p>`, parentId: asked.message.parentId });
+    }
     send(conn, { type: "card.clicked", clickId });
   }, CLICK_DELAY);
 }
@@ -834,6 +908,31 @@ function cardBots(room, message) {
       setTimeout(() => store.replaceBotMessage(room, bots.uptime.id, result.message.id, "<p>Message API errors are back to normal</p>"), BOT_REPLACE_DELAY);
     }, BOT_DELAY);
   }
+}
+
+// Asking first: in Engineering, a person's message that says "rollback", in the room or in a thread, brings a card
+// from Deploy Bot that only they see, there, asking whether to roll back. It's kept until they answer it.
+
+const ROLLBACK_VERSION = "v2.4.2";
+const rollbackButtons = [
+  { text: "Roll back", action: { id: "rollback", blockId: "rollback_actions", value: ROLLBACK_VERSION }, style: "danger" },
+  { text: "Cancel", action: { id: "cancel", blockId: "rollback_actions", value: ROLLBACK_VERSION } },
+];
+
+/// The card that asks, or with `outcome`, the one that says what was decided in place of its buttons.
+function rollbackCards(outcome) {
+  const question = { kind: "section", html: `<p>Roll <strong>message-api</strong> back to <code>${ROLLBACK_VERSION}</code>?</p>` };
+  const answer = outcome === undefined ? { kind: "buttons", buttons: rollbackButtons } : { kind: "context", items: [{ html: `<p>${outcome}</p>` }] };
+  return [{ source: "blocks", parts: [question, answer] }];
+}
+
+function askFirst(room, message) {
+  if (room.id !== rooms.engineering.id || store.users.get(message.creatorId)?.role === "bot" || !/rollback/i.test(message.plainText)) return;
+  setTimeout(() => {
+    if (!room.members.has(message.creatorId)) return;
+    const kept = keptCards(rollbackCards());
+    store.showOnly(room, message.creatorId, seededBots.deployBot.id, { cards: kept.cards, cardsText: kept.plainText, parentId: message.parentId });
+  }, BOT_DELAY);
 }
 
 function alertCards() {

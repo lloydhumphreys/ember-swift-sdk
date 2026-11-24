@@ -62,6 +62,18 @@ package enum ClientFrame: Equatable, Sendable {
     /// `card.click`: a button that acts, on a card under `messageId`, was clicked. The button is found
     /// by its action's `id`, `blockId` and `value`; `clickId` matches the room's answer.
     case clickCard(clickId: ClickID, messageId: MessageID, actionId: String, blockId: String? = nil, value: String? = nil)
+    /// `message.schedule`: a message for the room to send as its writer's at `sendAt`, as
+    /// `createMessage` would. The room answers with `scheduled`, or an `error` naming
+    /// `clientMessageId`.
+    case scheduleMessage(clientMessageId: ClientMessageID, body: String, sendAt: Date, parentId: MessageID? = nil, alsoSend: Bool? = nil)
+    /// `scheduled.edit`: a scheduled message's new body, which keeps its time.
+    case editScheduled(scheduledId: ScheduledMessageID, body: String)
+    /// `scheduled.reschedule`: moves a scheduled message to `sendAt`.
+    case reschedule(scheduledId: ScheduledMessageID, sendAt: Date)
+    /// `scheduled.send`: sends a scheduled message now.
+    case sendScheduled(scheduledId: ScheduledMessageID)
+    /// `scheduled.delete`: deletes a scheduled message, unsent.
+    case deleteScheduled(scheduledId: ScheduledMessageID)
     case ping
 
     /// The protocol's name for the frame (`message.create`, `history.before`…), which is what a server
@@ -84,6 +96,11 @@ package enum ClientFrame: Equatable, Sendable {
         case .threadBefore: "thread.before"
         case .visible: "presence.visible"
         case .clickCard: "card.click"
+        case .scheduleMessage: "message.schedule"
+        case .editScheduled: "scheduled.edit"
+        case .reschedule: "scheduled.reschedule"
+        case .sendScheduled: "scheduled.send"
+        case .deleteScheduled: "scheduled.delete"
         case .ping: "ping"
         }
     }
@@ -135,6 +152,20 @@ package enum ClientFrame: Equatable, Sendable {
             set("actionId", actionId)
             set("blockId", blockId)
             set("value", value)
+        case let .scheduleMessage(clientMessageId, body, sendAt, parentId, alsoSend):
+            set("clientMessageId", clientMessageId)
+            set("body", body)
+            set("sendAt", EmberJSON.string(from: sendAt))
+            set("parentId", parentId)
+            set("alsoSend", alsoSend)
+        case let .editScheduled(scheduledId, body):
+            set("scheduledId", scheduledId)
+            set("body", body)
+        case let .reschedule(scheduledId, sendAt):
+            set("scheduledId", scheduledId)
+            set("sendAt", EmberJSON.string(from: sendAt))
+        case let .sendScheduled(scheduledId), let .deleteScheduled(scheduledId):
+            set("scheduledId", scheduledId)
         case .typingStart, .typingStop, .ping:
             break
         }
@@ -160,6 +191,7 @@ package enum ClientFrame: Equatable, Sendable {
         func int(_ key: String) -> Int? { if case let .number(n)? = f[key], n == n.rounded() { Int(n) } else { nil } }
         func bool(_ key: String) -> Bool? { if case let .bool(b)? = f[key] { b } else { nil } }
         func identifier<ID: EmberIdentifier>(_ key: String) -> ID? { string(key).map(ID.init(rawValue:)) }
+        func date(_ key: String) -> Date? { string(key).flatMap(EmberJSON.date(from:)) }
         switch type {
         case "message.create":
             guard let id: ClientMessageID = identifier("clientMessageId"), let body = string("body") else { return nil }
@@ -207,6 +239,21 @@ package enum ClientFrame: Equatable, Sendable {
             guard let clickId: ClickID = identifier("clickId"), let messageId: MessageID = identifier("messageId"),
                   let actionId = string("actionId") else { return nil }
             self = .clickCard(clickId: clickId, messageId: messageId, actionId: actionId, blockId: string("blockId"), value: string("value"))
+        case "message.schedule":
+            guard let id: ClientMessageID = identifier("clientMessageId"), let body = string("body"), let sendAt = date("sendAt") else { return nil }
+            self = .scheduleMessage(clientMessageId: id, body: body, sendAt: sendAt, parentId: identifier("parentId"), alsoSend: bool("alsoSend"))
+        case "scheduled.edit":
+            guard let id: ScheduledMessageID = identifier("scheduledId"), let body = string("body") else { return nil }
+            self = .editScheduled(scheduledId: id, body: body)
+        case "scheduled.reschedule":
+            guard let id: ScheduledMessageID = identifier("scheduledId"), let sendAt = date("sendAt") else { return nil }
+            self = .reschedule(scheduledId: id, sendAt: sendAt)
+        case "scheduled.send":
+            guard let id: ScheduledMessageID = identifier("scheduledId") else { return nil }
+            self = .sendScheduled(scheduledId: id)
+        case "scheduled.delete":
+            guard let id: ScheduledMessageID = identifier("scheduledId") else { return nil }
+            self = .deleteScheduled(scheduledId: id)
         case "ping": self = .ping
         default: return nil
         }
@@ -219,11 +266,13 @@ package enum ClientFrame: Equatable, Sendable {
 /// the frame's `type`, or an empty string when the text isn't a frame at all.
 package enum ServerFrame: Equatable, Sendable {
     /// Everything a newcomer needs. Its page is the newest, or the one around the message the
-    /// socket's address named.
-    case welcome(you: User, present: [User], seq: Int, page: TimelinePage)
+    /// socket's address named. `ephemeral` holds the messages only they see in the room's timeline,
+    /// and `scheduled` the messages they have scheduled here.
+    case welcome(you: User, present: [User], seq: Int, page: TimelinePage, ephemeral: [EphemeralMessage] = [], scheduled: [ScheduledMessage] = [])
     /// In place of a welcome, to a socket that named `since=`: the messages changed since, as they are
-    /// now, oldest first, and the ids of those deleted.
-    case resumed(you: User, messages: [Message], deletedIds: [MessageID], present: [User], seq: Int)
+    /// now, oldest first, and the ids of those deleted. `ephemeral` and `scheduled` hold what a
+    /// welcome's do.
+    case resumed(you: User, messages: [Message], deletedIds: [MessageID], present: [User], seq: Int, ephemeral: [EphemeralMessage] = [], scheduled: [ScheduledMessage] = [])
     case messageCreated(Message, seq: Int)
     case messageUpdated(Message, seq: Int)
     case messageDeleted(messageId: MessageID, seq: Int)
@@ -241,15 +290,24 @@ package enum ServerFrame: Equatable, Sendable {
     case historyAround(TimelinePage)
     /// Answers `message.check`: which the room stored, and which it never received.
     case messageChecked(stored: [ClientMessageID], missing: [ClientMessageID])
-    case threadOpened(parentId: MessageID, parent: Message?, messages: [Message], hasMore: Bool)
+    /// Answers `thread.open`. `ephemeral` holds the messages only whoever opened it sees in the
+    /// thread.
+    case threadOpened(parentId: MessageID, parent: Message?, messages: [Message], hasMore: Bool, ephemeral: [EphemeralMessage] = [])
     case threadHistory(parentId: MessageID, before: MessageID, messages: [Message], hasMore: Bool)
     /// The bot took the click `clickId` names.
     case cardClicked(clickId: ClickID)
+    /// A message only this person sees: a new one, or one they have, by its id, as it is now. With
+    /// a `parentId` it's in that message's thread, and otherwise in the room's timeline.
+    case messageEphemeral(EphemeralMessage)
+    /// The messages this person has scheduled in the room, every one, soonest first: sent to their
+    /// sockets there whenever one is scheduled, moved, sent, deleted or can't be sent. `edited`
+    /// names the one a `scheduled.edit` from this socket changed.
+    case scheduled([ScheduledMessage], edited: ScheduledMessageID? = nil)
     /// `failed` names the request that went wrong (a `ClientFrame.type`), `clientMessageId` or
-    /// `clientMessageIds` the messages it was about, and `clickId` the click. `rewrite` says the room
-    /// won't take the message for what it says (a word Blocked words keeps out): it's for its writer
-    /// to change and send again, not to retry as it is.
-    case error(message: String, clientMessageId: ClientMessageID?, clientMessageIds: [ClientMessageID]?, clickId: ClickID? = nil, failed: String?, rewrite: Bool = false)
+    /// `clientMessageIds` the messages it was about, `scheduledId` the scheduled message, and
+    /// `clickId` the click. `rewrite` says the room won't take the message for what it says (a word
+    /// Blocked words keeps out): it's for its writer to change and send again, not to retry as it is.
+    case error(message: String, clientMessageId: ClientMessageID?, clientMessageIds: [ClientMessageID]?, clickId: ClickID? = nil, scheduledId: ScheduledMessageID? = nil, failed: String?, rewrite: Bool = false)
     case pong
     case unknown(String)
 
@@ -272,10 +330,16 @@ package enum ServerFrame: Equatable, Sendable {
         switch type {
         case "welcome":
             let f = try read(Welcome.self)
-            return .welcome(you: f.you, present: f.present?.elements ?? [], seq: f.seq, page: try read(TimelinePage.self))
+            return .welcome(
+                you: f.you, present: f.present?.elements ?? [], seq: f.seq, page: try read(TimelinePage.self),
+                ephemeral: f.ephemeral?.value?.elements ?? [], scheduled: f.scheduled?.value?.elements ?? []
+            )
         case "resumed":
             let f = try read(Resumed.self)
-            return .resumed(you: f.you, messages: f.messages?.elements ?? [], deletedIds: f.deletedIds ?? [], present: f.present?.elements ?? [], seq: f.seq)
+            return .resumed(
+                you: f.you, messages: f.messages?.elements ?? [], deletedIds: f.deletedIds ?? [], present: f.present?.elements ?? [], seq: f.seq,
+                ephemeral: f.ephemeral?.value?.elements ?? [], scheduled: f.scheduled?.value?.elements ?? []
+            )
         case "message.created":
             let f = try read(MessageChange.self)
             return .messageCreated(f.message, seq: f.seq)
@@ -311,15 +375,26 @@ package enum ServerFrame: Equatable, Sendable {
             return .messageChecked(stored: f.stored ?? [], missing: f.missing ?? [])
         case "thread.opened":
             let f = try read(ThreadOpened.self)
-            return .threadOpened(parentId: f.parentId, parent: f.parent?.value, messages: f.messages?.elements ?? [], hasMore: f.hasMore ?? false)
+            return .threadOpened(
+                parentId: f.parentId, parent: f.parent?.value, messages: f.messages?.elements ?? [], hasMore: f.hasMore ?? false,
+                ephemeral: f.ephemeral?.value?.elements ?? []
+            )
         case "thread.history":
             let f = try read(ThreadHistory.self)
             return .threadHistory(parentId: f.parentId, before: f.before, messages: f.messages?.elements ?? [], hasMore: f.hasMore ?? false)
         case "error":
             let f = try read(ErrorFrame.self)
-            return .error(message: f.message ?? "", clientMessageId: f.clientMessageId, clientMessageIds: f.clientMessageIds, clickId: f.clickId, failed: f.failed, rewrite: f.rewrite?.value ?? false)
+            return .error(
+                message: f.message ?? "", clientMessageId: f.clientMessageId, clientMessageIds: f.clientMessageIds, clickId: f.clickId,
+                scheduledId: f.scheduledId?.value, failed: f.failed, rewrite: f.rewrite?.value ?? false
+            )
         case "card.clicked":
             return .cardClicked(clickId: try read(CardClicked.self).clickId)
+        case "message.ephemeral":
+            return .messageEphemeral(try read(Ephemeral.self).message)
+        case "scheduled":
+            let f = try read(Scheduled.self)
+            return .scheduled(f.messages?.elements ?? [], edited: f.edited?.value)
         case "pong":
             return .pong
         default:
@@ -328,8 +403,14 @@ package enum ServerFrame: Equatable, Sendable {
     }
 
     // Lists are read one element at a time: one the build can't read is left out, never the frame.
-    private struct Welcome: Decodable { var you: User; var present: Lossy<User>?; var seq: Int }
-    private struct Resumed: Decodable { var you: User; var messages: Lossy<Message>?; var deletedIds: [MessageID]?; var present: Lossy<User>?; var seq: Int }
+    private struct Welcome: Decodable {
+        var you: User; var present: Lossy<User>?; var seq: Int
+        var ephemeral: Lenient<Lossy<EphemeralMessage>>?; var scheduled: Lenient<Lossy<ScheduledMessage>>?
+    }
+    private struct Resumed: Decodable {
+        var you: User; var messages: Lossy<Message>?; var deletedIds: [MessageID]?; var present: Lossy<User>?; var seq: Int
+        var ephemeral: Lenient<Lossy<EphemeralMessage>>?; var scheduled: Lenient<Lossy<ScheduledMessage>>?
+    }
     private struct MessageChange: Decodable { var message: Message; var seq: Int }
     private struct MessageDeleted: Decodable { var messageId: MessageID; var seq: Int }
     private struct BoostCreated: Decodable { var boost: Boost; var seq: Int }
@@ -340,10 +421,18 @@ package enum ServerFrame: Equatable, Sendable {
     private struct History: Decodable { var before: MessageID; var messages: Lossy<Message>?; var hasMore: Bool? }
     private struct HistoryAfter: Decodable { var after: MessageID; var messages: Lossy<Message>?; var hasNewer: Bool? }
     private struct Checked: Decodable { var stored: [ClientMessageID]?; var missing: [ClientMessageID]? }
-    private struct ThreadOpened: Decodable { var parentId: MessageID; var parent: Lenient<Message>?; var messages: Lossy<Message>?; var hasMore: Bool? }
+    private struct ThreadOpened: Decodable {
+        var parentId: MessageID; var parent: Lenient<Message>?; var messages: Lossy<Message>?; var hasMore: Bool?
+        var ephemeral: Lenient<Lossy<EphemeralMessage>>?
+    }
     private struct ThreadHistory: Decodable { var parentId: MessageID; var before: MessageID; var messages: Lossy<Message>?; var hasMore: Bool? }
     private struct CardClicked: Decodable { var clickId: ClickID }
-    private struct ErrorFrame: Decodable { var message: String?; var clientMessageId: ClientMessageID?; var clientMessageIds: [ClientMessageID]?; var clickId: ClickID?; var failed: String?; var rewrite: Lenient<Bool>? }
+    private struct Ephemeral: Decodable { var message: EphemeralMessage }
+    private struct Scheduled: Decodable { var messages: Lossy<ScheduledMessage>?; var edited: Lenient<ScheduledMessageID>? }
+    private struct ErrorFrame: Decodable {
+        var message: String?; var clientMessageId: ClientMessageID?; var clientMessageIds: [ClientMessageID]?; var clickId: ClickID?
+        var scheduledId: Lenient<ScheduledMessageID>?; var failed: String?; var rewrite: Lenient<Bool>?
+    }
 }
 
 /// A frame's `type`, read before the rest.
@@ -368,14 +457,16 @@ package enum WorkspaceFrame: Equatable, Sendable {
     case welcome(you: Me, account: Account)
     /// A room of theirs has a message they haven't seen, which marks it unread as of `since`, when
     /// the first of those came. In a DM it comes with each message, and `count` says how many there
-    /// are now.
-    case roomUnread(RoomID, since: Date? = nil, count: Int? = nil)
+    /// are now. In any other room it comes again with each message that mentions them, and
+    /// `mentions` says how many of those there are now.
+    case roomUnread(RoomID, since: Date? = nil, count: Int? = nil, mentions: Int? = nil)
     /// They've read a room marked unread, here or elsewhere.
     case roomRead(RoomID)
     /// Someone changed, as the directory now lists them.
     case userUpdated(DirectoryUser)
-    /// A room of theirs as it is now: made, renamed, changed, or newly theirs.
-    case roomSaved(Room)
+    /// A room of theirs as it is now: made, renamed, changed, or newly theirs. `section` says where
+    /// the sidebar lists it, when that's known.
+    case roomSaved(Room, section: RoomPlacement = .unchanged)
     /// A room that's no longer theirs.
     case roomGone(RoomID)
     /// A message came in a DM of theirs at `at`.
@@ -386,7 +477,8 @@ package enum WorkspaceFrame: Equatable, Sendable {
     case roomInvolvement(RoomID, Involvement)
     /// They dismissed the welcome card.
     case invitationDismissed
-    /// An administrator saved the shared room order, which names no rooms: load the sidebar again.
+    /// An administrator saved the shared room order, or made, renamed or deleted a section, or a
+    /// room moved to another: it names no rooms, so load the sidebar again.
     case roomsReordered
     case accountUpdated(Account)
     case error(String)
@@ -415,10 +507,12 @@ package enum WorkspaceFrame: Equatable, Sendable {
             return .welcome(you: f.you, account: f.account)
         case "room.unread":
             let f = try read(RoomUnread.self)
-            return .roomUnread(f.roomId, since: f.at?.value, count: f.count?.value)
+            return .roomUnread(f.roomId, since: f.at?.value, count: f.count?.value, mentions: f.mentions?.value)
         case "room.read": return .roomRead(try read(RoomOnly.self).roomId)
         case "user.updated": return .userUpdated(try read(UserUpdated.self).user)
-        case "room.saved": return .roomSaved(try read(RoomSaved.self).room)
+        case "room.saved":
+            let f = try read(RoomSaved.self)
+            return .roomSaved(f.room, section: f.section)
         case "room.gone": return .roomGone(try read(RoomOnly.self).roomId)
         case "room.active":
             let f = try read(RoomActive.self)
@@ -438,9 +532,30 @@ package enum WorkspaceFrame: Equatable, Sendable {
 
     private struct Welcome: Decodable { var you: Me; var account: Account }
     private struct RoomOnly: Decodable { var roomId: RoomID }
-    private struct RoomUnread: Decodable { var roomId: RoomID; var at: Lenient<Date>?; var count: Lenient<Int>? }
+    private struct RoomUnread: Decodable { var roomId: RoomID; var at: Lenient<Date>?; var count: Lenient<Int>?; var mentions: Lenient<Int>? }
     private struct UserUpdated: Decodable { var user: DirectoryUser }
-    private struct RoomSaved: Decodable { var room: Room }
+    private struct RoomSaved: Decodable {
+        var room: Room
+        var section: RoomPlacement
+
+        private enum CodingKeys: String, CodingKey { case room, section }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            room = try container.decode(Room.self, forKey: .room)
+            // No `section` leaves the room where it is, a null one takes it out of its section, and
+            // one this build can't read is left alone.
+            if !container.contains(.section) {
+                section = .unchanged
+            } else if (try? container.decodeNil(forKey: .section)) == true {
+                section = .loose
+            } else if let listed = try? container.decode(RoomSection.self, forKey: .section) {
+                section = .section(listed)
+            } else {
+                section = .unchanged
+            }
+        }
+    }
     private struct RoomActive: Decodable { var roomId: RoomID; var at: Date }
     private struct FavoritesChanged: Decodable { var favorites: Favorites }
     private struct RoomInvolvement: Decodable { var roomId: RoomID; var involvement: Involvement }
@@ -448,13 +563,24 @@ package enum WorkspaceFrame: Equatable, Sendable {
     private struct ErrorFrame: Decodable { var message: String? }
 }
 
+/// Where a saved room is listed among the sidebar's sections, as `room.saved` says.
+package enum RoomPlacement: Equatable, Sendable {
+    /// Where it was.
+    case unchanged
+    /// In no section.
+    case loose
+    /// In this section.
+    case section(RoomSection)
+}
+
 // MARK: - Sockets
 
 /// The query of a room socket's address, as `roomSocketQuery` writes it, without its `?`:
-/// `visible=0|1&protocol=4[&since=<seq>][&around=<id>]`.
+/// `visible=0|1&protocol=5[&since=<seq>][&around=<id>]`.
 package enum RoomSocket {
-    /// The revision of the room protocol this SDK speaks. The room refuses messages from older ones.
-    package static let protocolRevision = 4
+    /// The revision of the room protocol this SDK speaks. The room refuses messages from older ones,
+    /// and sends them no ephemeral messages.
+    package static let protocolRevision = 5
 
     package static func query(visible: Bool, since: Int?, around: MessageID?) -> String {
         var query = "visible=\(visible ? 1 : 0)&protocol=\(protocolRevision)"

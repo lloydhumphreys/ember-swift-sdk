@@ -207,11 +207,19 @@ private final class Walker {
     private func visitAttachment(_ node: HTMLNode, style: RichStyle, inLink: Bool, stack: inout [Work]) {
         switch node.attribute("content-type") {
         case PreviewReader.mentionContentType?:
-            if let id = Self.userId(fromSgid: node.attribute("sgid") ?? "") {
+            // display.ts `displayedMention`: the special mention its sgid makes, or the user it names.
+            let sgid = node.attribute("sgid") ?? ""
+            if Composer.specialMentions.contains(sgid) {
+                add(.specialMention(sgid))
+            } else if let id = Self.userId(fromSgid: sgid) {
                 add(.mention(userId: id))
             } else {
                 add(.text("☒", style))
             }
+        case Composer.roomMentionContentType?:
+            // display.ts `displayedRoomMention`: its sgid is the room's id.
+            let sgid = node.attribute("sgid") ?? ""
+            add(sgid.isEmpty ? .text("☒", style) : .roomMention(roomId: sgid))
         case PreviewReader.embedContentType?:
             // A card inside a heading or a cell has nowhere to go.
             guard !inline, let preview = PreviewReader.preview(from: node, host: host) else { return }

@@ -30,16 +30,24 @@ public enum RichText {
 
     /// Text typed in plain as segments for `body(from:)`: each "@" and the name of someone in
     /// `mentions` (a user id to the name the composer wrote for them) mentions them, where it stands
-    /// as a whole name rather than the start of a longer word.
-    public static func segments(_ text: String, mentions: [String: String]) -> [ComposeSegment] {
-        Composer.segments(text, mentions: mentions)
+    /// as a whole name rather than the start of a longer word. Each "@" and name in `specialMentions`
+    /// (`here`, `channel`, `everyone`) makes that special mention, and each "#" and the name of a room
+    /// in `rooms` (a room id to the name the composer wrote for it) mentions the room, by the same rule.
+    public static func segments(_ text: String, mentions: [String: String], specialMentions: [String] = [], rooms: [String: String] = [:]) -> [ComposeSegment] {
+        Composer.segments(text, mentions: mentions, specialMentions: specialMentions, rooms: rooms)
     }
 
-    /// Where in `text` `segments` finds each mention, "@" and name, in order: what a composer shows
-    /// as a mention while it's being written.
-    public static func mentionRanges(in text: String, mentions: [String: String]) -> [Range<String.Index>] {
-        Composer.matches(text, mentions: mentions).map(\.range)
+    /// Where in `text` `segments` finds each mention, its sign and name, in order: what a composer
+    /// shows as a mention while it's being written.
+    public static func mentionRanges(in text: String, mentions: [String: String], specialMentions: [String] = [], rooms: [String: String] = [:]) -> [Range<String.Index>] {
+        Composer.found(text, mentions: mentions, specialMentions: specialMentions, rooms: rooms).map(\.range)
     }
+
+    /// The special mentions' names, narrowest first: `here`, `channel`, `everyone`.
+    public static let specialMentions = Composer.specialMentions
+
+    /// What a mentioned room shows as to someone who isn't in it.
+    public static let privateRoomName = Composer.privateRoomName
 
     /// Whether the body holds something the model cannot show, whose plain text ("[Image]") is the best stand-in.
     private static func hasUnshownMedia(_ root: HTMLNode) -> Bool {

@@ -335,7 +335,7 @@ private let link = CardButton(text: "Open", href: "https://example.com/open")
 
     @Test func aWelcomeBringsItsMessagesCards() {
         let frame = ServerFrame(text: #"{"type":"welcome","you":\#(you),"present":[],"seq":7,"messages":[\#(withCards),\#(messageJSON)],"hasMore":false,"hasNewer":false,"around":null}"#)
-        guard case let .welcome(_, _, _, page) = frame else { Issue.record("\(frame)"); return }
+        guard case let .welcome(_, _, _, page, _, _) = frame else { Issue.record("\(frame)"); return }
         #expect(page.messages.map { $0.cards?.count } == [1, nil])
     }
 

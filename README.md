@@ -19,7 +19,7 @@ Bot cards, Ember's message attachments for bots, are read in `EmberCore` and the
 
 | | |
 | --- | --- |
-| Upstream | [ember-cloudflare](https://github.com/NYLLON-SOFTWARE/ember-cloudflare), `v0.5.0-beta.12` (commit `30755b2a`), 2026-11-19 |
+| Upstream | [ember-cloudflare](https://github.com/NYLLON-SOFTWARE/ember-cloudflare), `v0.5.0` (commit `2e6c7886`), 2026-11-22 |
 | Swift | 6.0 or later (`swift-tools-version: 6.0`) |
 | Xcode | 16.0 or later |
 | Platforms | iOS 18, macOS 15 |

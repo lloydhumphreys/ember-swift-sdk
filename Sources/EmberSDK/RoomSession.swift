@@ -812,7 +812,7 @@ import Observation
     func handle(_ frame: ServerFrame) {
         let isClick = clickAnswered(frame)
         switch frame {
-        case let .welcome(you, _, _, _):
+        case let .welcome(you, _, _, _, _, _):
             clicksLost(Self.clickLost)
             // Read (or read again, after a failure) before the welcome's check, which asks about
             // what's pending.
@@ -823,15 +823,15 @@ import Observation
             clicksLost(Self.clickLost)
             admitted = true
             if phase != .admitted { phase = .admitted }
-        case let .error(message, clientMessageId, clientMessageIds, _, failed, _) where !isClick:
+        case let .error(message, clientMessageId, clientMessageIds, _, scheduledId, failed, _) where !isClick:
             let ids = Set(clientMessageIds ?? clientMessageId.map { [$0] } ?? [])
             // A reply's refusal is its thread's to show, as a message's is the timeline's.
             let isPending = timeline.pending.contains { ids.contains($0.clientMessageId) }
                 || threads.contains { $0.timeline.pending.contains { ids.contains($0.clientMessageId) } }
             // A change sent with an `async` form hears its refusal as a throw instead.
-            let isChange = ids.isEmpty && changeRefused(message, failed: failed)
+            let isChange = ids.isEmpty ? changeRefused(message, failed: failed, scheduledId: scheduledId) : scheduleRefused(ids, message)
             if !isPending, !isChange, !message.isEmpty, failed != "thread.open", failed != "thread.before",
-               failed != "history.before", failed != "history.after" {
+               failed != "history.before", failed != "history.after", failed != "scheduled.edit" {
                 notice = message
             }
             if failed == "history.around" { aroundAnswered() }

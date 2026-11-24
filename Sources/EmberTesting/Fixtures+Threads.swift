@@ -105,11 +105,16 @@ extension Fixtures {
 
 extension Fixtures.RoomFrames {
     /// `thread.opened`: the thread's parent (nil for one that's gone) and its newest replies.
-    public static func threadOpened(_ parentID: MessageID, parent: Message?, replies: [Message] = [], hasMore: Bool = false) -> String {
-        Fixtures.json([
+    /// `ephemeral` are the messages in it only you see, there only when there are any.
+    public static func threadOpened(
+        _ parentID: MessageID, parent: Message?, replies: [Message] = [], hasMore: Bool = false, ephemeral: [EphemeralMessage] = []
+    ) -> String {
+        var object: [String: Any] = [
             "type": "thread.opened", "parentId": parentID.rawValue, "parent": parent.map { Fixtures.value($0) } ?? NSNull(),
             "messages": replies.map { Fixtures.value($0) }, "hasMore": hasMore,
-        ])
+        ]
+        if !ephemeral.isEmpty { object["ephemeral"] = ephemeral.map(Fixtures.ephemeralObject) }
+        return Fixtures.json(object)
     }
 
     /// `thread.history`: the replies before `before`.

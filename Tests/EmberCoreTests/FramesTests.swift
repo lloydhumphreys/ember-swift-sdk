@@ -29,6 +29,14 @@ import Testing
         (.clickCard(clickId: "k1", messageId: "m1", actionId: "approve"), #"{"type":"card.click","clickId":"k1","messageId":"m1","actionId":"approve"}"#),
         (.clickCard(clickId: "k1", messageId: "m1", actionId: "approve", blockId: "deploy", value: ""),
          #"{"type":"card.click","clickId":"k1","messageId":"m1","actionId":"approve","blockId":"deploy","value":""}"#),
+        (.scheduleMessage(clientMessageId: "c1", body: "<p>Hi</p>", sendAt: noon()),
+         #"{"type":"message.schedule","clientMessageId":"c1","body":"<p>Hi</p>","sendAt":"2026-10-12T12:00:00.000Z"}"#),
+        (.scheduleMessage(clientMessageId: "c1", body: "Hi", sendAt: noon(), parentId: "m1", alsoSend: true),
+         #"{"type":"message.schedule","clientMessageId":"c1","body":"Hi","sendAt":"2026-10-12T12:00:00.000Z","parentId":"m1","alsoSend":true}"#),
+        (.editScheduled(scheduledId: "s1", body: "Edited"), #"{"type":"scheduled.edit","scheduledId":"s1","body":"Edited"}"#),
+        (.reschedule(scheduledId: "s1", sendAt: noon(30)), #"{"type":"scheduled.reschedule","scheduledId":"s1","sendAt":"2026-10-12T12:30:00.000Z"}"#),
+        (.sendScheduled(scheduledId: "s1"), #"{"type":"scheduled.send","scheduledId":"s1"}"#),
+        (.deleteScheduled(scheduledId: "s1"), #"{"type":"scheduled.delete","scheduledId":"s1"}"#),
         (.ping, #"{"type":"ping"}"#),
     ]
 
@@ -68,7 +76,7 @@ import Testing
 
     @Test func welcome() throws {
         let frame = ServerFrame(text: #"{"type":"welcome","you":\#(you),"present":[\#(grace)],"seq":7,"messages":[\#(messageJSON)],"hasMore":true,"hasNewer":false,"around":null}"#)
-        guard case let .welcome(me, present, seq, page) = frame else { Issue.record("\(frame)"); return }
+        guard case let .welcome(me, present, seq, page, _, _) = frame else { Issue.record("\(frame)"); return }
         #expect(me == ada)
         #expect(present == [EmberCoreTests.grace])
         #expect(seq == 7)
@@ -83,7 +91,7 @@ import Testing
 
     @Test func resumed() {
         let frame = ServerFrame(text: #"{"type":"resumed","you":\#(you),"messages":[\#(messageJSON)],"deletedIds":["m000"],"present":[],"seq":9}"#)
-        guard case let .resumed(_, messages, deletedIds, present, seq) = frame else { Issue.record("\(frame)"); return }
+        guard case let .resumed(_, messages, deletedIds, present, seq, _, _) = frame else { Issue.record("\(frame)"); return }
         #expect(messages.count == 1 && deletedIds == ["m000"] && present.isEmpty && seq == 9)
     }
 
@@ -130,7 +138,7 @@ import Testing
     @Test func threads() {
         #expect(ServerFrame(text: #"{"type":"thread.opened","parentId":"m1","parent":null,"messages":[],"hasMore":false}"#)
             == .threadOpened(parentId: "m1", parent: nil, messages: [], hasMore: false))
-        guard case let .threadOpened(_, parent?, _, _) = ServerFrame(text: #"{"type":"thread.opened","parentId":"m001","parent":\#(messageJSON),"messages":[],"hasMore":true}"#) else {
+        guard case let .threadOpened(_, parent?, _, _, _) = ServerFrame(text: #"{"type":"thread.opened","parentId":"m001","parent":\#(messageJSON),"messages":[],"hasMore":true}"#) else {
             Issue.record("thread.opened"); return
         }
         #expect(parent.id == "m001")
@@ -155,6 +163,46 @@ import Testing
         #expect(ServerFrame(text: #"{"type":"error","message":"That click couldn’t be delivered","clickId":"k1","failed":"card.click"}"#)
             == .error(message: "That click couldn’t be delivered", clientMessageId: nil, clientMessageIds: nil, clickId: "k1", failed: "card.click"))
         #expect(ServerFrame(text: #"{"type":"pong"}"#) == .pong)
+    }
+
+    @Test func scheduledMessages() {
+        let first = ScheduledMessage(id: "s1", clientMessageId: "c1", body: "<p>Hi</p>", sendAt: noon())
+        let reply = ScheduledMessage(id: "s2", clientMessageId: "c2", body: "Later", sendAt: noon(30), parentId: "m1", alsoSend: true, failure: "Its thread's message has been deleted.")
+        let one = #"{"id":"s1","clientMessageId":"c1","body":"<p>Hi</p>","sendAt":"2026-10-12T12:00:00.000Z"}"#
+        let two = #"{"id":"s2","clientMessageId":"c2","body":"Later","sendAt":"2026-10-12T12:30:00.000Z","parentId":"m1","alsoSend":true,"failure":"Its thread's message has been deleted."}"#
+        #expect(ServerFrame(text: #"{"type":"scheduled","messages":[\#(one),\#(two)]}"#) == .scheduled([first, reply]))
+        #expect(ServerFrame(text: #"{"type":"scheduled","messages":[\#(one)],"edited":"s1"}"#) == .scheduled([first], edited: "s1"))
+        // None left, and one of them unreadable.
+        #expect(ServerFrame(text: #"{"type":"scheduled","messages":[]}"#) == .scheduled([]))
+        #expect(ServerFrame(text: #"{"type":"scheduled","messages":[{"id":"s9"},\#(one)],"edited":5}"#) == .scheduled([first]))
+        // The room says which one an edit it refused was of.
+        #expect(ServerFrame(text: #"{"type":"error","message":"Too long","scheduledId":"s1","failed":"scheduled.edit"}"#)
+            == .error(message: "Too long", clientMessageId: nil, clientMessageIds: nil, scheduledId: "s1", failed: "scheduled.edit"))
+        // Welcome and resumed list them when there are any.
+        #expect(ServerFrame(text: #"{"type":"welcome","you":\#(you),"messages":[],"present":[],"seq":0,"hasMore":false,"scheduled":[\#(one)]}"#)
+            == .welcome(you: User(id: "u1", name: "Ada"), present: [], seq: 0, page: TimelinePage(messages: [], hasMore: false), scheduled: [first]))
+        #expect(ServerFrame(text: #"{"type":"resumed","you":\#(you),"messages":[],"deletedIds":[],"present":[],"seq":3,"scheduled":[\#(two)]}"#)
+            == .resumed(you: User(id: "u1", name: "Ada"), messages: [], deletedIds: [], present: [], seq: 3, scheduled: [reply]))
+        // A list that can't be read is none, and the welcome is still taken.
+        #expect(ServerFrame(text: #"{"type":"welcome","you":\#(you),"messages":[],"present":[],"seq":0,"hasMore":false,"scheduled":"soon","ephemeral":7}"#)
+            == .welcome(you: User(id: "u1", name: "Ada"), present: [], seq: 0, page: TimelinePage(messages: [], hasMore: false)))
+    }
+
+    @Test func messagesOnlyYouSee() {
+        let card = #"{"id":"e1","roomId":"r1","creator":{"id":"ember","name":"Ember"},"body":"","plainText":"Run it?","cards":[],"createdAt":"2026-10-12T12:00:00.000Z"}"#
+        let asked = EphemeralMessage(id: "e1", roomId: "r1", creator: User(id: "ember", name: "Ember"), plainText: "Run it?", createdAt: noon())
+        var inThread = asked
+        inThread.parentId = "m1"
+        let threaded = #"{"id":"e1","roomId":"r1","creator":{"id":"ember","name":"Ember"},"plainText":"Run it?","createdAt":"2026-10-12T12:00:00Z","parentId":"m1"}"#
+        #expect(ServerFrame(text: #"{"type":"message.ephemeral","message":\#(card)}"#) == .messageEphemeral(asked))
+        #expect(ServerFrame(text: #"{"type":"message.ephemeral","message":\#(threaded)}"#) == .messageEphemeral(inThread))
+        #expect(ServerFrame(text: #"{"type":"message.ephemeral","message":{"id":"e1"}}"#) == .unknown("message.ephemeral"))
+        #expect(ServerFrame(text: #"{"type":"welcome","you":\#(you),"messages":[],"present":[],"seq":0,"hasMore":false,"ephemeral":[\#(card)]}"#)
+            == .welcome(you: User(id: "u1", name: "Ada"), present: [], seq: 0, page: TimelinePage(messages: [], hasMore: false), ephemeral: [asked]))
+        #expect(ServerFrame(text: #"{"type":"resumed","you":\#(you),"messages":[],"deletedIds":[],"present":[],"seq":3,"ephemeral":[\#(card),{"id":"e2"}]}"#)
+            == .resumed(you: User(id: "u1", name: "Ada"), messages: [], deletedIds: [], present: [], seq: 3, ephemeral: [asked]))
+        #expect(ServerFrame(text: #"{"type":"thread.opened","parentId":"m1","parent":null,"messages":[],"hasMore":false,"ephemeral":[\#(threaded)]}"#)
+            == .threadOpened(parentId: "m1", parent: nil, messages: [], hasMore: false, ephemeral: [inThread]))
     }
 
     @Test func aClickTaken() {
@@ -201,6 +249,27 @@ import Testing
         #expect(WorkspaceFrame(text: #"{"type":"rooms.reordered"}"#) == .roomsReordered)
     }
 
+    @Test func mentionsInAnUnreadRoom() {
+        #expect(WorkspaceFrame(text: #"{"type":"room.unread","roomId":"r1","at":"2026-10-12T12:00:00.000Z","mentions":2}"#)
+            == .roomUnread("r1", since: noon(), mentions: 2))
+        #expect(WorkspaceFrame(text: #"{"type":"room.unread","roomId":"d1","at":"2026-10-12T12:00:00.000Z","count":3,"mentions":1}"#)
+            == .roomUnread("d1", since: noon(), count: 3, mentions: 1))
+        #expect(WorkspaceFrame(text: #"{"type":"room.unread","roomId":"r1","mentions":"two"}"#) == .roomUnread("r1"))
+    }
+
+    @Test func aSavedRoomSaysItsSectionWhenThatIsWhatChanged() {
+        let room = #"{"id":"r1","kind":"open","name":"general","icon":null}"#
+        let general = Room(id: "r1", kind: .open, name: "general")
+        #expect(WorkspaceFrame(text: #"{"type":"room.saved","room":\#(room)}"#) == .roomSaved(general, section: .unchanged))
+        #expect(WorkspaceFrame(text: #"{"type":"room.saved","room":\#(room),"section":{"id":"s1","name":"Product"}}"#)
+            == .roomSaved(general, section: .section(RoomSection(id: "s1", name: "Product"))))
+        #expect(WorkspaceFrame(text: #"{"type":"room.saved","room":\#(room),"section":null}"#) == .roomSaved(general, section: .loose))
+        // One it can't read leaves the room where it was.
+        #expect(WorkspaceFrame(text: #"{"type":"room.saved","room":\#(room),"section":"s1"}"#) == .roomSaved(general, section: .unchanged))
+        #expect(WorkspaceFrame(text: #"{"type":"room.saved","room":{"id":"r1","kind":"open","name":"general","channelMentions":false}}"#)
+            == .roomSaved(Room(id: "r1", kind: .open, name: "general", channelMentions: false)))
+    }
+
     @Test func peopleStarsAndAccount() {
         #expect(WorkspaceFrame(text: #"{"type":"user.updated","user":{"id":"u2","name":"Grace","role":"member","status":"active","avatarUrl":"/a"}}"#)
             == .userUpdated(DirectoryUser(id: "u2", name: "Grace", avatarUrl: "/a")))
@@ -227,11 +296,11 @@ import Testing
 
 @Suite struct SocketTests {
     @Test func roomSocketQuery() {
-        #expect(RoomSocket.protocolRevision == 4)
-        #expect(RoomSocket.query(visible: true, since: nil, around: nil) == "visible=1&protocol=4")
-        #expect(RoomSocket.query(visible: false, since: 42, around: nil) == "visible=0&protocol=4&since=42")
-        #expect(RoomSocket.query(visible: true, since: nil, around: "m 1/é") == "visible=1&protocol=4&around=m%201%2F%C3%A9")
-        #expect(RoomSocket.query(visible: true, since: 0, around: "m1") == "visible=1&protocol=4&since=0&around=m1")
+        #expect(RoomSocket.protocolRevision == 5)
+        #expect(RoomSocket.query(visible: true, since: nil, around: nil) == "visible=1&protocol=5")
+        #expect(RoomSocket.query(visible: false, since: 42, around: nil) == "visible=0&protocol=5&since=42")
+        #expect(RoomSocket.query(visible: true, since: nil, around: "m 1/é") == "visible=1&protocol=5&around=m%201%2F%C3%A9")
+        #expect(RoomSocket.query(visible: true, since: 0, around: "m1") == "visible=1&protocol=5&since=0&around=m1")
     }
 
     @Test func closeCodes() {

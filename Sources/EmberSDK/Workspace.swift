@@ -142,11 +142,18 @@ import Observation
     public private(set) var favorites = Favorites(rooms: [], version: 0)
     /// The workspace's order for shared rooms.
     public private(set) var sharedOrder: [RoomID] = []
+    /// The sections shared rooms are listed under, in order, each with which of your rooms are in it:
+    /// every section for an administrator, and for anyone else the ones with a room of theirs.
+    public private(set) var sections: [SidebarSection] = []
     /// An invitation an administrator hasn't dismissed yet.
     public private(set) var invitation: Invitation?
 
     /// Shared rooms, none hidden, in sidebar order.
     public private(set) var sharedRooms: [SidebarRoom] = []
+
+    /// `sharedRooms` under their sections: the ones in none first, a starred room among them, then
+    /// each section that has one of them.
+    public private(set) var sectionedRooms = SectionedRooms()
 
     /// The starred rooms at the start of `sharedRooms`, which `moveFavorites` moves.
     public var favoriteRooms: [SidebarRoom] { sharedRooms.filter { isFavorite($0.id) } }
@@ -181,14 +188,16 @@ import Observation
         let roomsChanged = state.rooms != rooms
         let favoritesChanged = state.favorites != favorites
         let orderChanged = state.sharedOrder != sharedOrder
+        let sectionsChanged = state.sections != sections
         if roomsChanged {
             rooms = state.rooms
             roomIndex = Dictionary(rooms.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
         }
         if favoritesChanged { favorites = state.favorites }
         if orderChanged { sharedOrder = state.sharedOrder }
+        if sectionsChanged { sections = state.sections }
         if state.invitation != invitation { invitation = state.invitation }
-        guard roomsChanged || favoritesChanged || orderChanged else { return }
+        guard roomsChanged || favoritesChanged || orderChanged || sectionsChanged else { return }
         sortCount += 1
         if roomsChanged || favoritesChanged || orderChanged {
             assign(\.sharedRooms, RoomList.shared(rooms, favorites: favorites.rooms, sharedOrder: sharedOrder))
@@ -197,6 +206,7 @@ import Observation
             assign(\.roomsInSharedOrder, RoomList.inSharedOrder(rooms, sharedOrder: sharedOrder))
         }
         if roomsChanged { assign(\.directRooms, RoomList.directs(rooms)) }
+        assign(\.sectionedRooms, RoomList.inSections(sharedRooms, sections: sections, starred: Set(favorites.rooms)))
         publishUnread()
     }
 
@@ -389,27 +399,86 @@ import Observation
         return self.room(room.id) ?? SidebarRoom(room: room)
     }
 
-    /// Creates a shared room and adds it to the sidebar. A closed room always has you in it.
+    /// Creates a shared room and adds it to the sidebar, under the section it chooses. A closed room
+    /// always has you in it.
     public func createRoom(_ newRoom: NewRoom) async throws -> SidebarRoom {
         var newRoom = newRoom
         if case let .closed(memberIDs) = newRoom.access, !memberIDs.contains(me.id) {
             newRoom.access = .closed(memberIDs: [me.id] + memberIDs)
         }
         let room = try await client.createRoom(newRoom)
-        state.add(room)
+        add(room, in: newRoom.section)
         return self.room(room.id) ?? SidebarRoom(room: room)
     }
 
-    /// Changes a room, answering it as saved. Closing it without you in it takes it out of the sidebar.
+    /// Changes a room, answering it as saved, and lists it under the section the changes choose.
+    /// Closing it without you in it takes it out of the sidebar.
     @discardableResult
     public func changeRoom(_ roomID: RoomID, _ changes: RoomChanges) async throws -> Room {
         let room = try await client.changeRoom(roomID, changes)
         if case let .closed(memberIDs) = changes.access, !memberIDs.contains(me.id) {
             state.remove(roomID)
         } else {
+            add(room, in: changes.section)
+        }
+        return room
+    }
+
+    /// Puts people in a closed room and takes others out, everyone else staying as they are, and
+    /// answers the room as saved. Taking yourself out takes it out of the sidebar.
+    @discardableResult
+    public func changeMembers(of roomID: RoomID, adding added: [UserID] = [], removing removed: [UserID] = []) async throws -> Room {
+        let room = try await client.changeMembers(of: roomID, adding: added, removing: removed)
+        if removed.contains(me.id) {
+            state.remove(roomID)
+        } else {
             state.add(room)
         }
         return room
+    }
+
+    /// Shows a room as saved, under the section chosen for it: at once for none or a section the
+    /// sidebar lists, and once the sidebar has loaded again for any other.
+    private func add(_ room: Room, in choice: SectionChoice?) {
+        switch choice {
+        case nil:
+            state.add(room)
+        case .noSection:
+            state.add(room, section: .loose)
+        case let .section(id):
+            if let listed = state.sections.first(where: { $0.id == id }) {
+                state.add(room, section: .section(listed.section))
+            } else {
+                state.add(room)
+                Task { await load(directory: false) }
+            }
+        case .new:
+            state.add(room)
+            Task { await load(directory: false) }
+        }
+    }
+
+    /// Makes a section, after the others, and loads the sidebar again. Administrators only. A name
+    /// another section has is refused.
+    @discardableResult
+    public func makeSection(named name: String) async throws -> RoomSection {
+        let section = try await client.makeSection(named: name)
+        await load(directory: false)
+        return section
+    }
+
+    /// Renames a section and loads the sidebar again. Administrators only.
+    @discardableResult
+    public func renameSection(_ sectionID: SectionID, to name: String) async throws -> RoomSection {
+        let section = try await client.renameSection(sectionID, to: name)
+        await load(directory: false)
+        return section
+    }
+
+    /// Deletes a section, leaving its rooms in none, and loads the sidebar again. Administrators only.
+    public func deleteSection(_ sectionID: SectionID) async throws {
+        try await client.deleteSection(sectionID)
+        await load(directory: false)
     }
 
     /// Deletes a room or DM and takes it out of the sidebar.
@@ -454,11 +523,18 @@ import Observation
     }
 
     private func saveSharedOrder(_ order: [RoomID]) async {
-        let guess = state.beginSharedOrder(order)
+        await saveRoomLayout(RoomLayout(roomIds: order))
+    }
+
+    /// Saves the shared rooms' order and, with the layout's `sections`, the sections' order and
+    /// which of those rooms are in each, at once, for everyone. Administrators only. If the server
+    /// refuses, they go back, `notice` says why, and the sidebar loads again.
+    public func saveRoomLayout(_ layout: RoomLayout) async {
+        let guess = state.beginSharedOrder(layout.roomIds, sections: layout.sections)
         do {
-            let answer = try await client.setSharedOrder(order)
+            let answer = try await client.setRoomLayout(layout)
             guard !isShutDown else { return }
-            state.acceptSharedOrder(guess, order: answer)
+            state.acceptSharedOrder(guess, order: answer.sharedOrder, sections: answer.sections)
         } catch {
             guard !isShutDown else { return }
             state.rejectSharedOrder(guess)
@@ -526,6 +602,12 @@ import Observation
     /// Lets someone banned back in. Their deleted messages stay deleted. Administrators only.
     public func unban(_ userID: UserID) async throws {
         heard(try await client.unban(userID))
+    }
+
+    /// Pauses your notifications until `until`, at most `Limits.longestPause` from now, or resumes
+    /// them with nil. `people` shows it at once.
+    public func pauseNotifications(until: Date?) async throws {
+        heard(try await client.pauseNotifications(until: until))
     }
 
     /// Everyone banned, by name, for an administrator to let back in.
@@ -705,7 +787,7 @@ import Observation
                 me = Me(id: me.id, name: user.name, administrator: user.role == .administrator)
             }
             if refetch { Task { await reload() } }
-        case let .roomUnread(id, _, _) where id == currentRoomID:
+        case let .roomUnread(id, _, _, _) where id == currentRoomID:
             // The room on screen is being read.
             state.apply(frame)
             state.markRead(id)

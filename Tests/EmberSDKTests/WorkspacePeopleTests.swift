@@ -123,6 +123,48 @@ import Testing
         #expect(workspace.bannedPeople.map(\.id) == [Fixtures.alan.id])
     }
 
+    // MARK: Pause
+
+    @Test func pausedNotificationsShowAtOnceAndResume() async throws {
+        try await started()
+        let until = try #require(EmberJSON.date(from: "2026-11-24T09:00:00.000Z"))
+        let ada = try #require(workspace.person(Fixtures.me.id))
+        #expect(ada.pausedUntil == nil)
+        transport.stub("PUT", "/api/users/me/notifications-pause", json: Fixtures.changedPersonJSON(Fixtures.paused(ada, until: until)))
+        try await workspace.pauseNotifications(until: until)
+        #expect(transport.lastBody("PUT", "/api/users/me/notifications-pause")?["until"] as? String == "2026-11-24T09:00:00.000Z")
+        #expect(workspace.person(Fixtures.me.id)?.pausedUntil == until)
+
+        // The socket says the same to everyone, you included.
+        connector.latest?.serverSends(Fixtures.WorkspaceFrames.userUpdated(Fixtures.paused(ada, until: until)))
+        await settle()
+        #expect(workspace.person(Fixtures.me.id)?.pausedUntil == until)
+
+        transport.stub("PUT", "/api/users/me/notifications-pause", json: Fixtures.changedPersonJSON(ada))
+        try await workspace.pauseNotifications(until: nil)
+        #expect(transport.lastBody("PUT", "/api/users/me/notifications-pause")?["until"] is NSNull)
+        #expect(workspace.person(Fixtures.me.id)?.pausedUntil == nil)
+    }
+
+    @Test func aRefusedPausePausesNothing() async throws {
+        try await started()
+        transport.stub("PUT", "/api/users/me/notifications-pause", status: 422, json: Fixtures.errorJSON("Choose a time in the next 7 days"))
+        await #expect(throws: EmberError(status: 422, message: "Choose a time in the next 7 days")) {
+            try await workspace.pauseNotifications(until: Date(timeIntervalSince1970: 0))
+        }
+        #expect(workspace.person(Fixtures.me.id)?.pausedUntil == nil)
+    }
+
+    @Test func someoneElsesPauseArrivesOverTheSocket() async throws {
+        try await started()
+        let until = try #require(EmberJSON.date(from: "2026-11-24T09:00:00.000Z"))
+        let grace = try #require(workspace.person(Fixtures.grace.id))
+        connector.latest?.serverSends(Fixtures.WorkspaceFrames.userUpdated(Fixtures.paused(grace, until: until)))
+        #expect(await eventually { workspace.person(Fixtures.grace.id)?.pausedUntil == until })
+        connector.latest?.serverSends(Fixtures.WorkspaceFrames.userUpdated(grace))
+        #expect(await eventually { workspace.person(Fixtures.grace.id)?.pausedUntil == nil })
+    }
+
     @Test func aChangeToSomeoneDoesntSortTheSidebarAgain() async throws {
         try await started()
         let sorts = workspace.sortCount

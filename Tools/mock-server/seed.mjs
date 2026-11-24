@@ -85,17 +85,22 @@ export function seed(store, now = Date.now(), { mediaOrigin = "http://media.loca
   const everyone = PEOPLE.map(({ key }) => people[key].id);
   store.joinCode = stableId("join-code").slice(0, 12);
 
+  // Two sections: Product, with rooms everyone is in, and Company, whose one room is closed, so only its members
+  // have the section in their sidebar.
+  const sections = { product: { id: stableId("section:product"), name: "Product" }, company: { id: stableId("section:company"), name: "Company" } };
+  store.sections = [sections.product, sections.company];
+
   const rooms = {};
-  const shared = (key, name, icon, kind, memberIds, by, offset) => {
-    rooms[key] = store.addRoom({ id: stableId(`room:${key}`), kind, name, icon, memberIds, createdAt: start + offset * MINUTE, by: people[by].id });
+  const shared = (key, name, icon, kind, memberIds, by, offset, section = null) => {
+    rooms[key] = store.addRoom({ id: stableId(`room:${key}`), kind, name, icon, memberIds, createdAt: start + offset * MINUTE, by: people[by].id, sectionId: section?.id ?? null });
   };
   shared("general", "general", null, "open", everyone, "maya", 20);
   shared("random", "random", null, "open", everyone, "maya", 21);
-  shared("launch", "Launch", "rocket", "open", everyone, "maya", 60);
-  shared("design", "Design", "palette", "open", everyone, "priya", 61);
+  shared("launch", "Launch", "rocket", "open", everyone, "maya", 60, sections.product);
+  shared("design", "Design", "palette", "open", everyone, "priya", 61, sections.product);
   shared("engineering", "Engineering", "code", "open", everyone, "sam", 62);
   shared("support", "Support", "life-buoy", "open", everyone, "amara", 63);
-  shared("leadership", "Leadership", "briefcase", "closed", [people.maya.id, people.sam.id, people.priya.id], "maya", 64);
+  shared("leadership", "Leadership", "briefcase", "closed", [people.maya.id, people.sam.id, people.priya.id], "maya", 64, sections.company);
   const direct = (key, by, ...others) => {
     rooms[key] = store.addRoom({ id: stableId(`room:${key}`), kind: "direct", memberIds: [people[by].id, ...others.map((name) => people[name].id)], createdAt: start + 100 * MINUTE, by: people[by].id });
   };

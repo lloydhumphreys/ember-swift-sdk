@@ -36,7 +36,7 @@ extension RoomSession {
         case let .cardClicked(clickID):
             clicks.removeValue(forKey: clickID)?.resume()
             return true
-        case let .error(message, _, _, clickID?, _, _):
+        case let .error(message, _, _, clickID?, _, _, _):
             clicks.removeValue(forKey: clickID)?.resume(throwing: EmberError(kind: .refused, message: message))
             return true
         default:

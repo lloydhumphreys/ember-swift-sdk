@@ -98,3 +98,15 @@ public struct ClickID: EmberIdentifier {
     public let rawValue: String
     public init(rawValue: String) { self.rawValue = rawValue }
 }
+
+/// A section of the sidebar's shared rooms.
+public struct SectionID: EmberIdentifier {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+}
+
+/// A message waiting for its time to be sent.
+public struct ScheduledMessageID: EmberIdentifier {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+}

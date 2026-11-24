@@ -45,8 +45,8 @@ extension EmberClient {
         try await connection.waitUntilOpen()
         while true {
             switch ServerFrame(text: try await connection.receive()) {
-            case .welcome(_, _, _, let page): return page
-            case .error(let message, _, _, _, _, _): throw EmberError(status: 422, message: message)
+            case .welcome(_, _, _, let page, _, _): return page
+            case .error(let message, _, _, _, _, _, _): throw EmberError(status: 422, message: message)
             default: continue
             }
         }

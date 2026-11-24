@@ -92,12 +92,14 @@ public enum Fixtures {
     public static func sidebarJSON(
         rooms: [SidebarRoom] = sidebarRooms,
         favorites: Favorites = favorites,
-        sharedOrder: [RoomID] = [engines.id, general.id]
+        sharedOrder: [RoomID] = [engines.id, general.id],
+        sections: [SidebarSection] = []
     ) -> String {
         json([
             "rooms": rooms.map(sidebarRoomObject),
             "favorites": value(favorites),
             "sharedOrder": sharedOrder.map(\.rawValue),
+            "sections": sections.map(sidebarSectionObject),
             "invitation": NSNull(),
         ])
     }
@@ -145,18 +147,31 @@ public enum Fixtures {
 
     /// What a room's socket sends: `welcome` and the rest, as JSON.
     public enum RoomFrames {
-        public static func welcome(you: User = ada, messages: [Message] = Fixtures.messages(3), seq: Int = 10, present: [User] = [ada], hasMore: Bool = false, hasNewer: Bool = false, around: MessageID? = nil) -> String {
-            json([
+        /// `ephemeral` and `scheduled` are yours alone, and there only when there are any.
+        public static func welcome(
+            you: User = ada, messages: [Message] = Fixtures.messages(3), seq: Int = 10, present: [User] = [ada], hasMore: Bool = false,
+            hasNewer: Bool = false, around: MessageID? = nil, ephemeral: [EphemeralMessage] = [], scheduled: [ScheduledMessage] = []
+        ) -> String {
+            var object: [String: Any] = [
                 "type": "welcome", "you": value(you), "present": present.map { value($0) }, "seq": seq,
                 "messages": messages.map { value($0) }, "hasMore": hasMore, "hasNewer": hasNewer, "around": around?.rawValue ?? NSNull(),
-            ])
+            ]
+            if !ephemeral.isEmpty { object["ephemeral"] = ephemeral.map(ephemeralObject) }
+            if !scheduled.isEmpty { object["scheduled"] = scheduled.map(scheduledObject) }
+            return json(object)
         }
 
-        public static func resumed(you: User = ada, messages: [Message] = [], deletedIds: [MessageID] = [], seq: Int, present: [User] = [ada]) -> String {
-            json([
+        public static func resumed(
+            you: User = ada, messages: [Message] = [], deletedIds: [MessageID] = [], seq: Int, present: [User] = [ada],
+            ephemeral: [EphemeralMessage] = [], scheduled: [ScheduledMessage] = []
+        ) -> String {
+            var object: [String: Any] = [
                 "type": "resumed", "you": value(you), "messages": messages.map { value($0) }, "deletedIds": deletedIds.map(\.rawValue),
                 "present": present.map { value($0) }, "seq": seq,
-            ])
+            ]
+            if !ephemeral.isEmpty { object["ephemeral"] = ephemeral.map(ephemeralObject) }
+            if !scheduled.isEmpty { object["scheduled"] = scheduled.map(scheduledObject) }
+            return json(object)
         }
 
         public static func messageCreated(_ message: Message, seq: Int) -> String {
@@ -194,15 +209,18 @@ public enum Fixtures {
             json(["type": "typing", "user": value(user), "typing": typing])
         }
 
-        /// A refusal; with a `clientMessageId` it's a message's, with a `clickId` a click's, otherwise
-        /// something else's. `rewrite` refuses a message for what it says.
+        /// A refusal; with a `clientMessageId` it's a message's, with a `clickId` a click's, with a
+        /// `scheduledId` a scheduled message's edit's, otherwise something else's. `rewrite` refuses
+        /// a message for what it says.
         public static func error(
-            _ message: String, clientMessageId: ClientMessageID? = nil, clickId: ClickID? = nil, failed: String? = nil, rewrite: Bool = false
+            _ message: String, clientMessageId: ClientMessageID? = nil, clickId: ClickID? = nil, scheduledId: ScheduledMessageID? = nil,
+            failed: String? = nil, rewrite: Bool = false
         ) -> String {
             var object: [String: Any] = ["type": "error", "message": message]
             if rewrite { object["rewrite"] = true }
             if let clientMessageId { object["clientMessageId"] = clientMessageId.rawValue }
             if let clickId { object["clickId"] = clickId.rawValue }
+            if let scheduledId { object["scheduledId"] = scheduledId.rawValue }
             if let failed { object["failed"] = failed }
             return json(object)
         }
@@ -223,11 +241,12 @@ public enum Fixtures {
             json(["type": "welcome", "you": value(you), "account": accountObject(account)])
         }
 
-        /// A mark as of `at`; `count` for a DM's.
-        public static func roomUnread(_ roomID: RoomID, at: Date? = nil, count: Int? = nil) -> String {
+        /// A mark as of `at`; `count` for a DM's, `mentions` for a shared room's that mention you.
+        public static func roomUnread(_ roomID: RoomID, at: Date? = nil, count: Int? = nil, mentions: Int? = nil) -> String {
             let at = at ?? date("2026-11-20T09:00:00.000Z")
             var object: [String: Any] = ["type": "room.unread", "roomId": roomID.rawValue, "at": EmberJSON.string(from: at)]
             if let count { object["count"] = count }
+            if let mentions { object["mentions"] = mentions }
             return json(object)
         }
 
@@ -237,6 +256,11 @@ public enum Fixtures {
 
         public static func roomSaved(_ room: Room) -> String {
             json(["type": "room.saved", "room": value(room)])
+        }
+
+        /// A room saved with where it's listed: under `section`, or under none.
+        public static func roomSaved(_ room: Room, section: RoomSection?) -> String {
+            json(["type": "room.saved", "room": value(room), "section": section.map { value($0) } ?? NSNull()])
         }
 
         public static func roomGone(_ roomID: RoomID) -> String {
@@ -303,7 +327,8 @@ public enum Fixtures {
         [
             "name": account.name, "tagline": account.tagline, "logo": account.logo ?? NSNull(),
             "customDomain": account.customDomain ?? NSNull(), "restrictRoomCreation": account.restrictRoomCreation,
-            "hideTranslationButtons": account.hideTranslationButtons,
+            "hideTranslationButtons": account.hideTranslationButtons, "restrictChannelMentions": account.restrictChannelMentions,
+            "restrictEveryoneMention": account.restrictEveryoneMention, "warnBeforeNotifying": account.warnBeforeNotifying,
         ]
     }
 
@@ -313,6 +338,7 @@ public enum Fixtures {
         object["unread"] = room.unread
         if let unreadSince = room.unreadSince { object["unreadSince"] = EmberJSON.string(from: unreadSince) }
         if let unreadCount = room.unreadCount { object["unreadCount"] = unreadCount }
+        if let mentionCount = room.mentionCount { object["mentionCount"] = mentionCount }
         object["involvement"] = room.involvement.rawValue
         return object
     }

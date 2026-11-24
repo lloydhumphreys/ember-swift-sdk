@@ -11,7 +11,7 @@ private let you = #"{"id":"u1","name":"Ada"}"#
 @Suite struct LenientFrameTests {
     @Test func aWelcomeWithAMessageItCantReadStillWelcomes() {
         let frame = ServerFrame(text: #"{"type":"welcome","you":\#(you),"present":[\#(you),{"id":"u9"}],"seq":7,"messages":[\#(messageJSON),\#(nameless)],"hasMore":true}"#)
-        guard case let .welcome(me, present, seq, page) = frame else { Issue.record("\(frame)"); return }
+        guard case let .welcome(me, present, seq, page, _, _) = frame else { Issue.record("\(frame)"); return }
         #expect(me == ada)
         #expect(present == [ada])
         #expect(seq == 7)
@@ -23,7 +23,7 @@ private let you = #"{"id":"u1","name":"Ada"}"#
         let good = try Self.read(messageJSON)
         let list = "[\(nameless),\(messageJSON)]"
         let resumed = ServerFrame(text: #"{"type":"resumed","you":\#(you),"messages":\#(list),"deletedIds":[],"present":[],"seq":9}"#)
-        guard case let .resumed(_, messages, _, _, 9) = resumed else { Issue.record("\(resumed)"); return }
+        guard case let .resumed(_, messages, _, _, 9, _, _) = resumed else { Issue.record("\(resumed)"); return }
         #expect(messages.map(\.id) == ["m001"])
         let history = ServerFrame(text: #"{"type":"history","before":"m005","messages":\#(list),"hasMore":true}"#)
         #expect(history == .history(before: "m005", messages: [good], hasMore: true))

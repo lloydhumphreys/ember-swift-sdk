@@ -52,6 +52,11 @@ public indirect enum RichInline: Hashable, Sendable {
     case link(url: String, [RichInline])
     /// The app shows the person's current name.
     case mention(userId: String)
+    /// A special mention, by its name: `here`, `channel` or `everyone`. It shows as "@" and its name.
+    case specialMention(String)
+    /// A mention of a room. Someone in the room sees its name, linking to it; anyone else sees
+    /// `RichText.privateRoomName`.
+    case roomMention(roomId: String)
     case lineBreak
 }
 
@@ -78,4 +83,8 @@ public enum ComposeSegment: Hashable, Sendable {
     case text(String)
     /// `name` is what the composer showed; the server resolves the person by `userId` alone.
     case mention(userId: String, name: String)
+    /// A special mention, by its name: `here`, `channel` or `everyone`. Any other name goes as text.
+    case specialMention(String)
+    /// A mention of a room. `name` is what the composer showed; the server keeps the room's id alone.
+    case roomMention(roomId: String, name: String)
 }

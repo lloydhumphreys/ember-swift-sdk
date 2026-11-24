@@ -36,6 +36,9 @@ public struct ThreadTimeline: Equatable, Sendable {
     public private(set) var replies: [Message] = []
     /// Replies and files sent from here that the room hasn't confirmed, oldest first.
     public private(set) var pending: [PendingMessage] = []
+    /// Messages only you see in the thread, oldest first, as the room last sent them, shown as
+    /// `Timeline.ephemeral` is among the replies.
+    public private(set) var ephemeral: [EphemeralMessage] = []
     public private(set) var hasMore = false
     /// Whether a `thread.opened` has ever arrived.
     public private(set) var isLoaded = false
@@ -77,10 +80,10 @@ public struct ThreadTimeline: Equatable, Sendable {
     /// Answers what to send back.
     package mutating func apply(_ frame: ServerFrame, now: Date = Date()) -> [ClientFrame] {
         switch frame {
-        case let .welcome(you, _, _, _):
+        case let .welcome(you, _, _, _, _, _):
             me = you
 
-        case let .resumed(you, messages, deletedIds, _, _):
+        case let .resumed(you, messages, deletedIds, _, _, _, _):
             me = you
             let deleted = Set(deletedIds)
             if deleted.contains(parentId) { parent = .gone }
@@ -94,9 +97,10 @@ public struct ThreadTimeline: Equatable, Sendable {
             }
             dropConfirmed(by: messages)
 
-        case let .threadOpened(id, parent, messages, hasMore):
+        case let .threadOpened(id, parent, messages, hasMore, ephemeral):
             guard id == parentId else { return [] }
             isOpening = false
+            self.ephemeral = ephemeral
             if isLoaded {
                 reopen(messages, hasMore: hasMore)
             } else {
@@ -173,7 +177,15 @@ public struct ThreadTimeline: Equatable, Sendable {
                 stopTyping(user.id)
             }
 
-        case let .error(text, clientMessageId, clientMessageIds, _, failed, rewrite):
+        case let .messageEphemeral(message):
+            guard message.parentId == parentId else { return [] }
+            if let index = ephemeral.firstIndex(where: { $0.id == message.id }) {
+                ephemeral[index] = message
+            } else {
+                ephemeral.append(message)
+            }
+
+        case let .error(text, clientMessageId, clientMessageIds, _, _, failed, rewrite):
             switch failed {
             case "thread.open":
                 if isOpening {
@@ -184,6 +196,8 @@ public struct ThreadTimeline: Equatable, Sendable {
             case "thread.before":
                 olderPageFailed(text)
                 return []
+            case "scheduled.edit":
+                return []
             default:
                 let ids = Set(clientMessageIds ?? clientMessageId.map { [$0] } ?? [])
                 for index in pending.indices where ids.contains(pending[index].clientMessageId) {
@@ -192,7 +206,7 @@ public struct ThreadTimeline: Equatable, Sendable {
                 }
             }
 
-        case .presenceJoined, .presenceLeft, .history, .historyAfter, .historyAround, .cardClicked, .pong, .unknown:
+        case .presenceJoined, .presenceLeft, .history, .historyAfter, .historyAround, .scheduled, .cardClicked, .pong, .unknown:
             break
         }
         return []

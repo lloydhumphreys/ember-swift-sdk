@@ -3,9 +3,11 @@
 // which hands in what they share. The real server's rules are the source; README.md lists where this differs.
 
 import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
-import { sortableId } from "./store.mjs";
+import { MAX_SECTIONS, SECTIONS_FORBIDDEN, TOO_MANY_SECTIONS, sortableId } from "./store.mjs";
 
 const MAX_ROOM_NAME_LENGTH = 100;
+const MAX_SECTION_NAME_LENGTH = 100;
+const MAX_PAUSE_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_FAVORITES = 4096;
 const MAX_SHARED_ORDER = 4096;
 const MAX_BIO_LENGTH = 200;
@@ -41,6 +43,14 @@ const RESET_CODE_NEEDED = "Enter the 8-digit code from the email.";
 const RESET_CODE_WRONG = "That code is wrong or no longer works. Check the newest email from Ember, or send another code.";
 const EMAIL_LINK_GONE = "This link has expired, been used, or been replaced by a newer one.";
 const SHARED_ORDER_FORBIDDEN = "Only administrators can put rooms in order for everyone, and only the rooms in their sidebar";
+const SECTIONS_REFUSED = `sections must be at most ${MAX_SECTIONS} sections, each named once by its id, with rooms from roomIds, none in two`;
+const SECTION_REFUSED = "Section must be a section's id, null for none, or a new section's name";
+const SECTION_NAME_REFUSED = `Section name must be 1 to ${MAX_SECTION_NAME_LENGTH} characters`;
+const SECTION_NOT_FOUND = "Section not found";
+const SECTION_NAME_TAKEN = "There's a section with that name already";
+const ROOM_NOT_FOUND = "Room not found or inaccessible";
+const ROOM_CHANGE_FORBIDDEN = "Only administrators and the room's creator can change it";
+const PAUSE_REFUSED = "A pause needs the time it ends, or null to resume notifications";
 
 const ROOM_ICON = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -197,15 +207,32 @@ export function installAccountRoutes(ctx) {
   const MEMBERS_MESSAGE = `Members must be a list of at most ${MAX_LISTED_USERS} user ids`;
   const membersOk = (list) => Array.isArray(list) && list.length <= MAX_LISTED_USERS && list.every(isId);
 
+  /// A section's name as sent, trimmed, or null when it is none or too long.
+  const sectionName = (value) => {
+    const name = text(value);
+    return name === "" || lengthOf(name) > MAX_SECTION_NAME_LENGTH ? null : name;
+  };
+
+  /// The section a room is sent with: `{ section }`, undefined to leave it where it is, null for none, a section's id,
+  /// or `{ name }` for the section with that name or a new one. Or the message that refuses it.
+  function sectionChoice(value) {
+    if (value === undefined || value === null || (typeof value === "string" && ROOM_ID.test(value))) return { section: value };
+    if (!isObject(value)) return SECTION_REFUSED;
+    const name = sectionName(value.name);
+    return name === null ? SECTION_NAME_REFUSED : { section: { name } };
+  }
+
   function parseNewRoom(body) {
     if (!isObject(body)) return "Expected a JSON object";
     if (body.kind !== "open" && body.kind !== "closed") return 'Kind must be "open" or "closed"';
     const name = text(body.name);
     if (name === "" || lengthOf(name) > MAX_ROOM_NAME_LENGTH) return `Name must be 1 to ${MAX_ROOM_NAME_LENGTH} characters`;
     if (!roomChoice(body.icon)) return ICON_MESSAGE;
+    const section = sectionChoice(body.section);
+    if (typeof section === "string") return section;
     const memberIds = body.kind === "closed" ? (body.memberIds === undefined ? [] : body.memberIds) : [];
     if (!membersOk(memberIds)) return MEMBERS_MESSAGE;
-    return { kind: body.kind, name, icon: body.icon ?? "", memberIds };
+    return { kind: body.kind, name, icon: body.icon ?? "", memberIds, ...section };
   }
 
   function parseRoomChanges(body) {
@@ -220,6 +247,15 @@ export function installAccountRoutes(ctx) {
       if (!roomChoice(body.icon)) return ICON_MESSAGE;
       changes.icon = body.icon;
     }
+    // The mock has no huddles, so the switch is read and left at that.
+    if (body.huddles !== undefined && typeof body.huddles !== "boolean") return "Huddles must be true or false";
+    if (body.channelMentions !== undefined) {
+      if (typeof body.channelMentions !== "boolean") return "Room-wide mentions must be true or false";
+      changes.channelMentions = body.channelMentions;
+    }
+    const section = sectionChoice(body.section);
+    if (typeof section === "string") return section;
+    Object.assign(changes, section);
     if (body.kind !== undefined) {
       if (body.kind === "closed") {
         if (!membersOk(body.memberIds)) return MEMBERS_MESSAGE;
@@ -231,7 +267,14 @@ export function installAccountRoutes(ctx) {
     return changes;
   }
 
-  const savedRoom = (room) => ({ id: room.id, kind: room.kind, name: room.name, icon: room.icon });
+  function parseMembersChange(body) {
+    if (!isObject(body)) return "Expected a JSON object";
+    const { addedIds = [], removedIds = [] } = body;
+    if (!membersOk(addedIds) || !membersOk(removedIds)) return MEMBERS_MESSAGE;
+    return addedIds.some((id) => removedIds.includes(id)) ? "Nobody can be put in a room and taken out of it at once" : { addedIds, removedIds };
+  }
+
+  const savedRoom = (room) => store.roomWire(room);
   /// A shared room the person is in, which they can read the settings of, or null.
   const settingsRoom = (user, roomId) => {
     const room = ROOM_ID.test(roomId) ? store.rooms.get(roomId) : undefined;
@@ -244,36 +287,74 @@ export function installAccountRoutes(ctx) {
     if (!user) return signedOut(res);
     const parsed = parseNewRoom(await readBody(req));
     if (typeof parsed === "string") return fail(res, 422, parsed);
-    reply(res, 201, { room: savedRoom(store.createRoom(user.id, parsed)) });
+    const { section, ...room } = parsed;
+    const chosen = store.chooseSection(user, section);
+    if (chosen.error) return fail(res, chosen.status, chosen.error);
+    reply(res, 201, { room: savedRoom(store.createRoom(user.id, { ...room, sectionId: chosen.sectionId ?? null })) });
   });
 
   route("GET", "/api/rooms/new", (req, res) => {
     const user = userOf(req);
     if (!user) return signedOut(res);
-    reply(res, 200, { people: store.activePeople().map(({ id, name }) => ({ id, name })) });
+    reply(res, 200, { people: store.activePeople().map(({ id, name }) => ({ id, name })), sections: store.sectionOptions(user.id) });
   });
 
   route("GET", "/api/rooms/([^/]+)/settings", (req, res, [roomId]) => {
     const user = userOf(req);
     if (!user) return signedOut(res);
     const room = settingsRoom(user, roomId);
-    if (!room) return fail(res, 404, "Room not found or inaccessible");
+    if (!room) return fail(res, 404, ROOM_NOT_FOUND);
+    const canAdminister = mayAdminister(user, room);
     reply(res, 200, {
       room: savedRoom(room),
-      canAdminister: mayAdminister(user, room),
+      canAdminister,
+      canChangeHuddles: isAdministrator(user),
+      canChangeChannelMentions: isAdministrator(user),
       people: store.activePeople().map(({ id, name }) => ({ id, name, member: room.members.has(id) })),
+      section: store.sectionOf(room),
+      sections: canAdminister ? store.sectionOptions(user.id) : [],
     });
+  });
+
+  /// How many people a room has and how many each special mention would notify from the asker, in any room they are in.
+  route("GET", "/api/rooms/([^/]+)/notified", (req, res, [roomId]) => {
+    const user = userOf(req);
+    if (!user) return signedOut(res);
+    const room = ROOM_ID.test(roomId) ? store.rooms.get(roomId) : undefined;
+    if (!room || !room.members.has(user.id)) return fail(res, 404, ROOM_NOT_FOUND);
+    reply(res, 200, store.notified(room, user.id));
+  });
+
+  route("PATCH", "/api/rooms/([^/]+)/members", async (req, res, [roomId]) => {
+    const user = userOf(req);
+    if (!user) return signedOut(res);
+    const room = settingsRoom(user, roomId);
+    if (!room) return fail(res, 404, ROOM_NOT_FOUND);
+    if (!mayAdminister(user, room)) return fail(res, 403, ROOM_CHANGE_FORBIDDEN);
+    if (room.kind === "open") return fail(res, 409, "Everyone is in an open room, so nobody can be put in it or taken out");
+    const change = parseMembersChange(await readBody(req));
+    if (typeof change === "string") return fail(res, 422, change);
+    store.changeMembers(room, change.addedIds, change.removedIds);
+    reply(res, 200, { room: savedRoom(room) });
   });
 
   route("PATCH", "/api/rooms/([^/]+)", async (req, res, [roomId]) => {
     const user = userOf(req);
     if (!user) return signedOut(res);
     const room = settingsRoom(user, roomId);
-    if (!room) return fail(res, 404, "Room not found or inaccessible");
-    if (!mayAdminister(user, room)) return fail(res, 403, "Only administrators and the room's creator can change it");
-    const changes = parseRoomChanges(await readBody(req));
-    if (typeof changes === "string") return fail(res, 422, changes);
-    if (changes.name !== undefined || changes.kind !== undefined || changes.icon !== undefined) store.changeRoom(room, changes);
+    if (!room) return fail(res, 404, ROOM_NOT_FOUND);
+    if (!mayAdminister(user, room)) return fail(res, 403, ROOM_CHANGE_FORBIDDEN);
+    const parsed = parseRoomChanges(await readBody(req));
+    if (typeof parsed === "string") return fail(res, 422, parsed);
+    const { section, ...changes } = parsed;
+    // A switch sent as it is turns nothing on or off, which anyone who can change the room may send.
+    if (changes.channelMentions !== undefined && changes.channelMentions !== room.channelMentions && !isAdministrator(user)) {
+      return fail(res, 403, "Only administrators can turn @channel, @here and @everyone on or off in a room");
+    }
+    const chosen = store.chooseSection(user, section);
+    if (chosen.error) return fail(res, chosen.status, chosen.error);
+    if (chosen.sectionId !== undefined) changes.sectionId = chosen.sectionId;
+    if (Object.keys(changes).length > 0) store.changeRoom(room, changes);
     reply(res, 200, { room: savedRoom(room) });
   });
 
@@ -281,7 +362,7 @@ export function installAccountRoutes(ctx) {
     const user = userOf(req);
     if (!user) return signedOut(res);
     const room = ROOM_ID.test(roomId) ? store.rooms.get(roomId) : undefined;
-    if (!room || !room.members.has(user.id)) return fail(res, 404, "Room not found or inaccessible");
+    if (!room || !room.members.has(user.id)) return fail(res, 404, ROOM_NOT_FOUND);
     if (room.kind !== "direct" && !mayAdminister(user, room)) return fail(res, 403, "Only administrators and the room's creator can delete it");
     store.deleteRoom(room);
     reply(res, 204, null);
@@ -312,19 +393,116 @@ export function installAccountRoutes(ctx) {
     reply(res, 200, { favorites: result });
   });
 
+  /// A room layout body: `{ roomIds }`, with `sections` when it places rooms in them, or the 400 message that refuses it.
+  function parseRoomLayout(body) {
+    const roomIds = parseRoomOrder(body, MAX_SHARED_ORDER);
+    if (typeof roomIds === "string") return roomIds;
+    if (body.sections === undefined) return { roomIds };
+    if (!Array.isArray(body.sections) || body.sections.length > MAX_SECTIONS) return SECTIONS_REFUSED;
+    const listed = new Set(roomIds);
+    const placed = new Set();
+    const named = new Set();
+    const sections = [];
+    for (const section of body.sections) {
+      if (!isObject(section) || typeof section.id !== "string" || !ROOM_ID.test(section.id) || named.has(section.id) || !Array.isArray(section.roomIds)) return SECTIONS_REFUSED;
+      named.add(section.id);
+      for (const roomId of section.roomIds) {
+        if (typeof roomId !== "string" || !listed.has(roomId) || placed.has(roomId)) return SECTIONS_REFUSED;
+        placed.add(roomId);
+      }
+      sections.push({ id: section.id, roomIds: section.roomIds });
+    }
+    return { roomIds, sections };
+  }
+
   route("PUT", "/api/account/room_order", async (req, res) => {
     const user = userOf(req);
     if (!user) return signedOut(res);
+    const layout = parseRoomLayout(await readBody(req));
+    // Someone who isn't an administrator hears so before the list is checked.
     if (!isAdministrator(user)) return fail(res, 403, SHARED_ORDER_FORBIDDEN);
-    const ids = parseRoomOrder(await readBody(req), MAX_SHARED_ORDER);
-    if (typeof ids === "string") return fail(res, 400, ids);
+    if (typeof layout === "string") return fail(res, 400, layout);
+    const ids = layout.roomIds;
     const visible = new Set(store.roomsOf(user.id).filter((room) => room.kind !== "direct").map((room) => room.id));
     if (!ids.every((id) => visible.has(id))) return fail(res, 403, SHARED_ORDER_FORBIDDEN);
     // The mock keeps one list for everyone, so the ranks of rooms the administrator can't see stay as they were.
     const unseen = store.sharedOrder.filter((id) => !visible.has(id) && store.rooms.has(id));
     store.sharedOrder = ids.length === 0 ? unseen : [...ids, ...unseen];
+    if (layout.sections) store.placeRooms(ids, layout.sections);
     store.hub.everyone({ type: "rooms.reordered" });
-    reply(res, 200, { sharedOrder: [...ids] });
+    reply(res, 200, { sharedOrder: [...ids], sections: store.sidebarSections(user.id, true) });
+  });
+
+  // Sections
+
+  /// A section body's name, or null once the refusal has been answered: 422 to an administrator and 403 to anyone else.
+  async function namedSection(req, res, user) {
+    const body = await readBody(req);
+    const name = isObject(body) ? sectionName(body.name) : null;
+    if (!isAdministrator(user)) fail(res, 403, SECTIONS_FORBIDDEN);
+    else if (name === null) fail(res, 422, SECTION_NAME_REFUSED);
+    else return name;
+    return null;
+  }
+
+  const sectionWith = (id) => (ROOM_ID.test(id) ? store.sections.find((section) => section.id === id) : undefined);
+
+  route("POST", "/api/account/sections", async (req, res) => {
+    const user = userOf(req);
+    if (!user) return signedOut(res);
+    const name = await namedSection(req, res, user);
+    if (name === null) return;
+    if (store.sectionNamed(name)) return fail(res, 409, SECTION_NAME_TAKEN);
+    if (store.sections.length >= MAX_SECTIONS) return fail(res, 422, TOO_MANY_SECTIONS);
+    const { id } = store.addSection(name);
+    reply(res, 201, { section: { id, name } });
+  });
+
+  route("PATCH", "/api/account/sections/([^/]+)", async (req, res, [id]) => {
+    const user = userOf(req);
+    if (!user) return signedOut(res);
+    const name = await namedSection(req, res, user);
+    if (name === null) return;
+    const section = sectionWith(id);
+    if (!section) return fail(res, 404, SECTION_NOT_FOUND);
+    const named = store.sectionNamed(name);
+    if (named && named !== section) return fail(res, 409, SECTION_NAME_TAKEN);
+    store.renameSection(section, name);
+    reply(res, 200, { section: { id: section.id, name: section.name } });
+  });
+
+  route("DELETE", "/api/account/sections/([^/]+)", (req, res, [id]) => {
+    const user = userOf(req);
+    if (!user) return signedOut(res);
+    if (!isAdministrator(user)) return fail(res, 403, SECTIONS_FORBIDDEN);
+    const section = sectionWith(id);
+    if (!section) return fail(res, 404, SECTION_NOT_FOUND);
+    store.deleteSection(section);
+    reply(res, 204, null);
+  });
+
+  // Pausing notifications
+
+  /// When a pause body ends, in milliseconds, null to resume, or the message that refuses it.
+  function parsePause(body, now) {
+    if (!isObject(body)) return PAUSE_REFUSED;
+    if (body.until === null) return { until: null };
+    const end = typeof body.until === "string" ? Date.parse(body.until) : NaN;
+    if (!Number.isFinite(end) || new Date(end).toISOString() !== body.until) return PAUSE_REFUSED;
+    if (end <= now) return "A pause can't end in the past";
+    if (end - now > MAX_PAUSE_MS) return "Notifications can be paused for a week at most";
+    return { until: end };
+  }
+
+  route("PUT", "/api/users/me/notifications-pause", async (req, res) => {
+    const user = userOf(req);
+    if (!user) return signedOut(res);
+    const pause = parsePause(await readBody(req), Date.now());
+    if (typeof pause === "string") return fail(res, 422, pause);
+    if (pause.until === null) delete user.pausedUntil;
+    else user.pausedUntil = pause.until;
+    userUpdated(user);
+    reply(res, 200, { user: store.directoryUser(user, avatarToken) });
   });
 
   // Profile

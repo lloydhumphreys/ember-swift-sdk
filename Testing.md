@@ -53,7 +53,7 @@ The seeded accounts share one password, which you choose, read from `EMBER_SEED_
 
 ## Live tests
 
-`Tests/EmberLiveTests` signs in to a running server and goes through bootstrap, signing in, the sidebar, search, stars, both sockets, threads, files, cards and signing out. They skip unless `EMBER_TEST_ORIGIN` is set:
+`Tests/EmberLiveTests` signs in to a running server and goes through bootstrap, signing in, the sidebar, search, stars, both sockets, threads, files, cards, sections, mentions, scheduled messages and signing out. They skip unless `EMBER_TEST_ORIGIN` is set:
 
 ```bash
 EMBER_TEST_ORIGIN=http://127.0.0.1:8791 swift test --filter LiveTests

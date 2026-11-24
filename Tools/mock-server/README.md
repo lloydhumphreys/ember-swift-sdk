@@ -52,11 +52,15 @@ Ember, the assistant, has the id `ember`. Deploy Bot and Uptime are bots.
 
 Everyone belongs to every open room. The administrator invitation is left showing for Maya.
 
+Two sections are seeded: Product, with Launch and Design, and Company, with Leadership.
+
 The replier starts typing 700 ms after a message and replies about two seconds later.
 
 ## Implemented
 
-Bootstrap, sign-in and sign-out, me, sidebar and users with ETags, favourites, involvement, starting direct messages, search with filters and recent searches, avatars, uploads and file serving, and the workspace socket and room sockets. The room socket handles welcome, resume with `since`, `around`, history paging, create, update, delete, boosts, typing, presence, read marks, `message.check` and `card.click`.
+Bootstrap, sign-in and sign-out, me, sidebar and users with ETags, favourites, involvement, starting direct messages, search with filters and recent searches, avatars, uploads and file serving, and the workspace socket and room sockets. The room socket handles welcome, resume with `since`, `around`, history paging, create, update, delete, boosts, typing, presence, read marks, `message.check`, `card.click`, and scheduled messages. It speaks room protocol 5: a socket that names an older one gets `Ember has been updated. Reload the page to keep chatting.` after its welcome, and the same for anything it tries to write.
+
+The workspace socket answers `ping` with `pong`, and counts its person as active now until it sends `{type: "presence.active", active: false}`.
 
 Cross-site writes are refused with 422, and a socket from the wrong origin gets 404, as on the real server. Signing out closes that session's sockets with 4003.
 
@@ -88,6 +92,26 @@ Editing a card message answers `Messages with cards can't be edited.` (`failed: 
 
 While the replier is on, a person's top-level message in Engineering containing "deploy" (any case) brings a Deploy Bot card after `EMBER_BOT_DELAY`, and "alert" brings an Uptime alert card that Uptime replaces `EMBER_BOT_REPLACE_DELAY` later with plain text. The replacement drops the cards and everyone connected gets `message.updated` without a `cards` key.
 
+A card only one person sees: while the replier is on, a person's message in Engineering containing "rollback" (any case), in the room or in a thread, brings a question from Deploy Bot after `EMBER_BOT_DELAY`, shown to that person alone as `{type: "message.ephemeral", message}` with `{id, roomId, creator, body, plainText, cards, createdAt, parentId?}`. Its buttons are Roll back and Cancel, in the block `rollback_actions`. It is kept until answered: that person's welcome and resume carry the room's in `ephemeral`, and `thread.opened` carries the thread's. Only its asker can click it. The click answers `message.ephemeral` again with the same id and what was decided in place of the buttons, then `card.clicked`, and after Roll back, Deploy Bot says in the room or thread that it is rolling back. A socket on an older protocol is sent none of this.
+
+## Room-wide mentions
+
+`@here`, `@channel` and `@everyone` are mention attachments whose `sgid` is the word. On a new message in the room, the widest one its author may make there is the message's `notifies`; the others are left in its body as their text. None notifies in a DM, in a room with `channelMentions` off, or from the assistant, and `@everyone` only in an open room. A reply in a thread notifies nobody and stays as written. `GET /api/rooms/:id/notified` answers `{members, mentions}`: how many people each one would reach.
+
+A room that isn't a DM counts the unread messages that mention a person: by name, by `@channel` or `@everyone`, or by `@here` while they are active now. The count is the sidebar room's `mentionCount` and `room.unread`'s `mentions`. Someone whose mark and count don't change hears nothing.
+
+A mention of a room is an attachment with the content type `application/vnd.campfire.room` and the room's id as `sgid`. Its plain text is `#` and the room's name for an open room, and `#private room` for any other.
+
+The account's `restrictChannelMentions` and `restrictEveryoneMention` are false and `warnBeforeNotifying` is true, in the bootstrap and the workspace socket's welcome.
+
+## Scheduled messages
+
+`{type: "message.schedule", clientMessageId, body, sendAt, parentId?, alsoSend?}` keeps a message to send later: at most 30 for a person in a room, up to 120 days ahead. Its writer's sockets in the room get `{type: "scheduled", messages}`, soonest first, each `{id, clientMessageId, body, sendAt, parentId?, alsoSend?, failure?}`; nobody else hears of it. A refusal answers `error` with the `clientMessageId` and `failed: "message.schedule"`. One sent twice is kept once.
+
+`scheduled.edit {scheduledId, body}`, `scheduled.reschedule {scheduledId, sendAt}`, `scheduled.send {scheduledId}` and `scheduled.delete {scheduledId}` change one. Each answers the list, an edit's naming it in `edited` on the socket that asked, and a refused one then answers `error` with the `scheduledId` and the frame's type in `failed`. A message that can't be sent stays in the list with why in `failure`.
+
+A welcome and a resume carry the reader's own in `scheduled`, when there are any. Due messages are sent every 250 ms, as `message.created` to the room and then the shorter list to their writer.
+
 ## Bots
 
 `POST /rooms/:room/:key/messages` and `POST /rooms/:room/:key/messages/:id/boosts` are the keyed bot API: no session or cookie, and the key is `<bot id>-<token>`. A text body is the message's markup whatever its type. A multipart body with an `attachment` file posts a file. A message answers 201 with the permalink in `Location` and no body; a boost answers 201 with `{id, content, created_at, booster, message}`. A key that is no bot's is 401 `Unknown bot key`; a bot that isn't in the room, a missing message, or a blank body is an empty 404 or 422, as the real server answers.
@@ -100,16 +124,20 @@ Routes, messages, permissions and socket frames follow the real worker.
 
 | Route | Answer | Frames |
 | --- | --- | --- |
-| `POST /api/rooms` | 201 `{room}` | `room.saved` to its members |
-| `GET /api/rooms/new` | `{people}` | |
-| `GET /api/rooms/:id/settings` | `{room, canAdminister, people}`; 404 for a non-member or a DM | |
-| `PATCH /api/rooms/:id` | `{room}`; administrators and the creator | `room.saved`, and `room.gone` plus a 4004 socket close for people removed |
+| `POST /api/rooms` | 201 `{room}`; takes `section` | `room.saved` to its members, with its `section` |
+| `GET /api/rooms/new` | `{people, sections}` | |
+| `GET /api/rooms/:id/settings` | `{room, canAdminister, canChangeHuddles, canChangeChannelMentions, people, section, sections}`; 404 for a non-member or a DM | |
+| `PATCH /api/rooms/:id` | `{room}`; administrators and the creator; takes `section`, and from an administrator `channelMentions` | `room.saved`, with `section` while it has one and `section: null` when it leaves one, and `room.gone` plus a 4004 socket close for people removed |
+| `PATCH /api/rooms/:id/members` | `{room}`; `{addedIds?, removedIds?}`; 409 for an open room | `room.saved` to people added, `room.gone` plus a 4004 socket close for people removed |
+| `GET /api/rooms/:id/notified` | `{members, mentions}`; any member, DMs too | |
 | `DELETE /api/rooms/:id` | 204; administrators and the creator, any member for a DM | `room.gone`, sockets closed 4004 |
 | `PUT /api/sidebar/order` | `{favorites}` | `favorites.changed` to that person |
-| `PUT /api/account/room_order` | `{sharedOrder}`; administrators | `rooms.reordered` to everyone |
+| `PUT /api/account/room_order` | `{sharedOrder, sections}`; administrators; takes `sections: [{id, roomIds}]` | `rooms.reordered` to everyone |
+| `POST /api/account/sections`, `PATCH`, `DELETE /api/account/sections/:id` | 201 `{section}`, `{section}`, 204; administrators | `rooms.reordered`, to administrators for a new section and to everyone otherwise |
 | `DELETE /api/sidebar/invitation` | 204 | `invitation.dismissed` to that person |
 | `GET`, `PATCH /api/users/me/profile` | `{profile, transferId}` | `user.updated` to everyone |
 | `PUT`, `DELETE /api/users/me/avatar` | `{profile}` | `user.updated` to everyone |
+| `PUT /api/users/me/notifications-pause` | `{user}`; `{until}` is a time at most a week ahead, as `Date.toISOString()` writes it, or null to resume | `user.updated` to everyone |
 | `GET /api/users/:id` | `{person}`; administrators also get the email address and `transferId` | |
 | `POST`, `DELETE /api/users/:id/ban` | `{user}`; administrators | `user.updated`; a ban ends their sessions (close 4003) and deletes their messages |
 | `POST /api/session/transfers` | 201 `{user}` and a cookie; an empty 400 for any failure | |
@@ -120,6 +148,8 @@ Routes, messages, permissions and socket frames follow the real worker.
 | `POST /api/unfurl` | 200 preview, 204 none, 429 past 30 a minute | |
 
 The sidebar lists a person's rooms in the order they were put in them, then oldest first, as the real server does; clients put favourites first, then the shared order.
+
+The sidebar's `sections` are every section for an administrator, and for anyone else those with a room of theirs; the key is left out when there are none. A room's `section` is a section's id, null for none, or `{name}` for a new one, which only an administrator can make. There can be 100 sections, named in 1 to 100 characters, no two alike in any case.
 
 Banned people and bots can't sign in. A changed password replaces the shared seed password for that person.
 
@@ -148,6 +178,10 @@ The same are returned by `GET /mock/outbox` (mock only, no sign-in): `{resetCode
 - Room creation is never restricted to administrators.
 - The shared room order is one list for everyone, so `room_order` keeps ranks of rooms the administrator can't see.
 - A closed room made through the API holds only the listed people, as on the real server.
+- Room-wide mentions are never restricted to administrators, and guests are not told apart.
+- A room's `huddles` switch is checked and then ignored; there are no huddles.
+- A scheduled message that is sent brings no scripted reply or bot card.
+- A paused person is only marked as paused; nothing is notified either way.
 - Seeded invitation tokens are derived from the address; real ones are random.
 
 ## Not implemented

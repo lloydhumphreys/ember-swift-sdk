@@ -4,8 +4,9 @@ import Foundation
 /// anything the edit didn't touch.
 ///
 /// `text` is one line per block (list items and table cells are lines too), `<br>` is a line
-/// break, a mention reads as "@" and the person's name, and a link as its visible text. Images,
-/// files and previews read as nothing and are never removed by an edit.
+/// break, a mention reads as "@" and the person's name, a special mention as "@" and its name, a
+/// room mention as "#" and the room's name (or "private room"), and a link as its visible text.
+/// Images, files and previews read as nothing and are never removed by an edit.
 ///
 /// `body(editedTo:)` replaces only the smallest changed range of the body and keeps everything
 /// outside it byte for byte:
@@ -27,18 +28,21 @@ public struct EditableBody: Sendable {
     public let text: String
     let layout: Layout?
     private let mentionNames: [String: String]
+    private let roomNames: [String: String]
 
-    /// `mentionNames` maps a user id to the name a mention of them shows, as in `Message.mentions`.
-    /// The stored mention markup carries only the id.
-    public init(body: String, mentionNames: [String: String] = [:]) {
+    /// `mentionNames` maps a user id to the name a mention of them shows, as in `Message.mentions`,
+    /// and `roomNames` a room id to the name of a room the person editing is in. The stored mention
+    /// markup carries only the id. A room `roomNames` doesn't have reads as "private room".
+    public init(body: String, mentionNames: [String: String] = [:], roomNames: [String: String] = [:]) {
         self.body = body
         self.mentionNames = mentionNames
-        if let layout = try? Layout(body, mentionNames: mentionNames) {
+        self.roomNames = roomNames
+        if let layout = try? Layout(body, mentionNames: mentionNames, roomNames: roomNames) {
             self.layout = layout
             text = layout.units.map(\.text).joined()
         } else {
             layout = nil
-            text = Self.plainReading(body, mentionNames: mentionNames)
+            text = Self.plainReading(body, mentionNames: mentionNames, roomNames: roomNames)
         }
     }
 
@@ -72,19 +76,19 @@ public struct EditableBody: Sendable {
             guard let spliced = layout.splice(oldText: text, newText: newText) else { return nil }
             // Belt and braces: an edit that wouldn't read back as what was typed is not worth
             // keeping formatting for.
-            let check = EditableBody(body: spliced, mentionNames: mentionNames)
+            let check = EditableBody(body: spliced, mentionNames: mentionNames, roomNames: roomNames)
             guard check.layout != nil, check.text == Self.normalisedLineBreaks(newText) else { return nil }
             result = spliced
         }
-        return mentions.isEmpty ? result : Self.mentioning(mentions, in: result, names: mentionNames)
+        return mentions.isEmpty ? result : Self.mentioning(mentions, in: result, names: mentionNames, rooms: roomNames)
     }
 
     /// `body` with each "@" and name of someone in `mentions` that reads as plain text made a
     /// mention of them, or nil when the result wouldn't read back as it should.
-    private static func mentioning(_ mentions: [String: String], in body: String, names known: [String: String]) -> String? {
+    private static func mentioning(_ mentions: [String: String], in body: String, names known: [String: String], rooms: [String: String]) -> String? {
         // A mention of someone the body already mentions reads with the name it already has.
         let names = known.merging(mentions) { existing, _ in existing }
-        let reading = EditableBody(body: body, mentionNames: names)
+        let reading = EditableBody(body: body, mentionNames: names, roomNames: rooms)
         guard var layout = reading.layout else { return nil }
         let scalars = reading.text.unicodeScalars
         var expected = Array(scalars)
@@ -94,12 +98,12 @@ public struct EditableBody: Sendable {
             let start = scalars.distance(from: scalars.startIndex, to: match.range.lowerBound)
             let end = scalars.distance(from: scalars.startIndex, to: match.range.upperBound)
             guard let mentioned = layout.mentioning(start..<end, userId: match.userId) else { continue }
-            guard let next = try? Layout(mentioned, mentionNames: names) else { return nil }
+            guard let next = try? Layout(mentioned, mentionNames: names, roomNames: rooms) else { return nil }
             expected.replaceSubrange(start..<end, with: ("@" + (names[match.userId] ?? match.name)).unicodeScalars)
             result = mentioned
             layout = next
         }
-        let check = EditableBody(body: result, mentionNames: names)
+        let check = EditableBody(body: result, mentionNames: names, roomNames: rooms)
         guard check.layout != nil, check.text.unicodeScalars.elementsEqual(expected) else { return nil }
         return result
     }
@@ -111,34 +115,42 @@ public struct EditableBody: Sendable {
     // MARK: Fallback reading
 
     /// What a body the layout can't map reads as: the display model's text, one line per block.
-    private static func plainReading(_ body: String, mentionNames: [String: String]) -> String {
+    private static func plainReading(_ body: String, mentionNames: [String: String], roomNames: [String: String]) -> String {
         guard let root = try? HTMLTreeBuilder.parse(body) else { return "" }
         let blocks = DocumentConverter(host: "").blocks(from: root)
-        return lines(blocks, mentionNames).joined(separator: "\n")
+        return lines(blocks, mentionNames, roomNames).joined(separator: "\n")
     }
 
-    private static func lines(_ blocks: [RichBlock], _ names: [String: String]) -> [String] {
+    private static func lines(_ blocks: [RichBlock], _ names: [String: String], _ rooms: [String: String]) -> [String] {
         blocks.flatMap { block -> [String] in
             switch block {
-            case .paragraph(let inlines), .heading(_, let inlines): [string(inlines, names)]
+            case .paragraph(let inlines), .heading(_, let inlines): [string(inlines, names, rooms)]
             case .codeBlock(_, let code): [code]
-            case .quote(let inner): lines(inner, names)
-            case .list(_, _, let items): items.flatMap { lines($0, names) }
-            case .table(let header, let rows): ((header.map { [$0] } ?? []) + rows).flatMap { $0.map { string($0, names) } }
+            case .quote(let inner): lines(inner, names, rooms)
+            case .list(_, _, let items): items.flatMap { lines($0, names, rooms) }
+            case .table(let header, let rows): ((header.map { [$0] } ?? []) + rows).flatMap { $0.map { string($0, names, rooms) } }
             case .rule, .preview: []
             }
         }
     }
 
-    private static func string(_ inlines: [RichInline], _ names: [String: String]) -> String {
+    private static func string(_ inlines: [RichInline], _ names: [String: String], _ rooms: [String: String]) -> String {
         inlines.map { inline in
             switch inline {
             case .text(let text, _): text
-            case .link(_, let inner): string(inner, names)
+            case .link(_, let inner): string(inner, names, rooms)
             case .mention(let userId): "@" + (names[userId] ?? "")
+            case .specialMention(let name): "@" + name
+            case .roomMention(let roomId): roomReading(roomId, rooms)
             case .lineBreak: "\n"
             }
         }.joined()
+    }
+
+    /// What a mention of `roomId` reads as: "#" and the room's name, or "private room" for a room
+    /// `rooms` doesn't have (room-mentions.ts `roomMentionContent`).
+    static func roomReading(_ roomId: String, _ rooms: [String: String]) -> String {
+        rooms[roomId].map { "#" + $0 } ?? Composer.privateRoomName
     }
 }
 
@@ -188,11 +200,11 @@ struct Layout: Sendable {
     /// Images, files and other attachments that read as nothing: kept when an edit spans them.
     private(set) var keepers: [Range<Int>] = []
 
-    init(_ body: String, mentionNames: [String: String]) throws {
+    init(_ body: String, mentionNames: [String: String], roomNames: [String: String] = [:]) throws {
         source = Array(body.unicodeScalars)
         let tokens = try Self.tokenize(source)
         let (tokenElement, endToken) = try buildElements(tokens)
-        read(tokens, tokenElement: tokenElement, endToken: endToken, mentionNames: mentionNames)
+        read(tokens, tokenElement: tokenElement, endToken: endToken, mentionNames: mentionNames, roomNames: roomNames)
         var offset = 0
         for index in units.indices {
             units[index].textStart = offset
@@ -374,7 +386,7 @@ struct Layout: Sendable {
         var preContentStart: Int?
     }
 
-    private mutating func read(_ tokens: [Token], tokenElement: [Int: Int], endToken: [Int: Int], mentionNames: [String: String]) {
+    private mutating func read(_ tokens: [Token], tokenElement: [Int: Int], endToken: [Int: Int], mentionNames: [String: String], roomNames: [String: String]) {
         var reader = Reader()
         var index = 0
         while index < tokens.count {
@@ -391,8 +403,11 @@ struct Layout: Sendable {
                     emit(.lineBreak, "\n", range, &reader)
                 } else if name == PreviewReader.attachmentTag || inlineAtomTags.contains(name) || droppedTags.contains(name) || blockAtomTags.contains(name) {
                     if name == PreviewReader.attachmentTag, attributes["content-type"] == PreviewReader.mentionContentType {
-                        let name = attributes["sgid"].flatMap { mentionNames[$0] } ?? ""
+                        let sgid = attributes["sgid"] ?? ""
+                        let name = Composer.specialMentions.contains(sgid) ? sgid : mentionNames[sgid] ?? ""
                         emit(.mention, "@" + name, whole, &reader)
+                    } else if name == PreviewReader.attachmentTag, attributes["content-type"] == Composer.roomMentionContentType {
+                        emit(.mention, EditableBody.roomReading(attributes["sgid"] ?? "", roomNames), whole, &reader)
                     } else if blockAtomTags.contains(name) {
                         boundary(whole, &reader)
                     } else if !droppedTags.contains(name) {

@@ -97,6 +97,26 @@ public struct Timeline: Equatable, Sendable {
     public private(set) var messages: [Message] = []
     /// Sent, not yet confirmed, oldest first.
     public private(set) var pending: [PendingMessage] = []
+    /// Messages only you see in the room's own timeline, oldest first, as the room last sent them:
+    /// they're gone once it stops. Each shows after the messages created before it and before
+    /// anything pending, apart from the messages around it, marked "Only visible to you", and not at
+    /// all while `hasNewer`. Its cards' buttons are clicked like any message's
+    /// (`RoomSession.click(_:on:)` with its `id`); it can't be replied to, boosted, edited or linked.
+    public private(set) var ephemeral: [EphemeralMessage] = []
+    /// The messages you've scheduled in the room, replies included, soonest first, as the room last
+    /// listed them. One with a `failure` wasn't sent and waits to be sent again, changed or deleted.
+    public private(set) var scheduled: [ScheduledMessage] = []
+    /// The scheduled messages the room's composer lists: those to the room, and any reply whose
+    /// thread's message has been deleted.
+    public var scheduledForRoom: [ScheduledMessage] {
+        scheduled.filter { $0.parentId == nil || $0.failure == ScheduledMessage.threadDeleted }
+    }
+
+    /// The scheduled replies the composer of the thread under `parentId` lists.
+    public func scheduled(in parentId: MessageID) -> [ScheduledMessage] {
+        scheduled.filter { $0.parentId == parentId }
+    }
+
     /// Whether older pages exist.
     public private(set) var hasMore = false
     /// Whether the timeline stops short of the room's latest message, after a jump or a cut.
@@ -114,7 +134,8 @@ public struct Timeline: Equatable, Sendable {
     public private(set) var present: [User] = []
     /// Others typing in the room's composer, not in threads.
     public private(set) var typing: [User] = []
-    /// How many messages came in while `hasNewer` held them back, for a "new messages" button.
+    /// How many messages came in while `hasNewer` held them back, those only you see included, for
+    /// a "new messages" button.
     public private(set) var arrivals = 0
     /// Why the page before the oldest message didn't load, or nil. Until a retry
     /// (`RoomSession.retryOlder()`), a page that loads, or the next connection, no older page is asked
@@ -146,8 +167,10 @@ public struct Timeline: Equatable, Sendable {
     /// (re)connect, and the pending messages a `message.checked` says the room never got.
     package mutating func apply(_ frame: ServerFrame) -> [ClientFrame] {
         switch frame {
-        case let .welcome(you, present, seq, page):
+        case let .welcome(you, present, seq, page, ephemeral, scheduled):
             me = you
+            self.ephemeral = ephemeral
+            self.scheduled = scheduled
             if isLoaded, page.around == nil {
                 reconnect(to: page)
             } else {
@@ -158,8 +181,10 @@ public struct Timeline: Equatable, Sendable {
             settle()
             return checks()
 
-        case let .resumed(you, changed, deletedIds, present, seq):
+        case let .resumed(you, changed, deletedIds, present, seq, ephemeral, scheduled):
             me = you
+            self.ephemeral = ephemeral
+            self.scheduled = scheduled
             // Something newer than a window that stops short of the latest counts once, as the web does.
             let known = Set(messages.map(\.id))
             let newest = messages.last?.id ?? newestId
@@ -295,7 +320,20 @@ public struct Timeline: Equatable, Sendable {
         case .threadOpened, .threadHistory:
             break
 
-        case let .error(text, clientMessageId, clientMessageIds, _, failed, rewrite):
+        case let .messageEphemeral(message):
+            // One in a thread is its thread's.
+            guard message.parentId == nil else { return [] }
+            if let index = ephemeral.firstIndex(where: { $0.id == message.id }) {
+                ephemeral[index] = message
+            } else {
+                ephemeral.append(message)
+                if hasNewer { arrivals += 1 }
+            }
+
+        case let .scheduled(messages, _):
+            scheduled = messages
+
+        case let .error(text, clientMessageId, clientMessageIds, _, _, failed, rewrite):
             switch failed {
             case "history.before":
                 isLoadingOlder = false
@@ -304,7 +342,7 @@ public struct Timeline: Equatable, Sendable {
                 isLoadingNewer = false
                 newerPageFailure = text
             case "history.around": isLoadingPage = false
-            case "thread.open", "thread.before": return []
+            case "thread.open", "thread.before", "scheduled.edit": return []
             default: break
             }
             let ids = Set(clientMessageIds ?? clientMessageId.map { [$0] } ?? [])

@@ -248,7 +248,7 @@ const tracked = async (pathAndQuery, options) => {
   sockets.push(client);
   return client;
 };
-const roomSocket = (roomId, cookie, query = "visible=1&protocol=4") => tracked(`/api/rooms/${roomId}/socket?${query}`, { cookie });
+const roomSocket = (roomId, cookie, query = "visible=1&protocol=5") => tracked(`/api/rooms/${roomId}/socket?${query}`, { cookie });
 
 // The checks
 
@@ -344,6 +344,26 @@ await check("the sidebar lists rooms, DMs, favourites and unread marks", async (
   expectStatus(await request("GET", "/api/sidebar"), 401);
 });
 
+await check("the sidebar's sections: every one for an administrator, and for anyone else those with a room of theirs", async () => {
+  const names = (side) => (side.sections ?? []).map((section) => section.name).join();
+  expect(names(sidebar) === "Product,Company", `Maya's sections were ${names(sidebar)}`);
+  const [product, company] = sidebar.sections;
+  expect(sidebar.sections.every((section) => Object.keys(section).join() === "id,name,roomIds" && /^[0-9a-z]{16}$/.test(section.id)), "a section has an id, a name and its rooms");
+  expect([...product.roomIds].sort().join() === [state.rooms.Launch, state.rooms.Design].sort().join(), "Product has Launch and Design");
+  expect(company.roomIds.join() === state.rooms.Leadership, "Company has Leadership");
+  state.sections = { product: product.id, company: company.id };
+  expect(names((await request("GET", "/api/sidebar", { cookie: state.sam })).json) === "Product,Company", "Sam is in Leadership, so has both");
+  expect(names((await request("GET", "/api/sidebar", { cookie: state.leo })).json) === "Product", "Leo isn't, so hasn't Company");
+  expect(sidebar.rooms.every((room) => !("channelMentions" in room)), "no seeded room has room-wide mentions off");
+});
+
+await check("the account says who may notify a whole room, and whether to ask first", async () => {
+  const says = (account) => account?.restrictChannelMentions === false && account.restrictEveryoneMention === false && account.warnBeforeNotifying === true;
+  expect(says((await request("GET", "/api/bootstrap", { cookie: state.maya })).json.account), "the bootstrap's account has the three switches");
+  const socket = await tracked("/api/socket", { cookie: state.maya });
+  expect(says((await socket.nextOfType("welcome")).account), "and so has the workspace socket's welcome");
+});
+
 await check("users lists the directory, with the assistant", async () => {
   const res = await request("GET", "/api/users", { cookie: state.maya });
   expectStatus(res, 200);
@@ -437,11 +457,11 @@ await check("the workspace socket welcomes, pongs, and refuses the wrong origin 
 });
 
 await check("a room socket refuses the wrong origin, no cookie and a bad id, and closes 4004 for a stranger", async () => {
-  const path = `/api/rooms/${state.rooms.Launch}/socket?visible=1&protocol=4`;
+  const path = `/api/rooms/${state.rooms.Launch}/socket?visible=1&protocol=5`;
   expect((await openSocket(path, { cookie: state.maya, originHeader: "http://evil.example" })).status === 404, "a foreign origin is 404");
   expect((await openSocket(path)).status === 401, "no cookie is 401");
-  expect((await openSocket("/api/rooms/Bad_Id/socket?visible=1&protocol=4", { cookie: state.maya })).status === 404, "a bad room id is 404");
-  const stranger = await connect(`/api/rooms/${state.rooms.Leadership}/socket?visible=1&protocol=4`, { cookie: state.leo });
+  expect((await openSocket("/api/rooms/Bad_Id/socket?visible=1&protocol=5", { cookie: state.maya })).status === 404, "a bad room id is 404");
+  const stranger = await connect(`/api/rooms/${state.rooms.Leadership}/socket?visible=1&protocol=5`, { cookie: state.leo });
   const close = await stranger.whenClosed();
   expect(close.code === 4004, `expected close 4004, got ${close.code}`);
 });
@@ -572,7 +592,7 @@ await check("since resumes with what changed, and ping gets a pong", async () =>
   const clientMessageId = `check-${randomBytes(4).toString("hex")}`;
   maya.send({ type: "message.create", clientMessageId, body: "<p>While you were away</p>" });
   await maya.next((frame) => frame.type === "message.created" && frame.message.clientMessageId === clientMessageId, "created");
-  const again = await roomSocket(state.rooms.Launch, state.sam, `visible=1&protocol=4&since=${first.seq}`);
+  const again = await roomSocket(state.rooms.Launch, state.sam, `visible=1&protocol=5&since=${first.seq}`);
   const resumed = await again.nextOfType("resumed");
   expect(resumed.messages.some((message) => message.clientMessageId === clientMessageId) && resumed.seq > first.seq, "resumed has the new message and a later seq");
   expect(Array.isArray(resumed.deletedIds) && resumed.you.id !== undefined, "resumed has deletedIds and you");
@@ -580,7 +600,7 @@ await check("since resumes with what changed, and ping gets a pong", async () =>
   await again.nextOfType("pong");
   again.sendRaw("{not json");
   expect((await again.nextOfType("error")).message === "Unrecognized frame", "an unreadable frame is an error");
-  const ahead = await roomSocket(state.rooms.Launch, state.sam, "visible=1&protocol=4&since=999999");
+  const ahead = await roomSocket(state.rooms.Launch, state.sam, "visible=1&protocol=5&since=999999");
   await ahead.nextOfType("welcome");
 });
 
@@ -652,7 +672,7 @@ await check("a thread opens with its replies", async () => {
   expect(opened.parent?.id === parent.id && opened.messages.length === parent.thread.count && opened.messages.every((message) => message.parentId === parent.id), "the thread's replies");
 });
 
-await check("an outdated protocol is warned, and refused creates and edits", async () => {
+await check("an outdated protocol is warned, and refused creates, edits and scheduling", async () => {
   const fresh = await roomSocket(state.rooms.Launch, state.maya);
   await fresh.nextOfType("welcome");
   const own = `check-${randomBytes(4).toString("hex")}`;
@@ -667,6 +687,15 @@ await check("an outdated protocol is warned, and refused creates and edits", asy
   old.send({ type: "message.update", messageId: message.id, body: "<p>Changed</p>" });
   const refusedEdit = await old.nextOfType("error");
   expect(refusedEdit.failed === "message.update" && refusedEdit.message === warning.message, "update is refused");
+  old.send({ type: "message.schedule", clientMessageId: "check-old-later", body: "<p>Late</p>", sendAt: new Date(Date.now() + 3600000).toISOString() });
+  const refusedSchedule = await old.nextOfType("error");
+  expect(refusedSchedule.failed === "message.schedule" && refusedSchedule.clientMessageId === "check-old-later" && refusedSchedule.message === warning.message, "scheduling is refused with its id");
+  old.send({ type: "scheduled.edit", scheduledId: "check-old-scheduled", body: "<p>Changed</p>" });
+  const refusedScheduledEdit = await old.nextOfType("error");
+  expect(refusedScheduledEdit.failed === "scheduled.edit" && refusedScheduledEdit.scheduledId === "check-old-scheduled" && refusedScheduledEdit.message === warning.message, "and so is editing a scheduled message, with its id");
+  expect(await old.quiet((frame) => frame.type === "scheduled", 200), "with no list before it");
+  const older = await roomSocket(state.rooms.Launch, state.maya, "visible=1&protocol=4");
+  expect((await older.nextOfType("error")).message === warning.message, "the protocol before this one is warned too");
   expect(await fresh.quiet((frame) => frame.type === "message.created" || frame.type === "message.updated", 300), "nothing was stored");
 });
 
@@ -703,9 +732,9 @@ await check("room ids follow the real pattern", async () => {
   expectStatus(await request("PUT", "/api/rooms/some-room-1/favorite", { cookie: state.maya, body: { favorite: true } }), 403);
   expectStatus(await request("PUT", "/api/rooms/Bad_Room/favorite", { cookie: state.maya, body: { favorite: true } }), 400);
   expectStatus(await request("PUT", "/api/rooms/-nope/favorite", { cookie: state.maya, body: { favorite: true } }), 400);
-  const stranger = await connect("/api/rooms/some-room-1/socket?visible=1&protocol=4", { cookie: state.maya });
+  const stranger = await connect("/api/rooms/some-room-1/socket?visible=1&protocol=5", { cookie: state.maya });
   expect((await stranger.whenClosed()).code === 4004, "an unknown but well-formed room closes 4004");
-  expect((await openSocket("/api/rooms/Bad_Room/socket?visible=1&protocol=4", { cookie: state.maya })).status === 404, "a malformed id is 404");
+  expect((await openSocket("/api/rooms/Bad_Room/socket?visible=1&protocol=5", { cookie: state.maya })).status === 404, "a malformed id is 404");
 });
 
 // Threads, as the real server keeps them
@@ -800,16 +829,16 @@ await check("since leaves out thread-only replies but sends their parent, and fa
   const parent = await post(maya, "<p>Resume me</p>");
   const quiet = await reply(maya, parent, "<p>thread only</p>");
   const loud = await reply(maya, parent, "<p>also sent</p>", { alsoSend: true });
-  const resumed = await (await roomSocket(state.rooms.Engineering, state.leo, `visible=1&protocol=4&since=${first.seq}`)).nextOfType("resumed");
+  const resumed = await (await roomSocket(state.rooms.Engineering, state.leo, `visible=1&protocol=5&since=${first.seq}`)).nextOfType("resumed");
   const ids = resumed.messages.map((message) => message.id);
   expect(ids.includes(parent.id) && ids.includes(loud.id) && !ids.includes(quiet.id), "the parent and the also-sent reply, not the thread-only one");
   expect(ids.every((id, index) => index === 0 || ids[index - 1] < id), "sorted by id");
   const start = (await (await roomSocket(state.rooms.Engineering, state.leo)).nextOfType("welcome")).seq;
   for (let i = 0; i < 101; i++) maya.send({ type: "message.create", clientMessageId: `check-bulk-${randomBytes(4).toString("hex")}`, body: `<p>bulk ${i}</p>` });
   await maya.next((frame) => frame.type === "message.created" && frame.message.plainText === "bulk 100", "the last bulk message", 8000);
-  const edge = await roomSocket(state.rooms.Engineering, state.leo, `visible=1&protocol=4&since=${start + 1}`);
+  const edge = await roomSocket(state.rooms.Engineering, state.leo, `visible=1&protocol=5&since=${start + 1}`);
   expect((await edge.next((frame) => frame.type === "resumed" || frame.type === "welcome", "a resume")).type === "resumed", "100 changes behind still resumes");
-  const far = await roomSocket(state.rooms.Engineering, state.leo, `visible=1&protocol=4&since=${start}`);
+  const far = await roomSocket(state.rooms.Engineering, state.leo, `visible=1&protocol=5&since=${start}`);
   expect((await far.next((frame) => frame.type === "resumed" || frame.type === "welcome", "a welcome")).type === "welcome", "101 changes behind gets a welcome");
 });
 
@@ -1499,7 +1528,7 @@ await check("a bot posts a file as a multipart attachment", async () => {
   const id = permalinkId(res);
   expect(id, "a permalink");
   const welcome = await (async () => {
-    const socket = await roomSocket(state.rooms.Engineering, state.leo, `visible=1&protocol=4&around=${id}`);
+    const socket = await roomSocket(state.rooms.Engineering, state.leo, `visible=1&protocol=5&around=${id}`);
     return socket.nextOfType("welcome");
   })();
   const message = welcome.messages.find((candidate) => candidate.id === id);
@@ -1767,6 +1796,561 @@ await check("an administrator puts rooms in order for everyone, and everyone is 
   expect(cleared.status === 200 && cleared.json.sharedOrder.length === 0, "an empty list clears the order");
   await maya.nextOfType("rooms.reordered");
   expect((await request("GET", "/api/sidebar", { cookie: state.sam })).json.sharedOrder.length === 0, "and Sam sees none");
+});
+
+// Sections, room-wide mentions, scheduled messages, messages only one person sees, and pausing notifications
+
+const mention = (sgid) => `<action-text-attachment content-type="application/vnd.campfire.mention" sgid="${sgid}"></action-text-attachment>`;
+const roomMention = (roomId) => `<action-text-attachment content-type="application/vnd.campfire.room" sgid="${roomId}"></action-text-attachment>`;
+const sidebarOf = async (cookie) => (await request("GET", "/api/sidebar", { cookie })).json;
+const sectionsOf = async (cookie) => (await sidebarOf(cookie)).sections ?? [];
+const sectionNames = (sections) => sections.map((section) => section.name).join();
+const sorted = (ids) => [...ids].sort().join();
+const reordered = noFrame("rooms.reordered");
+const isUuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+/// Expects a refusal: this status, with this message.
+const refusedWith = (res, status, error) => expect(res.status === status && res.json?.error === error, `expected ${status} "${error}", got ${res.status} "${res.json?.error}"`);
+const SECTIONS_FORBIDDEN = "Only administrators can make, rename and delete sections";
+const SECTION_NAME_REFUSED = "Section name must be 1 to 100 characters";
+const SECTION_NOT_FOUND = "Section not found";
+const ROOM_NOT_FOUND = "Room not found or inaccessible";
+
+await check("sections: an administrator makes, renames and deletes them, and what is refused", async () => {
+  const maya = await workspaceSocket(state.maya);
+  const sam = await workspaceSocket(state.sam);
+  const taken = "There's a section with that name already";
+  const seeded = `/api/account/sections/${state.sections.product}`;
+  expectStatus(await request("POST", "/api/account/sections", { body: { name: "x" } }), 401);
+  expectStatus(await request("PATCH", seeded, { body: { name: "x" } }), 401);
+  expectStatus(await request("DELETE", seeded), 401);
+  refusedWith(await request("POST", "/api/account/sections", { cookie: state.sam, body: { name: "" } }), 403, SECTIONS_FORBIDDEN);
+  refusedWith(await request("PATCH", seeded, { cookie: state.sam, body: { name: "Mine" } }), 403, SECTIONS_FORBIDDEN);
+  refusedWith(await request("DELETE", seeded, { cookie: state.sam }), 403, SECTIONS_FORBIDDEN);
+
+  const made = await request("POST", "/api/account/sections", { cookie: state.maya, body: { name: "  Check Section  " } });
+  expectStatus(made, 201);
+  const section = made.json.section;
+  expect(/^[0-9a-z]{16}$/.test(section.id) && section.name === "Check Section" && Object.keys(section).join() === "id,name", "the section as saved, its name trimmed");
+  await maya.next(reordered, "rooms.reordered for an administrator");
+  expect(await sam.quiet(reordered, 300), "a member isn't told of a section with no rooms");
+  const mayas = await sectionsOf(state.maya);
+  expect(mayas.at(-1).id === section.id && mayas.at(-1).roomIds.length === 0, "an administrator's sidebar lists it last, empty");
+  expect(!(await sectionsOf(state.sam)).some((other) => other.id === section.id), "a member's doesn't");
+  const form = (await request("GET", "/api/rooms/new", { cookie: state.leo })).json;
+  expect(form.sections.some((option) => option.id === section.id && option.rooms === 0), "New room offers it to everyone");
+  for (const name of ["", "   ", "x".repeat(101), undefined, 5]) refusedWith(await request("POST", "/api/account/sections", { cookie: state.maya, body: { name } }), 422, SECTION_NAME_REFUSED);
+  refusedWith(await request("POST", "/api/account/sections", { cookie: state.maya, body: { name: "check SECTION" } }), 409, taken);
+
+  const path = `/api/account/sections/${section.id}`;
+  const rename = (name, target = path) => request("PATCH", target, { cookie: state.maya, body: { name } });
+  refusedWith(await rename("Other", "/api/account/sections/no-such-section"), 404, SECTION_NOT_FOUND);
+  refusedWith(await rename("Other", "/api/account/sections/Bad%20Id"), 404, SECTION_NOT_FOUND);
+  refusedWith(await rename("product"), 409, taken);
+  refusedWith(await rename(""), 422, SECTION_NAME_REFUSED);
+  const renamed = await rename("CHECK section");
+  expect(renamed.status === 200 && renamed.json.section.id === section.id && renamed.json.section.name === "CHECK section", "its own name in another case is fine");
+  for (const client of [maya, sam]) await client.next(reordered, "rooms.reordered once renamed");
+  expectStatus(await rename("CHECK section"), 200);
+  expect(await maya.quiet(reordered, 300), "the same name again tells nobody");
+
+  const count = (await sectionsOf(state.maya)).length;
+  const extra = [];
+  for (let n = count; n < 100; n += 1) extra.push((await request("POST", "/api/account/sections", { cookie: state.maya, body: { name: `Check ${n}` } })).json.section.id);
+  const full = "There can be at most 100 sections";
+  refusedWith(await request("POST", "/api/account/sections", { cookie: state.maya, body: { name: "One too many" } }), 422, full);
+  refusedWith(await request("POST", "/api/rooms", { cookie: state.maya, body: { kind: "open", name: "Check Full", section: { name: "One too many" } } }), 422, full);
+  for (const id of extra) expectStatus(await request("DELETE", `/api/account/sections/${id}`, { cookie: state.maya }), 204);
+
+  // New sockets, so the hundred changes above aren't mistaken for the last one's.
+  const mayaAfter = await workspaceSocket(state.maya);
+  const samAfter = await workspaceSocket(state.sam);
+  refusedWith(await request("DELETE", "/api/account/sections/no-such-section", { cookie: state.maya }), 404, SECTION_NOT_FOUND);
+  expectStatus(await request("DELETE", path, { cookie: state.maya }), 204);
+  for (const client of [mayaAfter, samAfter]) await client.next(reordered, "rooms.reordered once deleted");
+  expect(sectionNames(await sectionsOf(state.maya)) === "Product,Company", "the seeded two are left");
+});
+
+await check("an administrator's layout orders the sections and places rooms in them, and everyone is told", async () => {
+  const maya = await workspaceSocket(state.maya);
+  const sam = await workspaceSocket(state.sam);
+  const { product, company } = state.sections;
+  const { Support, Design, Launch, Leadership } = state.rooms;
+  const put = (cookie, body) => request("PUT", "/api/account/room_order", { cookie, body });
+  const roomIds = [Support, Design, Launch, Leadership];
+  const done = await put(state.maya, { roomIds, sections: [{ id: company, roomIds: [Leadership, Support] }, { id: product, roomIds: [Launch] }] });
+  expectStatus(done, 200);
+  expect(Object.keys(done.json).join() === "sharedOrder,sections" && done.json.sharedOrder.join() === roomIds.join(), "the order comes back");
+  expect(sectionNames(done.json.sections) === "Company,Product", "the sections in the order sent");
+  expect(sorted(done.json.sections[0].roomIds) === sorted([Leadership, Support]) && done.json.sections[1].roomIds.join() === Launch, "each with its rooms, and Design in none");
+  for (const client of [maya, sam]) expect(Object.keys(await client.next(reordered, "rooms.reordered")).join() === "type", "a frame with no payload");
+  const sams = await sectionsOf(state.sam);
+  expect(sectionNames(sams) === "Company,Product" && sorted(sams[0].roomIds) === sorted([Leadership, Support]), "Sam's sidebar has it");
+  const leos = await sectionsOf(state.leo);
+  expect(sectionNames(leos) === "Company,Product" && leos[0].roomIds.join() === Support, "Leo has Company now, for Support");
+
+  const kept = await put(state.maya, { roomIds: [Design, Support] });
+  expect(kept.status === 200 && sectionNames(kept.json.sections) === "Company,Product" && sorted(kept.json.sections[0].roomIds) === sorted([Leadership, Support]), "an order without sections leaves them as they were");
+  const partly = await put(state.maya, { roomIds: [Support, Launch], sections: [{ id: product, roomIds: [Support] }] });
+  expect(partly.status === 200 && sectionNames(partly.json.sections) === "Product,Company", "a section the layout lists comes first");
+  expect(partly.json.sections[0].roomIds.length === 0 && sorted(partly.json.sections[1].roomIds) === sorted([Leadership, Support]), "a room leaves a listed section that doesn't list it, and stays in one the layout doesn't list");
+  const unknown = await put(state.maya, { roomIds: [Design], sections: [{ id: "no-such-section", roomIds: [Design] }] });
+  expect(unknown.status === 200 && unknown.json.sections.every((section) => !section.roomIds.includes(Design)), "a room put in a section that isn't there stays where it was");
+
+  const refused = "sections must be at most 100 sections, each named once by its id, with rooms from roomIds, none in two";
+  const bad = [
+    "all",
+    [{ id: product }],
+    [{ id: product, roomIds: [] }, { id: product, roomIds: [] }],
+    [{ id: product, roomIds: [Leadership] }],
+    [{ id: product, roomIds: [Design] }, { id: company, roomIds: [Design] }],
+    [{ id: "Bad Id", roomIds: [] }],
+    Array.from({ length: 101 }, (_, n) => ({ id: `section-${n}`, roomIds: [] })),
+  ];
+  for (const sections of bad) refusedWith(await put(state.maya, { roomIds: [Design], sections }), 400, refused);
+  refusedWith(await put(state.sam, { roomIds: "x", sections: "all" }), 403, "Only administrators can put rooms in order for everyone, and only the rooms in their sidebar");
+
+  const restored = await put(state.maya, { roomIds: [Launch, Design, Leadership, Support], sections: [{ id: product, roomIds: [Launch, Design] }, { id: company, roomIds: [Leadership] }] });
+  expect(restored.status === 200 && sectionNames(restored.json.sections) === "Product,Company", "back as seeded");
+  expect(sorted(restored.json.sections[0].roomIds) === sorted([Launch, Design]) && restored.json.sections[1].roomIds.join() === Leadership, "with the seeded rooms");
+  const cleared = await put(state.maya, { roomIds: [] });
+  expect(cleared.status === 200 && cleared.json.sharedOrder.length === 0 && sectionNames(cleared.json.sections) === "Product,Company", "clearing the order leaves the sections");
+  expect(sectionNames(await sectionsOf(state.leo)) === "Product", "and Leo has only Product again");
+});
+
+await check("a room goes in a section when it's made or changed, and room.saved says where", async () => {
+  const sam = await workspaceSocket(state.sam);
+  const leo = await workspaceSocket(state.leo);
+  const { product, company } = state.sections;
+  const form = (await request("GET", "/api/rooms/new", { cookie: state.leo })).json;
+  expect(form.sections.map((option) => `${option.name}:${option.rooms}`).join() === "Product:2,Company:0", "New room offers every section, with how many of the asker's rooms are in it");
+  expect(form.sections.every((option) => Object.keys(option).join() === "id,name,rooms"), "an option has an id, a name and a count");
+  refusedWith(await request("POST", "/api/rooms", { cookie: state.sam, body: { kind: "open", name: "Check Placed", section: { name: "Brand New" } } }), 403, SECTIONS_FORBIDDEN);
+  refusedWith(await request("POST", "/api/rooms", { cookie: state.sam, body: { kind: "open", name: "Check Placed", section: "no-such-section" } }), 422, SECTION_NOT_FOUND);
+  const made = await request("POST", "/api/rooms", { cookie: state.sam, body: { kind: "open", name: "Check Placed", section: product } });
+  expectStatus(made, 201);
+  const room = made.json.room;
+  expect(!("section" in room) && !("channelMentions" in room), "the room itself says nothing of its section");
+  const saved = (client) => client.next((frame) => frame.type === "room.saved" && frame.room.id === room.id, "room.saved");
+  const first = await saved(leo);
+  expect(first.section?.id === product && first.section.name === "Product" && Object.keys(first.section).join() === "id,name", "room.saved carries the section");
+  await saved(sam);
+  expect((await sectionsOf(state.leo)).find((section) => section.id === product).roomIds.includes(room.id), "the sidebar has it there");
+
+  const path = `/api/rooms/${room.id}`;
+  const settings = async (cookie) => (await request("GET", `${path}/settings`, { cookie })).json;
+  const sams = await settings(state.sam);
+  expect(sams.section?.id === product && sams.section.name === "Product", "its settings say its section");
+  expect(sams.sections.map((option) => `${option.name}:${option.rooms}`).join() === "Product:3,Company:1", "and offer every section to someone who can change it");
+  expect(sams.canAdminister === true && sams.canChangeHuddles === false && sams.canChangeChannelMentions === false, "its creator can change it, but not its huddles or room-wide mentions");
+  const mayas = await settings(state.maya);
+  expect(mayas.canChangeHuddles === true && mayas.canChangeChannelMentions === true, "an administrator can");
+  const leos = await settings(state.leo);
+  expect(leos.canAdminister === false && leos.section?.id === product && Array.isArray(leos.sections) && leos.sections.length === 0, "someone who can't change it sees its section and is offered none");
+
+  const patch = (cookie, body) => request("PATCH", path, { cookie, body });
+  expectStatus(await patch(state.sam, { section: { name: "company" } }), 200);
+  expect((await saved(leo)).section?.id === company, "a name in any case picks the section there is");
+  await saved(sam);
+  refusedWith(await patch(state.sam, { section: { name: "Brand New" } }), 403, SECTIONS_FORBIDDEN);
+  refusedWith(await patch(state.sam, { section: "no-such-section" }), 422, SECTION_NOT_FOUND);
+  const choiceRefused = "Section must be a section's id, null for none, or a new section's name";
+  refusedWith(await patch(state.sam, { section: 5 }), 422, choiceRefused);
+  refusedWith(await patch(state.sam, { section: "Bad Id" }), 422, choiceRefused);
+  refusedWith(await patch(state.sam, { section: { name: "  " } }), 422, SECTION_NAME_REFUSED);
+  refusedWith(await patch(state.sam, { section: { name: "x".repeat(101) } }), 422, SECTION_NAME_REFUSED);
+  expectStatus(await patch(state.maya, { section: { name: "Brand New" } }), 200);
+  const inNew = await saved(leo);
+  expect(inNew.section?.name === "Brand New" && /^[0-9a-z]{16}$/.test(inNew.section.id), "an administrator's new name makes the section");
+  await saved(sam);
+  expectStatus(await patch(state.sam, { name: "Check Placed Again" }), 200);
+  const renamed = await saved(leo);
+  expect(renamed.room.name === "Check Placed Again" && renamed.section?.id === inNew.section.id, "a change to a room in a section says its section again");
+  await saved(sam);
+  expectStatus(await patch(state.sam, { section: null }), 200);
+  const out = await saved(leo);
+  expect("section" in out && out.section === null, "leaving a section says null");
+  await saved(sam);
+  expectStatus(await patch(state.sam, { name: "Check Placed" }), 200);
+  expect(!("section" in (await saved(leo))), "and a later change says nothing of sections");
+  expect((await settings(state.sam)).section === null, "its settings say none");
+  expectStatus(await request("DELETE", path, { cookie: state.sam }), 204);
+  expectStatus(await request("DELETE", `/api/account/sections/${inNew.section.id}`, { cookie: state.maya }), 204);
+});
+
+await check("people are put in a closed room and taken out of it, without sending who stays", async () => {
+  const people = await directory();
+  const sam = await workspaceSocket(state.sam);
+  const leo = await workspaceSocket(state.leo);
+  const tomas = await workspaceSocket(state.tomas);
+  const made = await request("POST", "/api/rooms", { cookie: state.sam, body: { kind: "closed", name: "Check People", memberIds: [people.sam.id, people.leo.id] } });
+  expectStatus(made, 201);
+  const room = made.json.room.id;
+  const path = `/api/rooms/${room}/members`;
+  const change = (cookie, body, target = path) => request("PATCH", target, { cookie, body });
+  expectStatus(await request("PATCH", path, { body: {} }), 401);
+  refusedWith(await change(state.leo, { addedIds: [people.tomas.id] }), 403, "Only administrators and the room's creator can change it");
+  refusedWith(await change(state.tomas, {}), 404, ROOM_NOT_FOUND);
+  refusedWith(await change(state.maya, {}), 404, ROOM_NOT_FOUND);
+  refusedWith(await change(state.sam, {}, `/api/rooms/${state.samDm}/members`), 404, ROOM_NOT_FOUND);
+  refusedWith(await change(state.sam, {}, "/api/rooms/no-such-room/members"), 404, ROOM_NOT_FOUND);
+  const membersRefused = "Members must be a list of at most 1000 user ids";
+  refusedWith(await change(state.sam, { addedIds: "everyone" }), 422, membersRefused);
+  refusedWith(await change(state.sam, { removedIds: [5] }), 422, membersRefused);
+  refusedWith(await change(state.sam, { addedIds: Array.from({ length: 1001 }, (_, n) => `unknown${n}`) }), 422, membersRefused);
+  refusedWith(await change(state.sam, { addedIds: [people.leo.id], removedIds: [people.leo.id] }), 422, "Nobody can be put in a room and taken out of it at once");
+  refusedWith(await change(state.maya, { addedIds: [people.leo.id] }, `/api/rooms/${state.rooms.Support}/members`), 409, "Everyone is in an open room, so nobody can be put in it or taken out");
+
+  const about = (type) => (frame) => frame.type === type && (frame.room?.id ?? frame.roomId) === room;
+  await sam.next(about("room.saved"), "room.saved for the new room");
+  await leo.next(about("room.saved"), "room.saved for the new room");
+  const changed = await change(state.sam, { addedIds: [people.tomas.id, "nobody-has-this-id"], removedIds: [people.leo.id] });
+  expectStatus(changed, 200);
+  expect(changed.json.room.id === room && changed.json.room.kind === "closed" && changed.json.room.name === "Check People", "the room comes back");
+  expect((await tomas.next(about("room.saved"), "room.saved for whoever was put in")).room.id === room, "whoever was put in hears of the room");
+  await leo.next(about("room.gone"), "room.gone for whoever was taken out");
+  expect(await sam.quiet(about("room.saved"), 300), "whoever stays hears nothing, the room being as it was");
+  const members = (await request("GET", `/api/rooms/${room}/settings`, { cookie: state.sam })).json.people.filter((person) => person.member).map((person) => person.id);
+  expect(sorted(members) === sorted([people.sam.id, people.tomas.id]), "its settings list who is in it now");
+  expectStatus(await change(state.sam, {}), 200);
+  expect(await tomas.quiet(about("room.saved"), 300), "an empty change tells nobody");
+  expectStatus(await request("DELETE", `/api/rooms/${room}`, { cookie: state.sam }), 204);
+});
+
+await check("a room says how many people a room-wide mention would notify", async () => {
+  await workspaceSocket(state.sam);
+  const path = (room) => `/api/rooms/${encodeURIComponent(room)}/notified`;
+  expectStatus(await request("GET", path(state.rooms.Support)), 401);
+  const open = await request("GET", path(state.rooms.Support), { cookie: state.maya });
+  expectStatus(open, 200);
+  const { members, mentions } = open.json;
+  expect(Object.keys(open.json).join() === "members,mentions" && Object.keys(mentions).join() === "here,channel,everyone", "an open room allows all three");
+  expect(members === mentions.channel + 1 && mentions.everyone === mentions.channel, "@channel and @everyone reach everyone else in it");
+  expect(mentions.here >= 1 && mentions.here <= mentions.channel, "@here reaches those of them who are active now");
+  const closed = (await request("GET", path(state.closedRoom), { cookie: state.sam })).json;
+  expect(Object.keys(closed.mentions).join() === "here,channel" && closed.members === closed.mentions.channel + 1, "a closed room hasn't @everyone");
+  const direct = (await request("GET", path(state.samDm), { cookie: state.sam })).json;
+  expect(direct.members === 2 && Object.keys(direct.mentions).length === 0, "and a DM has none");
+  for (const [cookie, id] of [[state.maya, state.closedRoom], [state.sam, "no-such-room"], [state.sam, "Bad Id"]]) refusedWith(await request("GET", path(id), { cookie }), 404, ROOM_NOT_FOUND);
+});
+
+await check("@here, @channel and @everyone notify a room, and count for the people they reach", async () => {
+  const made = await request("POST", "/api/rooms", { cookie: state.maya, body: { kind: "open", name: "Check Mentions" } });
+  expectStatus(made, 201);
+  const room = made.json.room.id;
+  const people = await directory();
+  const jordanCookie = await signIn("jordan@example.com");
+  const sam = await workspaceSocket(state.sam);
+  const leo = await workspaceSocket(state.leo);
+  const maya = await roomSocket(room, state.maya);
+  await maya.nextOfType("welcome");
+  const unread = (frame) => frame.type === "room.unread" && frame.roomId === room;
+  const listed = async (cookie) => (await sidebarOf(cookie)).rooms.find((candidate) => candidate.id === room);
+
+  const plain = await post(maya, "<p>Morning</p>");
+  expect(!("notifies" in plain), "a message with no room-wide mention says nothing of one");
+  const marked = await sam.next(unread, "room.unread");
+  expect(typeof marked.at === "string" && !("mentions" in marked) && !("count" in marked), "an unread room that hasn't mentioned you has no count");
+
+  const here = await post(maya, `<p>${mention("here")} standup</p>`);
+  expect(here.notifies === "here" && here.plainText === "@here standup" && here.body.includes('sgid="here"'), "@here notifies, and stays a mention");
+  const once = await sam.next(unread, "room.unread for @here");
+  expect(once.mentions === 1 && once.at === marked.at, "someone active now is counted, and the mark stays where it was");
+  const jordans = await listed(jordanCookie);
+  expect(jordans.unread === true && !("mentionCount" in jordans), "someone who isn't active is not");
+
+  const everyone = await post(maya, `<p>${mention("channel")} and ${mention("everyone")}</p>`);
+  expect(everyone.notifies === "everyone" && everyone.plainText === "@channel and @everyone", "the widest mention made is the one that notifies");
+  expect((await sam.next(unread, "room.unread for @everyone")).mentions === 2, "everyone is counted");
+  const sams = await listed(state.sam);
+  expect(sams.mentionCount === 2 && !("unreadCount" in sams), "the sidebar has the count, and no count of messages");
+  expect((await listed(jordanCookie)).mentionCount === 1, "whether they're active or not");
+
+  const named = await post(maya, `<p>${mention(people.leo.id)} one for you</p>`);
+  expect(!("notifies" in named), "a person's mention isn't a room-wide one");
+  expect((await leo.next((frame) => unread(frame) && frame.mentions === 3, "room.unread for a mention")).at === marked.at, "it counts for the person named");
+  expect(await sam.quiet(unread, 300), "and nobody else hears a thing");
+
+  const jordan = await workspaceSocket(jordanCookie);
+  const settled = async (active) => {
+    jordan.send({ type: "presence.active", active });
+    jordan.send({ type: "ping" });
+    await jordan.nextOfType("pong");
+  };
+  await settled(false);
+  await post(maya, `<p>${mention("here")} anyone?</p>`);
+  expect((await sam.next(unread, "room.unread for the second @here")).mentions === 3, "@here counts again for someone active");
+  expect(await jordan.quiet(unread, 300) && (await listed(jordanCookie)).mentionCount === 1, "but not for someone connected who has said they're away");
+  await settled(true);
+  await post(maya, `<p>${mention("here")} and now?</p>`);
+  expect((await jordan.next(unread, "room.unread once active")).mentions === 2, "and does once they're back");
+  jordan.close();
+
+  const reading = await roomSocket(room, state.sam);
+  await reading.nextOfType("welcome");
+  await sam.next((frame) => frame.type === "room.read" && frame.roomId === room, "room.read");
+  const read = await listed(state.sam);
+  expect(read.unread === false && !("mentionCount" in read) && !("unreadSince" in read), "reading the room clears the count");
+
+  const inThread = await reply(maya, plain, `<p>${mention("channel")} in a thread</p>`);
+  expect(!("notifies" in inThread) && inThread.body.includes('sgid="channel"'), "a reply in a thread notifies nobody, and stays as written");
+  expectStatus(await request("DELETE", `/api/rooms/${room}`, { cookie: state.maya }), 204);
+});
+
+await check("who may notify a room: not @everyone in a closed room, nothing in a DM, nothing where it's turned off", async () => {
+  const people = await directory();
+  const closed = await roomSocket(state.closedRoom, state.sam);
+  await closed.nextOfType("welcome");
+  const narrowed = await post(closed, `<p>${mention("everyone")} and ${mention("here")}</p>`);
+  expect(narrowed.notifies === "here" && narrowed.plainText === "@everyone and @here", "a closed room has no @everyone");
+  expect(!narrowed.body.includes('sgid="everyone"') && narrowed.body.includes("@everyone") && narrowed.body.includes('sgid="here"'), "the one refused is left as its text");
+
+  const dm = await request("POST", "/api/directs", { cookie: state.sam, body: { userIds: [people.tomas.id] } });
+  expect(dm.status === 201 || dm.status === 200, `expected 201 or 200, got ${dm.status}`);
+  const direct = await roomSocket(dm.json.room.id, state.sam);
+  await direct.nextOfType("welcome");
+  const quiet = await post(direct, `<p>${mention("channel")} hi</p>`);
+  expect(!("notifies" in quiet) && quiet.plainText === "@channel hi" && !quiet.body.includes("action-text-attachment"), "a DM has none");
+
+  const leo = await workspaceSocket(state.leo);
+  const made = await request("POST", "/api/rooms", { cookie: state.sam, body: { kind: "open", name: "Check Quiet" } });
+  expectStatus(made, 201);
+  const room = made.json.room.id;
+  const path = `/api/rooms/${room}`;
+  const patch = (cookie, body) => request("PATCH", path, { cookie, body });
+  refusedWith(await patch(state.sam, { channelMentions: false }), 403, "Only administrators can turn @channel, @here and @everyone on or off in a room");
+  expectStatus(await patch(state.sam, { channelMentions: true }), 200);
+  refusedWith(await patch(state.maya, { channelMentions: "no" }), 422, "Room-wide mentions must be true or false");
+  refusedWith(await patch(state.maya, { huddles: "no" }), 422, "Huddles must be true or false");
+  expectStatus(await patch(state.sam, { huddles: false }), 200);
+  const off = await patch(state.maya, { channelMentions: false });
+  expect(off.status === 200 && off.json.room.channelMentions === false, "an administrator turns them off");
+  await leo.next((frame) => frame.type === "room.saved" && frame.room.id === room && frame.room.channelMentions === false, "room.saved with them off");
+  const withOff = (await sidebarOf(state.leo)).rooms.filter((candidate) => "channelMentions" in candidate);
+  expect(withOff.length === 1 && withOff[0].id === room && withOff[0].channelMentions === false, "the sidebar says so, for that room alone");
+  expect((await request("GET", `${path}/settings`, { cookie: state.sam })).json.room.channelMentions === false, "and so do its settings");
+  expect(Object.keys((await request("GET", `${path}/notified`, { cookie: state.maya })).json.mentions).length === 0, "none would notify");
+  const maya = await roomSocket(room, state.maya);
+  await maya.nextOfType("welcome");
+  const unheard = await post(maya, `<p>${mention("channel")} anyone?</p>`);
+  expect(!("notifies" in unheard) && unheard.plainText === "@channel anyone?" && !unheard.body.includes("action-text-attachment"), "and none does, even from an administrator");
+  const on = await patch(state.maya, { channelMentions: true });
+  expect(on.status === 200 && !("channelMentions" in on.json.room), "turned on again, the room says nothing of it");
+  expectStatus(await request("DELETE", path, { cookie: state.sam }), 204);
+});
+
+await check("a mention of a room reads as its name, or as a private room", async () => {
+  const maya = await roomSocket(state.rooms.Support, state.maya);
+  await maya.nextOfType("welcome");
+  const message = await post(maya, `<p>See ${roomMention(state.rooms.Design)} and ${roomMention(state.rooms.Leadership)} and ${roomMention("no-such-room")}</p>`);
+  expect(message.plainText === "See #Design and #private room and #private room", `its plain text was ${message.plainText}`);
+  expect(message.body.split('content-type="application/vnd.campfire.room"').length === 4 && message.body.includes(`sgid="${state.rooms.Design}"`), "its body keeps the mentions");
+});
+
+await check("messages are scheduled, changed, sent early and sent when due, and only their writer hears of them", async () => {
+  const made = await request("POST", "/api/rooms", { cookie: state.maya, body: { kind: "open", name: "Check Later" } });
+  expectStatus(made, 201);
+  const room = made.json.room.id;
+  const maya = await roomSocket(room, state.maya);
+  const welcome = await maya.nextOfType("welcome");
+  expect(!("scheduled" in welcome) && !("ephemeral" in welcome), "a welcome says nothing of them while there are none");
+  const other = await roomSocket(room, state.maya);
+  await other.nextOfType("welcome");
+  const sam = await roomSocket(room, state.sam);
+  await sam.nextOfType("welcome");
+  const inDays = (days) => new Date(Date.now() + days * 86400000).toISOString();
+  const isList = noFrame("scheduled");
+  const listed = (client) => client.nextOfType("scheduled");
+  const ids = (frame) => frame.messages.map((message) => message.clientMessageId).join();
+  const schedule = (client, clientMessageId, body, sendAt, extra = {}) => client.send({ type: "message.schedule", clientMessageId, body, sendAt, ...extra });
+  const timeRefused = "Pick a time between now and 120 days from now.";
+  const gone = "That message isn't scheduled any more.";
+  const threadDeleted = "Its thread's message has been deleted.";
+
+  const at = inDays(2);
+  schedule(maya, "check-later-1", "<p>Later</p>", at);
+  const first = await listed(maya);
+  const [later] = first.messages;
+  expect(first.messages.length === 1 && isUuid(later.id) && later.clientMessageId === "check-later-1" && later.body === "<p>Later</p>" && later.sendAt === at, "the scheduled message comes back in the list");
+  expect(Object.keys(later).sort().join() === "body,clientMessageId,id,sendAt" && !("edited" in first), "with nothing else");
+  expect(ids(await listed(other)) === "check-later-1", "its writer's other sockets hear it");
+  expect(await sam.quiet(isList, 300), "nobody else does");
+  schedule(maya, "check-later-2", "<p>Sooner</p>", inDays(1));
+  expect(ids(await listed(maya)) === "check-later-2,check-later-1", "soonest first");
+  schedule(maya, "check-later-1", "<p>Again</p>", inDays(3));
+  const again = await listed(maya);
+  expect(ids(again) === "check-later-2,check-later-1" && again.messages[1].body === "<p>Later</p>" && again.messages[1].sendAt === at, "one sent twice is kept once, as it was");
+
+  const refusedSchedule = async (extra, message) => {
+    const clientMessageId = `check-refused-${randomBytes(3).toString("hex")}`;
+    maya.send({ type: "message.schedule", clientMessageId, body: "<p>No</p>", sendAt: inDays(1), ...extra });
+    const error = await maya.nextOfType("error");
+    expect(error.message === message && error.clientMessageId === clientMessageId && error.failed === "message.schedule", `expected "${message}" by its id, got "${error.message}"`);
+  };
+  await refusedSchedule({ sendAt: new Date(Date.now() - 60000).toISOString() }, timeRefused);
+  await refusedSchedule({ sendAt: inDays(121) }, timeRefused);
+  await refusedSchedule({ parentId: "no-such-message" }, "That message no longer exists");
+  await refusedSchedule({ body: "" }, "Your message is empty.");
+  const unrecognised = async (frame) => {
+    maya.send(frame);
+    const error = await maya.nextOfType("error");
+    expect(error.message === "Unrecognized frame" && !("failed" in error), `a malformed ${frame.type} isn't recognised`);
+  };
+  for (const extra of [{ sendAt: "tomorrow" }, { sendAt: `${inDays(1)}${" ".repeat(10)}` }, { clientMessageId: undefined }, { body: 5 }, { parentId: 5 }]) await unrecognised({ type: "message.schedule", clientMessageId: "check-malformed", body: "<p>No</p>", sendAt: inDays(1), ...extra });
+  expect(await maya.quiet(isList, 200), "a refused one answers no list");
+
+  maya.send({ type: "scheduled.edit", scheduledId: later.id, body: "<p>Changed</p>" });
+  const edited = await listed(maya);
+  expect(edited.edited === later.id && edited.messages.find((message) => message.id === later.id).body === "<p>Changed</p>", "an edit answers the list, naming what was edited");
+  const told = await other.next((frame) => isList(frame) && frame.messages.some((message) => message.body === "<p>Changed</p>"), "the edited list on the writer's other socket");
+  expect(!("edited" in told), "which isn't told what was edited");
+
+  const refusedChange = async (client, frame, message) => {
+    client.send(frame);
+    const list = await listed(client);
+    expect(!("edited" in list), "a refused change answers the list first");
+    const error = await client.nextOfType("error");
+    expect(error.message === message && error.scheduledId === frame.scheduledId && error.failed === frame.type && !("clientMessageId" in error), `expected "${message}" for ${frame.type}, got "${error.message}"`);
+    return list;
+  };
+  const unchanged = await refusedChange(maya, { type: "scheduled.edit", scheduledId: later.id, body: "" }, "Your message is empty.");
+  expect(unchanged.messages.find((message) => message.id === later.id).body === "<p>Changed</p>", "and leaves it as it was");
+  await refusedChange(maya, { type: "scheduled.reschedule", scheduledId: later.id, sendAt: inDays(200) }, timeRefused);
+  for (const type of ["scheduled.edit", "scheduled.reschedule", "scheduled.send", "scheduled.delete"]) await refusedChange(maya, { type, scheduledId: "no-such-scheduled", body: "<p>x</p>", sendAt: inDays(1) }, gone);
+  expect((await refusedChange(sam, { type: "scheduled.delete", scheduledId: later.id }, gone)).messages.length === 0, "someone else's can't be changed");
+  for (const frame of [{ type: "scheduled.edit", scheduledId: later.id }, { type: "scheduled.reschedule", scheduledId: later.id, sendAt: "soon" }, { type: "scheduled.send" }]) await unrecognised(frame);
+  expect(await maya.quiet(isList, 200), "a malformed change answers no list");
+
+  const sooner = inDays(0.5);
+  maya.send({ type: "scheduled.reschedule", scheduledId: later.id, sendAt: sooner });
+  const moved = await listed(maya);
+  expect(ids(moved) === "check-later-1,check-later-2" && moved.messages[0].sendAt === sooner && !("edited" in moved), "a new time puts it in order again");
+  maya.send({ type: "scheduled.send", scheduledId: moved.messages[1].id });
+  const sent = await maya.next((frame) => frame.type === "message.created" && frame.message.clientMessageId === "check-later-2", "message.created for the one sent now");
+  expect(sent.message.plainText === "Sooner" && sent.message.creator.id === state.mayaId, "sent now, it's its writer's message");
+  await sam.next((frame) => frame.type === "message.created" && frame.message.plainText === "Sooner", "message.created for everyone else");
+  expect(ids(await listed(maya)) === "check-later-1", "and is scheduled no longer");
+
+  const returning = await roomSocket(room, state.maya);
+  const kept = await returning.nextOfType("welcome");
+  expect(kept.scheduled?.length === 1 && kept.scheduled[0].id === later.id && kept.scheduled[0].body === "<p>Changed</p>" && !("ephemeral" in kept), "a welcome carries its reader's scheduled messages");
+  const resumed = await (await roomSocket(room, state.maya, `visible=1&protocol=5&since=${kept.seq}`)).nextOfType("resumed");
+  expect(resumed.scheduled?.length === 1 && resumed.scheduled[0].id === later.id, "and so does a resume");
+  expect(!("scheduled" in (await (await roomSocket(room, state.leo)).nextOfType("welcome"))), "nobody else's does");
+
+  const parent = await post(maya, "<p>A thread</p>");
+  schedule(maya, "check-later-3", "<p>Reply, later</p>", inDays(1), { parentId: parent.id, alsoSend: true });
+  const threaded = (await listed(maya)).messages.find((message) => message.clientMessageId === "check-later-3");
+  expect(threaded.parentId === parent.id && threaded.alsoSend === true, "a scheduled reply says its thread, and that it goes to the room too");
+  schedule(maya, "check-later-4", "<p>Reply, quietly</p>", inDays(1), { parentId: parent.id });
+  const quietly = (await listed(maya)).messages.find((message) => message.clientMessageId === "check-later-4");
+  expect(quietly.parentId === parent.id && quietly.alsoSend === false, "or that it doesn't");
+  maya.send({ type: "message.delete", messageId: parent.id });
+  await maya.next((frame) => frame.type === "message.deleted" && frame.messageId === parent.id, "message.deleted");
+  maya.send({ type: "scheduled.send", scheduledId: threaded.id });
+  const stuck = (await listed(maya)).messages.find((message) => message.id === threaded.id);
+  expect(stuck?.failure === threadDeleted, "one that can't be sent stays, saying why");
+  const failedSend = await maya.nextOfType("error");
+  expect(failedSend.message === threadDeleted && failedSend.scheduledId === threaded.id && failedSend.failed === "scheduled.send", "and whoever sent it is told");
+  maya.send({ type: "scheduled.delete", scheduledId: threaded.id });
+  await listed(maya);
+  maya.send({ type: "scheduled.delete", scheduledId: quietly.id });
+  expect(ids(await listed(maya)) === "check-later-1", "deleted, they're gone");
+
+  schedule(maya, "check-later-5", "<p>Any moment</p>", new Date(Date.now() + 400).toISOString());
+  expect(ids(await listed(maya)) === "check-later-5,check-later-1", "one due in a moment is scheduled like any other");
+  const due = await maya.next((frame) => frame.type === "message.created" && frame.message.clientMessageId === "check-later-5", "message.created when it's due");
+  expect(due.message.plainText === "Any moment" && !("notifies" in due.message), "and sent when its time comes");
+  expect(ids(await listed(maya)) === "check-later-1", "leaving the list");
+
+  for (let n = 1; n <= 30; n += 1) {
+    schedule(sam, `check-many-${n}`, "<p>Many</p>", inDays(100));
+    expect((await listed(sam)).messages.length === n, "thirty are kept");
+  }
+  schedule(sam, "check-many-31", "<p>Many</p>", inDays(100));
+  const full = await sam.nextOfType("error");
+  expect(full.message === "You can have up to 30 messages scheduled here at once." && full.clientMessageId === "check-many-31" && full.failed === "message.schedule", "the thirty-first is refused");
+  schedule(sam, "check-many-1", "<p>Many</p>", inDays(100));
+  expect((await listed(sam)).messages.length === 30, "one already kept is answered with the list, even then");
+  expectStatus(await request("DELETE", `/api/rooms/${room}`, { cookie: state.maya }), 204);
+});
+
+await check("a message only its asker sees: shown to them alone, kept until answered, and answered in place", async () => {
+  const engineering = state.rooms.Engineering;
+  const opened = async (cookie, query) => {
+    const socket = await roomSocket(engineering, cookie, query);
+    return { socket, welcome: await socket.nextOfType("welcome") };
+  };
+  const { socket: maya, welcome } = await opened(state.maya);
+  expect(!("ephemeral" in welcome), "a welcome says nothing of them while there are none");
+  const { socket: old } = await opened(state.maya, "visible=1&protocol=4");
+  const { socket: leo } = await opened(state.leo);
+  const shown = noFrame("message.ephemeral");
+  const click = (client, clickId, actionId, messageId) => client.send({ type: "card.click", clickId, messageId, actionId, blockId: "rollback_actions", value: "v2.4.2" });
+  const buttonGone = "That button is no longer there";
+
+  const said = await post(maya, "<p>Should we rollback?</p>");
+  const card = (await maya.nextOfType("message.ephemeral")).message;
+  expect(isUuid(card.id) && card.roomId === engineering && card.creator.name === "Deploy Bot" && card.body === "" && !("parentId" in card) && !Number.isNaN(Date.parse(card.createdAt)), "the message, from the bot that asks");
+  expect(cardKinds(card) === "section,buttons" && card.plainText.includes("back to v2.4.2?"), `a question with buttons, whose plain text was ${card.plainText}`);
+  const buttons = card.cards[0].parts[1].buttons.map((button) => `${button.text}:${button.action.id}:${button.action.blockId}:${button.action.value}`).join();
+  expect(buttons === "Roll back:rollback:rollback_actions:v2.4.2,Cancel:cancel:rollback_actions:v2.4.2", `its buttons were ${buttons}`);
+  expect((await leo.quiet(shown, 300)) && (await old.quiet(shown, 0)), "nobody else is shown it, nor is an outdated client");
+
+  const { socket: second, welcome: kept } = await opened(state.maya);
+  expect(kept.ephemeral?.length === 1 && kept.ephemeral[0].id === card.id, "a welcome carries what is still to be answered");
+  expect(!("ephemeral" in (await opened(state.maya, "visible=1&protocol=4")).welcome), "but not an outdated client's");
+  expect(!("ephemeral" in (await opened(state.leo)).welcome), "nor anyone else's");
+
+  click(leo, "check-only-1", "cancel", card.id);
+  const notTheirs = await leo.nextOfType("error");
+  expect(notTheirs.message === buttonGone && notTheirs.clickId === "check-only-1" && notTheirs.failed === "card.click", "nobody else can answer it");
+  click(maya, "check-only-2", "cancel", card.id);
+  const decided = (await maya.nextOfType("message.ephemeral")).message;
+  expect(decided.id === card.id && cardKinds(decided) === "section,context" && decided.plainText.includes("You cancelled this."), "answered, it says what was decided where its buttons were");
+  expect((await maya.nextOfType("card.clicked")).clickId === "check-only-2", "and the click is answered by its id");
+  expect((await second.nextOfType("message.ephemeral")).message.id === card.id, "on every one of its asker's sockets");
+  click(maya, "check-only-3", "rollback", card.id);
+  const answered = await maya.nextOfType("error");
+  expect(answered.message === buttonGone && answered.clickId === "check-only-3", "once answered, its buttons are gone");
+  expect(!("ephemeral" in (await opened(state.maya)).welcome), "and a welcome carries it no longer");
+
+  await reply(maya, said, "<p>rollback, in here?</p>");
+  const inThread = (await maya.nextOfType("message.ephemeral")).message;
+  expect(inThread.parentId === said.id && inThread.id !== card.id && cardKinds(inThread) === "section,buttons", "asked in a thread, it's shown in that thread");
+  maya.send({ type: "thread.open", parentId: said.id });
+  const thread = await maya.nextOfType("thread.opened");
+  expect(thread.ephemeral?.length === 1 && thread.ephemeral[0].id === inThread.id, "an opened thread carries its own");
+  old.send({ type: "thread.open", parentId: said.id });
+  expect(!("ephemeral" in (await old.nextOfType("thread.opened"))), "but not for an outdated client");
+  expect(!("ephemeral" in (await opened(state.maya)).welcome), "and a welcome carries only the room's");
+  click(maya, "check-only-4", "rollback", inThread.id);
+  const allowed = (await maya.nextOfType("message.ephemeral")).message;
+  expect(allowed.id === inThread.id && allowed.parentId === said.id && allowed.plainText.includes("You allowed this."), "allowed, it says so");
+  expect((await maya.nextOfType("card.clicked")).clickId === "check-only-4", "the click is answered");
+  const rolling = await maya.next((frame) => frame.type === "message.created" && frame.message.plainText.startsWith("Rolling message-api back to v2.4.2, as "), "Deploy Bot's message");
+  expect(rolling.message.parentId === said.id && rolling.message.creator.name === "Deploy Bot", "and the bot says in the thread that it's doing it");
+});
+
+await check("notifications are paused until a time and resumed, and everyone is told", async () => {
+  const people = await directory();
+  const maya = await workspaceSocket(state.maya);
+  const path = "/api/users/me/notifications-pause";
+  const pause = (until) => request("PUT", path, { cookie: state.sam, body: { until } });
+  const updated = (frame) => frame.type === "user.updated" && frame.user.id === people.sam.id;
+  expectStatus(await request("PUT", path, { body: { until: null } }), 401);
+  for (const until of [undefined, 5, "tomorrow", "2030-01-01T00:00:00Z"]) refusedWith(await pause(until), 422, "A pause needs the time it ends, or null to resume notifications");
+  refusedWith(await pause(new Date(Date.now() - 60000).toISOString()), 422, "A pause can't end in the past");
+  refusedWith(await pause(new Date(Date.now() + 8 * 86400000).toISOString()), 422, "Notifications can be paused for a week at most");
+  expect(!("pausedUntil" in people.sam), "nobody is paused to begin with");
+
+  const until = new Date(Date.now() + 3600000).toISOString();
+  const paused = await pause(until);
+  expect(paused.status === 200 && paused.json.user.id === people.sam.id && paused.json.user.pausedUntil === until, "the person comes back, paused until then");
+  expect((await maya.next(updated, "user.updated")).user.pausedUntil === until, "everyone is told");
+  expect((await directory()).sam.pausedUntil === until, "and the directory says so");
+  const resumed = await pause(null);
+  expect(resumed.status === 200 && !("pausedUntil" in resumed.json.user), "null resumes");
+  expect(!("pausedUntil" in (await maya.next(updated, "user.updated again")).user), "and everyone is told again");
 });
 
 await check("your profile: its shape, a changed bio and name told to everyone, and what is refused", async () => {

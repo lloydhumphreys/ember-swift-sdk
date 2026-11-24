@@ -1,7 +1,7 @@
 // The stand-in server's state and rules, all in memory. Sockets and HTTP live in server.mjs, which plugs a
 // `hub` in so this file can say who hears what without knowing how it's delivered.
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 export const HISTORY_PAGE_SIZE = 40;
 export const MAX_MESSAGE_LENGTH = 40_000;
@@ -14,6 +14,20 @@ export const THREAD_FACES = 4;
 /// How far behind a socket can be and still resume; further back it gets a welcome, as on the real server.
 export const CHANGES_KEPT = 100;
 export const ASSISTANT_ID = "ember";
+/// The mentions that notify a room rather than a person, narrowest first.
+export const SPECIAL_MENTIONS = ["here", "channel", "everyone"];
+export const MAX_SECTIONS = 100;
+export const MAX_SCHEDULED_MESSAGES = 30;
+export const SCHEDULE_AHEAD_MS = 120 * 24 * 60 * 60_000;
+/// How many due messages a room sends in one go.
+export const SCHEDULED_SENT_AT_ONCE = 10;
+export const MESSAGE_GONE = "That message no longer exists";
+export const SCHEDULE_TIME_REFUSED = "Pick a time between now and 120 days from now.";
+export const TOO_MANY_SCHEDULED = "You can have up to 30 messages scheduled here at once.";
+export const SCHEDULED_GONE = "That message isn't scheduled any more.";
+export const THREAD_DELETED = "Its thread's message has been deleted.";
+export const SECTIONS_FORBIDDEN = "Only administrators can make, rename and delete sections";
+export const TOO_MANY_SECTIONS = "There can be at most 100 sections";
 const SEARCH_LIMIT = Number(process.env.EMBER_SEARCH_PAGE) > 0 ? Number(process.env.EMBER_SEARCH_PAGE) : 100;
 const STAR_LIMIT = 20;
 
@@ -90,7 +104,25 @@ const attribute = (attrs, name) => new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"
 const isMention = (node) =>
   node.tag === "action-text-attachment" && attribute(node.attrs, "content-type") === "application/vnd.campfire.mention" && attribute(node.attrs, "sgid") !== undefined;
 
-/// The ids of the people a body mentions, once each, in order.
+const isRoomMention = (node) =>
+  node.tag === "action-text-attachment" && attribute(node.attrs, "content-type") === "application/vnd.campfire.room" && attribute(node.attrs, "sgid") !== undefined;
+
+/// The special mentions a body makes, narrowest first.
+export function specialMentionsOf(html) {
+  const made = mentionIdsOf(html);
+  return SPECIAL_MENTIONS.filter((mention) => made.includes(mention));
+}
+
+/// The body with each of the `refused` special mentions as the text it reads as, which notifies nobody.
+export function specialMentionsAsText(html, refused) {
+  if (refused.length === 0) return html;
+  return html.replace(/<action-text-attachment((?:[^>"']|"[^"]*"|'[^']*')*)>(?:[^<]*<\/action-text-attachment\s*>)?/gi, (whole, attrs) => {
+    const sgid = attribute(attrs, "sgid");
+    return attribute(attrs, "content-type") === "application/vnd.campfire.mention" && refused.includes(sgid) ? `@${sgid}` : whole;
+  });
+}
+
+/// The ids a body mentions, once each, in order: people's, and the special mentions.
 export function mentionIdsOf(html) {
   const ids = [];
   const walk = (node) => {
@@ -105,8 +137,9 @@ export function mentionIdsOf(html) {
   return ids;
 }
 
-/// Action Text's plain text of a body: what search matches, and what a notification would say.
-export function plainTextOf(html, nameOf) {
+/// Action Text's plain text of a body: what search matches, and what a notification would say. A mention of a
+/// room reads as `#` and what `roomNameOf` answers, or "private room" when it answers nothing.
+export function plainTextOf(html, nameOf, roomNameOf = () => undefined) {
   const render = (node, listDepth, counter) => {
     if (typeof node === "string") return decodeEntities(node);
     const inner = (depth = listDepth, count = counter) => node.children.map((child) => render(child, depth, count)).join("");
@@ -140,8 +173,11 @@ export function plainTextOf(html, nameOf) {
       case "script":
       case "style":
         return "";
-      case "action-text-attachment":
-        return isMention(node) ? `@${nameOf(attribute(node.attrs, "sgid")) ?? "someone"}` : "";
+      case "action-text-attachment": {
+        const sgid = attribute(node.attrs, "sgid");
+        if (isMention(node)) return SPECIAL_MENTIONS.includes(sgid) ? `@${sgid}` : `@${nameOf(sgid) ?? "someone"}`;
+        return isRoomMention(node) ? `#${roomNameOf(sgid) ?? "private room"}` : "";
+      }
       default:
         return inner();
     }
@@ -155,6 +191,18 @@ const hasLinkable = (text) => /\bhttps?:\/\/\S+|\bwww\.\S+\.\S+/i.test(text);
 
 const iso = (ms) => new Date(ms).toISOString();
 const versionOf = (ms) => iso(ms).slice(0, 19).replace(/\D/g, "");
+/// A section's name as no two can have it: ASCII letters in either case alike.
+const sectionKey = (name) => name.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+const isSchedulable = (time, now) => time > now && time <= now + SCHEDULE_AHEAD_MS;
+const soonestFirst = (a, b) => a.sendAt - b.sendAt || (a.id < b.id ? -1 : 1);
+const scheduledWire = (message) => ({
+  id: message.id,
+  clientMessageId: message.clientMessageId,
+  body: message.body,
+  sendAt: iso(message.sendAt),
+  ...(message.parentId !== undefined && { parentId: message.parentId, alsoSend: message.alsoSend === true }),
+  ...(message.failure !== undefined && { failure: message.failure }),
+});
 
 export class Store {
   users = new Map();
@@ -163,11 +211,15 @@ export class Store {
   favourites = new Map();
   searches = new Map();
   sharedOrder = [];
+  /// The sections shared rooms are listed under, in order: { id, name }. A room names its own in `sectionId`.
+  sections = [];
+  /// The id of the room made last, so that two made in one millisecond keep that order, which a sidebar lists them by.
+  madeLast = "";
   invitations = new Map();
   account = { name: process.env.EMBER_WORKSPACE_NAME || "Fernwood", tagline: "Calm software, made together" };
   joinCode = "";
   /// Replaced by server.mjs: who hears what, and who is where.
-  hub = { room() {}, workspace() {}, everyone() {}, closeRoom() {}, viewers: () => new Set(), present: () => [], typing: () => {} };
+  hub = { room() {}, person() {}, workspace() {}, everyone() {}, closeRoom() {}, viewers: () => new Set(), present: () => [], active: () => [], typing: () => {} };
   /// People invited by email and not yet joined, newest first: { id, emailAddress, invitedBy, createdAt, expiresAt, delivery, digest }.
   emailInvitations = [];
 
@@ -191,6 +243,11 @@ export class Store {
     return { id: userId, name: user?.name ?? "Someone" };
   };
   nameOf = (userId) => this.users.get(userId)?.name;
+  /// A room's name as a mention of it reads: an open room's, and nothing for any other.
+  roomNameOf = (roomId) => {
+    const room = this.rooms.get(roomId);
+    return room?.kind === "open" ? room.name : undefined;
+  };
 
   directoryUser(user, avatarToken) {
     return {
@@ -200,12 +257,14 @@ export class Store {
       role: user.role,
       status: user.status ?? "active",
       avatarUrl: `/users/${avatarToken(user.id)}/avatar?v=${versionOf(user.updatedAt)}`,
+      // Only while it lasts, and only for someone active.
+      ...((user.status ?? "active") === "active" && user.pausedUntil > Date.now() && { pausedUntil: iso(user.pausedUntil) }),
     };
   }
 
   // Rooms
 
-  addRoom({ id, kind, name = null, icon = null, memberIds, createdAt, by }) {
+  addRoom({ id, kind, name = null, icon = null, memberIds, createdAt, by, sectionId = null }) {
     const room = {
       id,
       kind,
@@ -218,6 +277,12 @@ export class Store {
       seq: 0,
       changes: [],
       activeAt: createdAt,
+      channelMentions: true,
+      sectionId,
+      /// Messages to send later: { id, creatorId, clientMessageId, body, sendAt, parentId?, alsoSend?, failure? }, `sendAt` in milliseconds.
+      scheduled: [],
+      /// Messages only one person sees, kept until they're answered: { forUserId, message }.
+      ephemeral: [],
     };
     // `since` is when each member was put in the room, which their sidebar lists their rooms by.
     for (const userId of memberIds) room.members.set(userId, { unread: false, involvement: kind === "direct" ? "everything" : "mentions", since: createdAt });
@@ -227,7 +292,7 @@ export class Store {
 
   roomWire(room) {
     if (room.kind === "direct") return { id: room.id, kind: "direct", members: [...room.members.keys()].map(this.ref), activeAt: iso(room.activeAt) };
-    return { id: room.id, kind: room.kind, name: room.name, icon: room.icon };
+    return { id: room.id, kind: room.kind, name: room.name, icon: room.icon, ...(room.channelMentions === false && { channelMentions: false }) };
   }
 
   /// The rooms `userId` is in, in the order they were put in them, then oldest first, as the real
@@ -248,6 +313,7 @@ export class Store {
     const rooms = this.roomsOf(userId);
     const favourites = this.favouritesOf(userId);
     const invitation = this.users.get(userId)?.role === "administrator" && !this.invitations.get(userId) ? { roomId: this.originalRoom().id, joinCode: this.joinCode } : null;
+    const sections = this.sidebarSections(userId, this.users.get(userId)?.role === "administrator");
     return {
       rooms: rooms.map((room) => {
         const state = room.members.get(userId);
@@ -256,13 +322,98 @@ export class Store {
       favorites: { rooms: [...favourites.rooms], version: favourites.version },
       sharedOrder: this.sharedOrder.filter((id) => rooms.some((room) => room.id === id)),
       invitation,
+      ...(sections.length > 0 && { sections }),
     };
   }
 
-  /// A member's unread mark as the sidebar lists it: when the first message they haven't seen came and, in a DM, how many have come since.
+  /// A member's unread mark as the sidebar lists it: when the first message they haven't seen came and, in a DM, how
+  /// many have come since, or in any other room, how many of them mention the member, if any do.
   markOf(room, state) {
     if (!state.unread) return { unread: false };
-    return { unread: true, ...(state.unreadAt !== undefined && { unreadSince: iso(state.unreadAt) }), ...(room.kind === "direct" && { unreadCount: Math.max(state.unreadCount ?? 0, 1) }) };
+    return {
+      unread: true,
+      ...(state.unreadAt !== undefined && { unreadSince: iso(state.unreadAt) }),
+      ...(room.kind === "direct" && { unreadCount: Math.max(state.unreadCount ?? 0, 1) }),
+      ...(room.kind !== "direct" && state.mentionCount > 0 && { mentionCount: state.mentionCount }),
+    };
+  }
+
+  // Sections
+
+  administrators = () => [...this.users.values()].filter((user) => user.role === "administrator" && user.status === "active");
+
+  /// The section a room is in, or null.
+  sectionOf(room) {
+    const section = this.sections.find((candidate) => candidate.id === room.sectionId);
+    return section ? { id: section.id, name: section.name } : null;
+  }
+
+  sectionNamed(name) {
+    const key = sectionKey(name);
+    return this.sections.find((section) => sectionKey(section.name) === key) ?? null;
+  }
+
+  /// The sections in order, each with which of `userId`'s rooms are in it: every one for `every`, as for an
+  /// administrator, or else those with a room.
+  sidebarSections(userId, every) {
+    const rooms = this.roomsOf(userId);
+    return this.sections
+      .map(({ id, name }) => ({ id, name, roomIds: rooms.filter((room) => room.sectionId === id).map((room) => room.id) }))
+      .filter((section) => every || section.roomIds.length > 0);
+  }
+
+  /// Every section, in order, with how many of `userId`'s rooms are in it, as New room and a room's settings offer them.
+  sectionOptions(userId) {
+    return this.sidebarSections(userId, true).map(({ roomIds, ...section }) => ({ ...section, rooms: roomIds.length }));
+  }
+
+  /// A new section, last. Administrators hear that the sidebar's layout changed.
+  addSection(name) {
+    const section = { id: sortableId(), name };
+    this.sections.push(section);
+    for (const user of this.administrators()) this.hub.workspace(user.id, { type: "rooms.reordered" });
+    return section;
+  }
+
+  renameSection(section, name) {
+    if (section.name === name) return;
+    section.name = name;
+    this.hub.everyone({ type: "rooms.reordered" });
+  }
+
+  /// Removes a section, leaving its rooms in none.
+  deleteSection(section) {
+    this.sections = this.sections.filter((candidate) => candidate !== section);
+    for (const room of this.rooms.values()) if (room.sectionId === section.id) room.sectionId = null;
+    this.hub.everyone({ type: "rooms.reordered" });
+  }
+
+  /// What a room's `section` comes to for `user`: `{ sectionId }`, undefined to leave the room where it is and null for
+  /// none, or `{ status, error }`. A new section is made here, so ask last, once nothing else can refuse the change.
+  chooseSection(user, choice) {
+    if (choice === undefined || choice === null) return { sectionId: choice };
+    if (typeof choice === "string") return this.sections.some((section) => section.id === choice) ? { sectionId: choice } : { status: 422, error: "Section not found" };
+    const named = this.sectionNamed(choice.name);
+    if (named) return { sectionId: named.id };
+    if (user.role !== "administrator") return { status: 403, error: SECTIONS_FORBIDDEN };
+    if (this.sections.length >= MAX_SECTIONS) return { status: 422, error: TOO_MANY_SECTIONS };
+    return { sectionId: this.addSection(choice.name).id };
+  }
+
+  /// Puts the sections in the order a layout lists them, the ones it doesn't list after them as they were, and each of
+  /// `roomIds` in the section that lists it, or in none. A room in a section the layout doesn't list stays there, and
+  /// so does one put in a section that isn't there.
+  placeRooms(roomIds, sections) {
+    const listed = new Set(sections.map((section) => section.id));
+    const placed = sections.map((section) => this.sections.find((candidate) => candidate.id === section.id)).filter(Boolean);
+    this.sections = [...placed, ...this.sections.filter((section) => !placed.includes(section))];
+    const sectionOf = new Map(sections.flatMap((section) => section.roomIds.map((roomId) => [roomId, section.id])));
+    for (const roomId of roomIds) {
+      const room = this.rooms.get(roomId);
+      const target = sectionOf.get(roomId) ?? null;
+      if (!room || (target !== null && !this.sections.some((section) => section.id === target))) continue;
+      if (room.sectionId === null || listed.has(room.sectionId)) room.sectionId = target;
+    }
   }
 
   /// Everyone active, by name, as a room's settings list them.
@@ -271,20 +422,26 @@ export class Store {
   }
 
   /// A new open or closed room. An open room has everyone active; a closed one just the people named who exist, as on the real server, which does not add the creator.
-  createRoom(creatorId, { kind, name, icon, memberIds }) {
+  createRoom(creatorId, { kind, name, icon, memberIds, sectionId = null }) {
     const now = Date.now();
     const ids = kind === "closed" ? [...new Set(memberIds)].filter((id) => this.users.has(id)) : this.activePeople().map((user) => user.id);
-    const room = this.addRoom({ id: sortableId(now), kind, name, icon: icon || null, memberIds: ids, createdAt: now, by: creatorId });
+    this.madeLast = sortableId(now, this.madeLast);
+    const room = this.addRoom({ id: this.madeLast, kind, name, icon: icon || null, memberIds: ids, createdAt: now, by: creatorId, sectionId });
     const wire = this.roomWire(room);
-    for (const id of ids) this.hub.workspace(id, { type: "room.saved", room: wire });
+    const section = this.sectionOf(room);
+    for (const id of ids) this.hub.workspace(id, { type: "room.saved", room: wire, ...(section && { section }) });
     return room;
   }
 
-  /// Renames, re-icons, opens or closes a room. Answers whether it changed. Opening adds everyone active; closing keeps exactly `memberIds`.
-  changeRoom(room, { name, icon, kind, memberIds }) {
+  /// Renames, re-icons, opens or closes a room, turns its room-wide mentions on or off, or puts it in a section (`sectionId`
+  /// null for none). Answers whether it changed. Opening adds everyone active; closing keeps exactly `memberIds`.
+  changeRoom(room, { name, icon, kind, memberIds, channelMentions, sectionId }) {
     const before = this.roomWire(room);
+    const sectionBefore = room.sectionId;
     if (name !== undefined) room.name = name;
     if (icon !== undefined) room.icon = icon || null;
+    if (channelMentions !== undefined) room.channelMentions = channelMentions;
+    if (sectionId !== undefined) room.sectionId = sectionId;
     const was = new Set(room.members.keys());
     let wanted = was;
     if (kind === "open") wanted = new Set([...was, ...this.activePeople().map((user) => user.id)]);
@@ -296,6 +453,9 @@ export class Store {
     for (const id of added) room.members.set(id, { unread: false, involvement: "mentions", since: now });
     for (const id of removed) {
       room.members.delete(id);
+      // What they had waiting here goes with them.
+      room.scheduled = room.scheduled.filter((message) => message.creatorId !== id);
+      room.ephemeral = room.ephemeral.filter((kept) => kept.forUserId !== id);
       const favourites = this.favouritesOf(id);
       if (favourites.rooms.includes(room.id)) {
         favourites.rooms = favourites.rooms.filter((candidate) => candidate !== room.id);
@@ -304,14 +464,44 @@ export class Store {
       }
     }
     const wire = this.roomWire(room);
-    const changed = JSON.stringify(before) !== JSON.stringify(wire);
+    const moved = room.sectionId !== sectionBefore;
+    const changed = JSON.stringify(before) !== JSON.stringify(wire) || moved;
     for (const id of removed) {
       this.hub.workspace(id, { type: "room.gone", roomId: room.id });
       this.hub.closeRoom(room.id, id, 4004, "NotFound");
     }
-    for (const id of changed ? room.members.keys() : added) this.hub.workspace(id, { type: "room.saved", room: wire });
+    // The room's section goes with it whenever it has one, and null when it has just left one.
+    const section = this.sectionOf(room);
+    const saved = { type: "room.saved", room: wire, ...(section ? { section } : moved && { section: null }) };
+    for (const id of changed ? room.members.keys() : added) this.hub.workspace(id, saved);
     if (added.length > 0 && this.sharedOrder.includes(room.id)) for (const id of added) this.hub.workspace(id, { type: "rooms.reordered" });
     return changed;
+  }
+
+  /// Puts people in a closed room and takes others out, everyone else staying as they are.
+  changeMembers(room, addedIds, removedIds) {
+    const members = new Set([...room.members.keys(), ...addedIds]);
+    for (const id of removedIds) members.delete(id);
+    return this.changeRoom(room, { kind: "closed", memberIds: [...members] });
+  }
+
+  /// The special mentions that notify `room` when `userId` makes them, narrowest first: none in a DM, in a room with them
+  /// turned off, or from Ember's own assistant, and @everyone only in an open room.
+  notifyingMentions(room, userId) {
+    if (room.kind === "direct" || room.channelMentions === false || userId === ASSISTANT_ID) return [];
+    return room.kind === "open" ? [...SPECIAL_MENTIONS] : ["here", "channel"];
+  }
+
+  /// How many people `room` has, and how many each special mention would notify from `userId`: everyone else in it who
+  /// is active and no bot, or for @here, those of them active now.
+  notified(room, userId) {
+    const everyone = [...room.members.keys()].filter((id) => {
+      const user = this.users.get(id);
+      return id !== userId && user?.status === "active" && user.role !== "bot";
+    });
+    const active = new Set(this.hub.active());
+    const here = everyone.filter((id) => active.has(id)).length;
+    return { members: everyone.length + 1, mentions: Object.fromEntries(this.notifyingMentions(room, userId).map((mention) => [mention, mention === "here" ? here : everyone.length])) };
   }
 
   /// Removes a room and its messages, telling its members and closing its sockets.
@@ -422,6 +612,7 @@ export class Store {
       for (const reply of [...replies].reverse()) if (!people.includes(reply.creatorId)) people.push(reply.creatorId);
       wire.thread = { count: replies.length, latestAt: iso(replies[replies.length - 1].createdAt), people: people.slice(0, THREAD_FACES).map(this.ref) };
     }
+    if (message.notifies) wire.notifies = message.notifies;
     if (message.deleted) wire.deleted = true;
     return wire;
   }
@@ -478,10 +669,20 @@ export class Store {
     if (typeof body !== "string" || body.length > MAX_MESSAGE_HTML_LENGTH) return { error: "That message couldn’t be saved." };
     const html = body.replace(/<(script|style)[\s\S]*?<\/\1\s*>/gi, "");
     const mentionIds = mentionIdsOf(html).filter((id) => this.users.has(id));
-    const plainText = plainTextOf(html, this.nameOf);
+    const plainText = plainTextOf(html, this.nameOf, this.roomNameOf);
     if (plainText.trim() === "" && mentionIds.length === 0) return { error: "Your message is empty." };
     if (plainText.length > MAX_MESSAGE_LENGTH) return { error: `Messages can be up to ${MAX_MESSAGE_LENGTH.toLocaleString("en-US")} characters.` };
-    return { html, plainText, mentionIds };
+    return { html, plainText, mentionIds, specialMentions: specialMentionsOf(html) };
+  }
+
+  /// Which of a new message's special mentions notifies the room: the widest of those `userId` may make there. The
+  /// rest are left in its body as the text they read as. A reply in a thread notifies nobody, and stays as written.
+  #notifying(room, userId, prepared, inThread) {
+    const made = prepared.specialMentions ?? [];
+    if (made.length === 0 || inThread) return undefined;
+    const allowed = this.notifyingMentions(room, userId);
+    prepared.html = specialMentionsAsText(prepared.html, made.filter((mention) => !allowed.includes(mention)));
+    return made.filter((mention) => allowed.includes(mention)).at(-1);
   }
 
   /// Adds a message for `userId`, tells everyone, and answers it, or `{ error }` with the frame to send back.
@@ -494,7 +695,7 @@ export class Store {
     let parent = null;
     if (parentId !== undefined && parentId !== null) {
       parent = room.messages.find((message) => message.id === parentId);
-      if (!parent || parent.parentId) return fail("That message no longer exists");
+      if (!parent || parent.parentId) return fail(MESSAGE_GONE);
     }
     let prepared;
     if (attachment) prepared = { html: "", plainText: attachment.name, mentionIds: [] };
@@ -507,6 +708,7 @@ export class Store {
       prepared = this.prepareBody(body);
       if (prepared.error) return fail(prepared.error);
     }
+    const notifies = this.#notifying(room, userId, prepared, parent !== null);
     const id = sortableId(at, room.messages.at(-1)?.id ?? "");
     const message = {
       id,
@@ -523,6 +725,7 @@ export class Store {
       alsoSent: parent ? alsoSend === true : undefined,
       deleted: false,
     };
+    if (notifies) message.notifies = notifies;
     if (attachment) message.attachment = attachment;
     if (bot.cards?.length > 0) message.cards = bot.cards;
     room.messages.push(message);
@@ -541,13 +744,21 @@ export class Store {
     const inRoom = !parent || message.alsoSent;
     if (inRoom) {
       const viewers = this.hub.viewers(room.id);
+      const direct = room.kind === "direct";
+      // @channel and @everyone mention everyone in the room, and @here those active now, besides the people named.
+      const everyone = message.notifies === "channel" || message.notifies === "everyone";
+      const mentioned = new Set(message.notifies === "here" ? [...message.mentionIds, ...this.hub.active()] : message.mentionIds);
       for (const [memberId, state] of room.members) {
-        // A room is marked once; a DM counts every message, as on the real server.
-        if (memberId === message.creatorId || viewers.has(memberId) || (state.unread && room.kind !== "direct") || state.involvement === "invisible") continue;
-        if (!state.unread) Object.assign(state, { unread: true, unreadAt: message.createdAt, unreadCount: 0 });
-        state.unreadCount = (state.unreadCount ?? 0) + 1;
-        const { unreadSince, unreadCount } = this.markOf(room, state);
-        this.hub.workspace(memberId, { type: "room.unread", roomId: room.id, at: unreadSince, ...(unreadCount !== undefined && { count: unreadCount }) });
+        if (memberId === message.creatorId || viewers.has(memberId) || state.involvement === "invisible") continue;
+        // A room is marked once, and counts the messages that mention the member; a DM counts every message, as on the real server.
+        const marked = !state.unread || direct;
+        const counted = !direct && (everyone || mentioned.has(memberId));
+        if (!marked && !counted) continue;
+        if (!state.unread) Object.assign(state, { unread: true, unreadAt: message.createdAt, unreadCount: 0, mentionCount: 0 });
+        if (marked) state.unreadCount = (state.unreadCount ?? 0) + 1;
+        if (counted) state.mentionCount = (state.mentionCount ?? 0) + 1;
+        const { unreadSince, unreadCount, mentionCount } = this.markOf(room, state);
+        this.hub.workspace(memberId, { type: "room.unread", roomId: room.id, at: unreadSince, ...(unreadCount !== undefined && { count: unreadCount }), ...(mentionCount !== undefined && { mentions: mentionCount }) });
       }
     }
     if (room.kind === "direct" && inRoom) {
@@ -560,7 +771,7 @@ export class Store {
   markRead(room, userId) {
     const state = room.members.get(userId);
     if (state?.unread) {
-      Object.assign(state, { unread: false, unreadAt: undefined, unreadCount: 0 });
+      Object.assign(state, { unread: false, unreadAt: undefined, unreadCount: 0, mentionCount: 0 });
       this.hub.workspace(userId, { type: "room.read", roomId: room.id });
     }
   }
@@ -576,6 +787,12 @@ export class Store {
     message.body = prepared.html;
     message.plainText = prepared.plainText;
     message.mentionIds = prepared.mentionIds;
+    // An edit can only narrow what the message notified, or take it away: its body is left as written.
+    if (message.notifies) {
+      const widest = prepared.specialMentions.at(-1);
+      if (widest === undefined) delete message.notifies;
+      else message.notifies = SPECIAL_MENTIONS[Math.min(SPECIAL_MENTIONS.indexOf(message.notifies), SPECIAL_MENTIONS.indexOf(widest))];
+    }
     message.updatedAt = message.editedAt = Date.now();
     const seq = this.nextSeq(room, "upsert", message.id);
     this.hub.room(room.id, { type: "message.updated", message: this.wire(room, message), seq });
@@ -613,6 +830,7 @@ export class Store {
       message.boosts = [];
       delete message.attachment;
       delete message.cards;
+      delete message.notifies;
       const seq = this.nextSeq(room, "upsert", message.id);
       this.hub.room(room.id, { type: "message.updated", message: this.wire(room, message), seq });
       return {};
@@ -659,18 +877,126 @@ export class Store {
     return {};
   }
 
-  threadOpened(room, parentId) {
+  /// A thread as it opens for `userId`, with the messages only they see in it, if there are any. Leave `userId` out for a
+  /// socket that is sent none.
+  threadOpened(room, parentId, userId) {
+    const only = userId === undefined ? [] : this.ephemeralOf(room, userId, parentId);
+    const ephemeral = only.length > 0 && { ephemeral: only };
     const parent = room.messages.find((message) => message.id === parentId && !message.parentId);
-    if (!parent) return { type: "thread.opened", parentId, parent: null, messages: [], hasMore: false };
+    if (!parent) return { type: "thread.opened", parentId, parent: null, messages: [], hasMore: false, ...ephemeral };
     const replies = this.repliesOf(room, parentId);
     const messages = replies.slice(-HISTORY_PAGE_SIZE);
-    return { type: "thread.opened", parentId, parent: this.wire(room, parent), messages: messages.map((message) => this.wire(room, message)), hasMore: replies.length > messages.length };
+    return { type: "thread.opened", parentId, parent: this.wire(room, parent), messages: messages.map((message) => this.wire(room, message)), hasMore: replies.length > messages.length, ...ephemeral };
   }
 
   threadBefore(room, parentId, before, limit) {
     const older = this.repliesOf(room, parentId).filter((message) => message.id < before);
     const messages = older.slice(-limit);
     return { type: "thread.history", parentId, before, messages: messages.map((message) => this.wire(room, message)), hasMore: older.length > messages.length };
+  }
+
+  // Scheduled messages
+
+  /// What `userId` has scheduled in `room`, soonest first, as the room lists it to them.
+  scheduledOf(room, userId) {
+    return room.scheduled.filter((message) => message.creatorId === userId).sort(soonestFirst).map(scheduledWire);
+  }
+
+  /// Keeps a message for `userId` to send at `sendAt`, in milliseconds, and answers why not, if it doesn't. One sent
+  /// again with the same `clientMessageId` is kept once.
+  schedule(room, userId, { clientMessageId, body, sendAt, parentId, alsoSend }, now = Date.now()) {
+    if (!isSchedulable(sendAt, now)) return SCHEDULE_TIME_REFUSED;
+    const theirs = room.scheduled.filter((message) => message.creatorId === userId);
+    if (theirs.some((message) => message.clientMessageId === clientMessageId)) return null;
+    if (theirs.length >= MAX_SCHEDULED_MESSAGES) return TOO_MANY_SCHEDULED;
+    if (parentId !== undefined && !room.messages.some((message) => message.id === parentId && !message.parentId)) return MESSAGE_GONE;
+    const prepared = this.prepareBody(body);
+    if (prepared.error) return prepared.error;
+    room.scheduled.push({ id: randomUUID(), creatorId: userId, clientMessageId, body: prepared.html, sendAt, ...(parentId !== undefined && { parentId, alsoSend: alsoSend === true }) });
+    return null;
+  }
+
+  /// Edits, moves, sends or deletes the scheduled message a `scheduled.*` frame names, if it's `userId`'s, and answers
+  /// why nothing changed, if nothing did. A reschedule's `sendAt` is in milliseconds.
+  changeScheduled(room, userId, frame, now = Date.now()) {
+    const message = room.scheduled.find((candidate) => candidate.id === frame.scheduledId);
+    if (!message || message.creatorId !== userId) return SCHEDULED_GONE;
+    switch (frame.type) {
+      case "scheduled.edit": {
+        const prepared = this.prepareBody(frame.body);
+        if (prepared.error) return prepared.error;
+        message.body = prepared.html;
+        return null;
+      }
+      case "scheduled.reschedule":
+        if (!isSchedulable(frame.sendAt, now)) return SCHEDULE_TIME_REFUSED;
+        message.sendAt = frame.sendAt;
+        delete message.failure;
+        return null;
+      case "scheduled.send":
+        return this.sendScheduled(room, message);
+      default:
+        room.scheduled = room.scheduled.filter((candidate) => candidate !== message);
+        return null;
+    }
+  }
+
+  /// Sends a scheduled message now, as `message.create` would have, and forgets it, or keeps it saying why it couldn't
+  /// be sent, which it answers. One that's stored already isn't sent again.
+  sendScheduled(room, scheduled) {
+    const sent = room.messages.some((message) => message.creatorId === scheduled.creatorId && message.clientMessageId === scheduled.clientMessageId);
+    const { error } = sent ? {} : this.createMessage(room, scheduled.creatorId, { clientMessageId: scheduled.clientMessageId, body: scheduled.body, parentId: scheduled.parentId, alsoSend: scheduled.alsoSend });
+    const failure = error === undefined ? null : error.message === MESSAGE_GONE ? THREAD_DELETED : error.message;
+    if (failure === null) room.scheduled = room.scheduled.filter((candidate) => candidate !== scheduled);
+    else scheduled.failure = failure;
+    return failure;
+  }
+
+  /// Sends the scheduled messages that are due, the soonest few in each room, and answers whose lists changed, as
+  /// `[room, userId]` pairs. A writer who isn't in the room any more has theirs forgotten.
+  sendDue(now = Date.now()) {
+    const changed = [];
+    for (const room of this.rooms.values()) {
+      const due = room.scheduled.filter((message) => message.failure === undefined && message.sendAt <= now).sort(soonestFirst).slice(0, SCHEDULED_SENT_AT_ONCE);
+      const writers = new Set();
+      for (const message of due) {
+        if (room.members.has(message.creatorId) && this.users.get(message.creatorId)?.status === "active") this.sendScheduled(room, message);
+        else room.scheduled = room.scheduled.filter((candidate) => candidate !== message);
+        writers.add(message.creatorId);
+      }
+      for (const userId of writers) changed.push([room, userId]);
+    }
+    return changed;
+  }
+
+  // Messages only one person sees
+
+  /// The messages only `userId` sees in `room`: the room's own, or with `parentId`, that thread's.
+  ephemeralOf(room, userId, parentId) {
+    return room.ephemeral.filter((kept) => kept.forUserId === userId && kept.message.parentId === parentId).map((kept) => kept.message);
+  }
+
+  /// Shows `userId` alone a message from `botId`, with cards as `keptCards` answers them, and keeps it until it's answered.
+  showOnly(room, userId, botId, { body = "", cards, cardsText = "", parentId }, at = Date.now()) {
+    const plainText = [body === "" ? "" : plainTextOf(body, this.nameOf, this.roomNameOf), cardsText].filter((line) => line !== "").join("\n");
+    const message = { id: randomUUID(), roomId: room.id, creator: this.ref(botId), body, plainText, cards, createdAt: iso(at), ...(parentId !== undefined && { parentId }) };
+    room.ephemeral.push({ forUserId: userId, message });
+    this.hub.person(room.id, userId, { type: "message.ephemeral", message });
+    return message;
+  }
+
+  /// The kept message with this id that `userId` can answer, if there is one.
+  keptEphemeral(room, userId, messageId) {
+    return room.ephemeral.find((kept) => kept.forUserId === userId && kept.message.id === messageId) ?? null;
+  }
+
+  /// Stops keeping an answered message, and shows its asker what came of it in its place: the same message, with these cards.
+  decideEphemeral(room, kept, { cards, cardsText = "" }) {
+    room.ephemeral = room.ephemeral.filter((candidate) => candidate !== kept);
+    const text = kept.message.body === "" ? "" : plainTextOf(kept.message.body, this.nameOf, this.roomNameOf);
+    const message = { ...kept.message, cards, plainText: [text, cardsText].filter((line) => line !== "").join("\n") };
+    this.hub.person(room.id, kept.forUserId, { type: "message.ephemeral", message });
+    return message;
   }
 
   // Search

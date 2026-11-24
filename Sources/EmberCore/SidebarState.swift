@@ -8,14 +8,17 @@ import Foundation
 ///
 /// A star is shown as soon as it's asked for (`beginFavorite`), over the stars the server has
 /// given, until its answer comes (`acceptFavorite` or `rejectFavorite`); a sidebar or socket frame
-/// landing meanwhile doesn't undo it. Reordering stars or shared rooms, and dismissing the
-/// invitation, show at once the same way (`beginFavoriteOrder`, `beginSharedOrder`, `beginDismissal`).
+/// landing meanwhile doesn't undo it. Reordering stars or shared rooms and their sections, and
+/// dismissing the invitation, show at once the same way (`beginFavoriteOrder`, `beginSharedOrder`,
+/// `beginDismissal`).
 public struct SidebarState: Equatable, Sendable {
     /// The rooms you're in.
     public private(set) var rooms: [SidebarRoom]
 
     /// The shared order as the server has given it.
     private var savedSharedOrder: [RoomID]
+    /// The sections as the server has given them.
+    private var savedSections: [SidebarSection]
     /// The invitation as the server has given it.
     private var savedInvitation: Invitation?
     /// Orders asked for and not answered yet, oldest first.
@@ -37,6 +40,7 @@ public struct SidebarState: Equatable, Sendable {
         rooms = []
         starred = Favorites()
         savedSharedOrder = []
+        savedSections = []
         savedInvitation = nil
     }
 
@@ -44,11 +48,21 @@ public struct SidebarState: Equatable, Sendable {
         rooms = sidebar.rooms
         starred = sidebar.favorites
         savedSharedOrder = sidebar.sharedOrder
+        savedSections = sidebar.sections
         savedInvitation = sidebar.invitation
     }
 
     /// The workspace's order for shared rooms: the server's, or the one asked for last.
     public var sharedOrder: [RoomID] { sharedOrders.last?.roomIDs ?? savedSharedOrder }
+
+    /// The sections shared rooms are listed under, in order, each with which of your rooms are in it:
+    /// every section for an administrator, or else those with a room of yours. The server's, with the
+    /// layouts asked for and not yet answered over them.
+    public var sections: [SidebarSection] {
+        sharedOrders.reduce(savedSections) { sections, guess in
+            guess.placements.map { RoomList.placing(sections, roomIDs: guess.roomIDs, in: $0) } ?? sections
+        }
+    }
 
     /// An invitation an administrator hasn't dismissed yet.
     public var invitation: Invitation? { dismissals > 0 ? nil : savedInvitation }
@@ -104,18 +118,20 @@ public struct SidebarState: Equatable, Sendable {
         favoriteOrders.removeAll { $0 == guess }
     }
 
-    /// Shows this shared order for now, until `acceptSharedOrder` or `rejectSharedOrder`.
-    package mutating func beginSharedOrder(_ roomIDs: [RoomID]) -> OrderGuess {
+    /// Shows this shared order for now, and with `sections`, the sections in that order with those
+    /// rooms in them, until `acceptSharedOrder` or `rejectSharedOrder`.
+    package mutating func beginSharedOrder(_ roomIDs: [RoomID], sections: [RoomLayout.Placement]? = nil) -> OrderGuess {
         guessesMade += 1
-        let guess = OrderGuess(roomIDs: roomIDs, number: guessesMade)
+        let guess = OrderGuess(roomIDs: roomIDs, placements: sections, number: guessesMade)
         sharedOrders.append(guess)
         return guess
     }
 
-    /// The server saved the order and answered the rooms of yours it ranks.
-    package mutating func acceptSharedOrder(_ guess: OrderGuess, order: [RoomID]) {
+    /// The server saved the order and answered the rooms of yours it ranks, and with a layout, every
+    /// section.
+    package mutating func acceptSharedOrder(_ guess: OrderGuess, order: [RoomID], sections: [SidebarSection]? = nil) {
         sharedOrders.removeAll { $0 == guess }
-        record(.ordered(order))
+        record(.ordered(order, sections: sections))
     }
 
     /// The server refused the order: the shared order is the server's again.
@@ -136,17 +152,21 @@ public struct SidebarState: Equatable, Sendable {
     package mutating func rejectDismissal() { dismissals = max(0, dismissals - 1) }
 
     /// Applies a frame. Returns true when the frame means the sidebar should be fetched again:
-    /// `welcome`, since anything could have changed while the socket was closed, and `rooms.reordered`,
-    /// which names no rooms. For `user.updated`, which can mean a refetch too, use
-    /// `apply(_:me:directory:)`.
+    /// `welcome`, since anything could have changed while the socket was closed, `rooms.reordered`,
+    /// which names no rooms, and a `room.saved` that puts the room in a section the sidebar doesn't
+    /// list, whose place among the others only the server knows. For `user.updated`, which can mean a
+    /// refetch too, use `apply(_:me:)`.
     @discardableResult
     package mutating func apply(_ frame: WorkspaceFrame) -> Bool {
         switch frame {
         case .welcome, .roomsReordered:
             return true
-        case let .roomUnread(id, since, count): record(.marked(id, unread: true, since: since, count: count))
-        case let .roomRead(id): record(.marked(id, unread: false, since: nil, count: nil))
-        case let .roomSaved(room): record(.saved(room))
+        case let .roomUnread(id, since, count, mentions): record(.marked(id, unread: true, since: since, count: count, mentions: mentions))
+        case let .roomRead(id): record(.marked(id, unread: false, since: nil, count: nil, mentions: nil))
+        case let .roomSaved(room, placement):
+            let known = savedSections
+            record(.saved(room, placement))
+            if case let .section(section) = placement { return !known.contains { $0.id == section.id } }
         case let .roomGone(id): record(.gone(id))
         case let .roomActive(id, at): record(.active(id, at: at))
         case let .favoritesChanged(favorites): record(.starred(favorites))
@@ -168,7 +188,7 @@ public struct SidebarState: Equatable, Sendable {
     }
 
     /// They've opened a room, or read it elsewhere.
-    package mutating func markRead(_ roomID: RoomID) { record(.marked(roomID, unread: false, since: nil, count: nil)) }
+    package mutating func markRead(_ roomID: RoomID) { record(.marked(roomID, unread: false, since: nil, count: nil, mentions: nil)) }
 
     /// Sets how much of a room reaches you.
     package mutating func setInvolvement(_ involvement: Involvement, roomID: RoomID) {
@@ -179,8 +199,8 @@ public struct SidebarState: Equatable, Sendable {
     /// and the sidebar itself, in whatever order they arrive.
     package mutating func setFavorites(_ favorites: Favorites) { record(.starred(favorites)) }
 
-    /// A room as the server saved it (`RoomList.withRoom`).
-    package mutating func add(_ room: Room) { record(.saved(room)) }
+    /// A room as the server saved it (`RoomList.withRoom`), in the section it was put in, when that's known.
+    package mutating func add(_ room: Room, section: RoomPlacement = .unchanged) { record(.saved(room, section)) }
 
     /// A room you've left or deleted, as `room.gone` takes it out.
     package mutating func remove(_ roomID: RoomID) { record(.gone(roomID)) }
@@ -207,13 +227,13 @@ public struct SidebarState: Equatable, Sendable {
     package mutating func unanswered() { unseen = nil }
 
     private enum Change: Equatable, Sendable {
-        case saved(Room)
+        case saved(Room, RoomPlacement)
         case gone(RoomID)
-        case marked(RoomID, unread: Bool, since: Date?, count: Int?)
+        case marked(RoomID, unread: Bool, since: Date?, count: Int?, mentions: Int?)
         case active(RoomID, at: Date)
         case involved(RoomID, Involvement)
         case starred(Favorites)
-        case ordered([RoomID])
+        case ordered([RoomID], sections: [SidebarSection]?)
         case invitationDismissed
     }
 
@@ -228,7 +248,7 @@ public struct SidebarState: Equatable, Sendable {
         for change in changes {
             switch change {
             case let .gone(id) where listed.contains(id): takenOut.insert(id)
-            case let .saved(room) where takenOut.contains(room.id): return true
+            case let .saved(room, _) where takenOut.contains(room.id): return true
             default: break
             }
         }
@@ -242,15 +262,23 @@ public struct SidebarState: Equatable, Sendable {
 
     private mutating func apply(_ change: Change) {
         switch change {
-        case let .saved(room):
+        case let .saved(room, placement):
             rooms = RoomList.withRoom(rooms, room)
+            switch placement {
+            case .unchanged: break
+            case .loose: savedSections = RoomList.withRoomIn(savedSections, room.id, nil)
+            case let .section(section): savedSections = RoomList.withRoomIn(savedSections, room.id, section)
+            }
         case let .gone(id):
             rooms.removeAll { $0.id == id }
+            savedSections = RoomList.withoutRoom(savedSections, id)
             // A room that's gone takes its star with it, as the server's stars do.
             starred.rooms.removeAll { $0 == id }
             guesses.removeAll { $0.roomID == id }
-        case let .marked(id, unread, since, count):
-            for index in rooms.indices where rooms[index].id == id { rooms[index].mark(unread: unread, since: since, count: count) }
+        case let .marked(id, unread, since, count, mentions):
+            for index in rooms.indices where rooms[index].id == id {
+                rooms[index].mark(unread: unread, since: since, count: count, mentions: mentions)
+            }
         case let .active(id, at):
             for index in rooms.indices where rooms[index].id == id && rooms[index].room.isDirect {
                 if (rooms[index].room.activeAt ?? .distantPast) < at { rooms[index].room.activeAt = at }
@@ -259,8 +287,9 @@ public struct SidebarState: Equatable, Sendable {
             for index in rooms.indices where rooms[index].id == id { rooms[index].involvement = involvement }
         case let .starred(newer):
             if newer.version > starred.version { starred = newer }
-        case let .ordered(order):
+        case let .ordered(order, sections):
             savedSharedOrder = order
+            if let sections { savedSections = sections }
         case .invitationDismissed:
             savedInvitation = nil
         }
@@ -280,5 +309,13 @@ package struct FavoriteGuess: Hashable, Sendable {
 package struct OrderGuess: Hashable, Sendable {
     /// The rooms in the order asked for.
     package let roomIDs: [RoomID]
+    /// The sections asked for with a shared order, in order, each with its rooms.
+    package let placements: [RoomLayout.Placement]?
     let number: Int
+
+    init(roomIDs: [RoomID], placements: [RoomLayout.Placement]? = nil, number: Int) {
+        self.roomIDs = roomIDs
+        self.placements = placements
+        self.number = number
+    }
 }

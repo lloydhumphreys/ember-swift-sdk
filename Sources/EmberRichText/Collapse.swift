@@ -54,7 +54,7 @@ enum WhitespaceCollapser {
                 if state.pendingSpace, hasVisibleContent(children) { flushSpace(&out, &state) }
                 let inner = run(children, &state)
                 if !inner.isEmpty { out.append(.link(url: url, inner)) }
-            case .mention:
+            case .mention, .specialMention, .roomMention:
                 if state.pendingSpace { flushSpace(&out, &state) }
                 state.atLineStart = false
                 out.append(item)
@@ -87,7 +87,7 @@ enum WhitespaceCollapser {
                 if text.unicodeScalars.contains(where: { !isCollapsible($0) }) { return true }
             case .link(_, let children):
                 if hasVisibleContent(children) { return true }
-            case .mention:
+            case .mention, .specialMention, .roomMention:
                 return true
             case .lineBreak:
                 continue

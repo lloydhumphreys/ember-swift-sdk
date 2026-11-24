@@ -1,7 +1,7 @@
 import Foundation
 
-/// An edit, deletion or boost sent with an `async` form, waiting for the room to show it made. The
-/// room answers none of them, so the change it broadcasts is the answer: `shows` tells it.
+/// An edit, deletion, boost or scheduling sent with an `async` form, waiting for the room to show it
+/// made. The room answers none of them, so the change it broadcasts is the answer: `shows` tells it.
 struct ChangeWaiter {
     let id: UUID
     let frame: ClientFrame
@@ -12,8 +12,22 @@ struct ChangeWaiter {
     let shows: @MainActor (ServerFrame) -> Bool
     let continuation: CheckedContinuation<ServerFrame?, any Error>
     let timer: Task<Void, Never>
+    /// Whether it goes again on the next connection when the socket drops before its answer, for a
+    /// frame the room takes once however often it's sent.
+    let resends: Bool
     /// Whether it went on a socket. One asked for while the room was reconnecting waits to be let in.
     var isWritten: Bool
+
+    /// Whether an error frame that names no message, with this `failed` and `scheduledId`, can be
+    /// this change's refusal. The refusal of a scheduling names its message, and that of a scheduled
+    /// message's edit names both.
+    func isRefused(by failed: String?, scheduledId: ScheduledMessageID?) -> Bool {
+        switch frame {
+        case .scheduleMessage: false
+        case let .editScheduled(id, _): failed == type && scheduledId == id
+        default: scheduledId == nil && (failed == nil || failed == type)
+        }
+    }
 }
 
 extension RoomSession {
@@ -94,7 +108,9 @@ extension RoomSession {
 
     /// Sends `frame`, and `marker` after it, now or once the room lets the socket in, and waits for
     /// the frame `shows` picks out, a refusal, the clock, or a drop after it was sent.
-    private func change(_ frame: ClientFrame, then marker: ClientFrame? = nil, shows: @escaping @MainActor (ServerFrame) -> Bool) async throws -> ServerFrame? {
+    func change(
+        _ frame: ClientFrame, then marker: ClientFrame? = nil, resends: Bool = false, shows: @escaping @MainActor (ServerFrame) -> Bool
+    ) async throws -> ServerFrame? {
         let unreachable = EmberError(kind: .unreachable, message: Self.notConnected)
         if isAdmitted {
             guard write(frame, then: marker) else { throw unreachable }
@@ -109,7 +125,12 @@ extension RoomSession {
                 do { try await timing.sleep(for: Self.changeTimeout) } catch { return }
                 self?.finishChange(id, with: .failure(EmberError(kind: .timedOut, message: Self.changeTimedOut)))
             }
-            changes.append(ChangeWaiter(id: id, frame: frame, marker: marker, shows: shows, continuation: continuation, timer: timer, isWritten: isWritten))
+            changes.append(
+                ChangeWaiter(
+                    id: id, frame: frame, marker: marker, shows: shows, continuation: continuation, timer: timer, resends: resends,
+                    isWritten: isWritten
+                )
+            )
         }
     }
 
@@ -130,15 +151,20 @@ extension RoomSession {
         }
     }
 
-    private func finishChange(_ id: UUID, with result: Result<ServerFrame?, any Error>) {
+    func finishChange(_ id: UUID, with result: Result<ServerFrame?, any Error>) {
         guard let index = changes.firstIndex(where: { $0.id == id }) else { return }
         let waiter = changes.remove(at: index)
         waiter.timer.cancel()
         waiter.continuation.resume(with: result)
     }
 
-    /// Finishes each change `frame` shows made.
+    /// Finishes each change `frame` shows made. The room answers each edit of a scheduled message
+    /// with a frame of its own, so one of those finishes one edit: the oldest it can be the answer to.
     func changeShown(_ frame: ServerFrame) {
+        if case .scheduled(_, .some) = frame {
+            if let waiter = changes.first(where: { $0.isWritten && $0.shows(frame) }) { finishChange(waiter.id, with: .success(frame)) }
+            return
+        }
         for waiter in changes where waiter.shows(frame) {
             finishChange(waiter.id, with: .success(frame))
         }
@@ -147,18 +173,33 @@ extension RoomSession {
     /// Hands an error frame that names no message to the oldest change it can be the answer to,
     /// since the room answers a socket's frames in order: one that names the frame's type, or names
     /// none, as most refusals of these do. Answers whether one took it.
-    func changeRefused(_ message: String, failed: String?) -> Bool {
-        guard let waiter = changes.first(where: { $0.isWritten && (failed == nil || $0.type == failed) }) else { return false }
+    func changeRefused(_ message: String, failed: String?, scheduledId: ScheduledMessageID? = nil) -> Bool {
+        guard let waiter = changes.first(where: { $0.isWritten && $0.isRefused(by: failed, scheduledId: scheduledId) }) else { return false }
+        finishChange(waiter.id, with: .failure(EmberError(kind: .refused, message: message)))
+        return true
+    }
+
+    /// Hands an error frame naming messages to the scheduling of one of them that's waiting, if one
+    /// is. Answers whether one took it.
+    func scheduleRefused(_ ids: Set<ClientMessageID>, _ message: String) -> Bool {
+        let waiter = changes.first { waiter in
+            if case let .scheduleMessage(id, _, _, _, _) = waiter.frame { ids.contains(id) } else { false }
+        }
+        guard let waiter else { return false }
         finishChange(waiter.id, with: .failure(EmberError(kind: .refused, message: message)))
         return true
     }
 
     /// The socket dropped, to `status`: no answer to what was sent on it will come. What wasn't sent
-    /// yet waits for the next connection, unless the room has stopped trying.
+    /// yet, and what's sent again, waits for the next connection, unless the room has stopped trying.
     func changesDisconnected(_ status: ConnectionStatus) {
         let isTrying = status == .connecting || status == .open
         for waiter in changes where waiter.isWritten || !isTrying {
-            finishChange(waiter.id, with: .failure(EmberError(kind: .unreachable, message: Self.notConnected)))
+            if isTrying, waiter.resends, let index = changes.firstIndex(where: { $0.id == waiter.id }) {
+                changes[index].isWritten = false
+            } else {
+                finishChange(waiter.id, with: .failure(EmberError(kind: .unreachable, message: Self.notConnected)))
+            }
         }
     }
 }
