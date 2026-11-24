@@ -4,6 +4,8 @@ All notable changes to this project are listed here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
 Tracks upstream Ember `v0.5.0` (commit `2e6c7886`).
 
 ### Added
